@@ -1,0 +1,1 @@
+Elapsed Time (minutes), Pmax (µW), Vmax (mV), Imax (mA), FF, Efficiency (%)
