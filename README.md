@@ -1,4 +1,7 @@
+
 # SolarJv Analyzer
+
+> **Note:** This document describes the `v2` branch.
 
 A Python-based application for performing multi-channel J–V (current–voltage) measurements on solar cells using PyMeasure. This tool provides a GUI for configuring experiments, executing sweeps, and viewing results, with support for both real and simulated instruments.
 
@@ -7,7 +10,7 @@ A Python-based application for performing multi-channel J–V (current–voltage
 ## Project Structure
 
 ```
-solarjv-analyzer/          # Root project directory
+jv_setup_keithley_controller/          # Root project directory
 ├── src/solarjv_analyzer/   # Python package
 │   ├── config.py           # Configuration constants and defaults
 │   ├── main.py             # Entry point: initializes and runs the GUI
@@ -85,21 +88,28 @@ solarjv-analyzer/          # Root project directory
 
 ## Installation & Usage
 
-1. **Install dependencies**:
+1. Clone the repository and switch to the v2 branch:
+
+   ```bash
+   git clone https://github.com/uni-stuttgart-ipv/jv_setup_keithley_controller.git
+   cd jv_setup_keithley_controller
+   git checkout v2
+   ```
+2. **Install dependencies**:
 
    ```bash
    pip install .
    ```
-2. **Configure hardware settings** in `config.py` (MUX\_PORT, GPIB\_ADDRESS, SIMULATION\_MODE).
-3. **Run the application**:
+3. **Configure hardware settings** in `config.py` (MUX\_PORT, GPIB\_ADDRESS, SIMULATION\_MODE).
+4. **Run the application**:
 
    ```bash
    hatch run start   # or: python -m solarjv_analyzer.main
    ```
-4. **Login Dialog** appears. Enter credentials.
-5. **Configure experiment** in the left panel and click **Queue** to start.
-6. **View live plot**, **log**, and **experiment queue** in the main area.
-7. **Data files** are saved under `RESULTS_ROOT/<DD-MM-YYYY>/…` with a timestamp.
+5. **Login Dialog** appears. Enter credentials.
+6. **Configure experiment** in the left panel and click **Queue** to start.
+7. **View live plot**, **log**, and **experiment queue** in the main area.
+8. **Data files** are saved under `RESULTS_ROOT/<DD-MM-YYYY>/…` with a timestamp.
 
 ---
 
@@ -113,3 +123,11 @@ solarjv-analyzer/          # Root project directory
 ---
 
 For detailed API, refer to inline docstrings in each module. Happy measuring!
+
+---
+
+## Branching Strategy
+
+- `main`: **Legacy reference branch** containing the older implementation, kept for archival/reference only.
+- `v2`: Active development of the new unified JV setup application.
+- Future feature branches should be based off `v2`.
