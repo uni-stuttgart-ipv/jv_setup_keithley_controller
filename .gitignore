@@ -1,1 +1,116 @@
-.DS_Store
+# Byte-compiled / optimized / DLL files
+
+**pycache**/
+\*.py\[cod]
+\*\$py.class
+
+# C extensions
+
+\*.so
+
+# Distribution / packaging
+
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+\*.egg-info/
+.installed.cfg
+\*.egg
+
+# Virtual environments
+
+venv/
+ENV/
+env/
+.env/
+.venv/
+
+# PyBuilder
+
+target/
+
+# Hatch environments
+
+.hatch/
+
+# Jupyter Notebook checkpoints
+
+.ipynb\_checkpoints
+
+# IPython
+
+profile\_default/
+ipython\_config.py
+
+# pyenv
+
+.python-version
+
+# pipenv
+
+Pipfile.lock
+
+# pytest
+
+.cache/
+.pytest\_cache/
+
+# mypy
+
+.mypy\_cache/
+
+# IDEs and editors
+
+.vscode/
+.idea/
+\*.sublime-workspace
+\*.sublime-project
+
+# Logs and SQLite databases
+
+\*.log
+\*.sqlite3
+
+# Data and Results directories
+
+data/
+Reports/
+
+# Temporary files
+
+\*.tmp
+\*.temp
+
+# OS-specific files
+
+.DS\_Store
+Thumbs.db
+
+# Coverage reports
+
+htmlcov/
+.coverage
+coverage.xml
+
+# Sphinx documentation
+
+docs/\_build/
+
+# PyCharm
+
+\*.iml
+
+# Docker files
+
+docker-compose.override.yml
+
+# End of .gitignore
