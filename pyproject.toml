@@ -6,18 +6,26 @@ build-backend = "hatchling.build"
 name = "solarjv-analyzer"
 version = "0.0.1"
 description = "J–V Analysis GUI using PyMeasure and PyQt5"
-authors = [{ name = "Yamandeep", email = "example@example.com" }]
-keywords = ["solar", "JV", "pymeasure", "gui", "photovoltaics"]
+authors = [
+  { name = "Yamandeep", email = "st195620@stud.uni-stuttgart.de" }
+]
 readme = "README.md"
 requires-python = ">=3.8"
-
+license = { file = "LICENSE.txt" }
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: Microsoft :: Windows"
+]
+keywords = ["solar", "JV", "pymeasure", "gui", "photovoltaics"]
 dependencies = [
   "pymeasure",
   "PyQt5",
   "pyvisa",
   "matplotlib",
   "reportlab",
-  "pandas"
+  "pandas",
 ]
 
 [tool.hatch.envs.default]
@@ -27,8 +35,21 @@ dependencies = [
   "pyvisa",
   "matplotlib",
   "reportlab",
-  "pandas"
+  "pandas",
+  "pyserial",
 ]
 
 [tool.hatch.envs.default.scripts]
 start = "python src/solarjv_analyzer/main.py"
+
+[tool.briefcase]
+project_name = "SolarJVAnalyzer"
+formal_name  = "Solar JV Analyzer"
+bundle       = "com.yourorg.solarjvanalyzer"
+version      = "0.0.1"                      # ← Explicit literal version
+
+[tool.briefcase.app.solarjv_analyzer]
+sources     = ["src/solarjv_analyzer"]
+entry_point = "solarjv_analyzer.main:main"
+requires    = ["pymeasure", "PyQt5", "pyserial"]
+license.file = "LICENSE.txt"
