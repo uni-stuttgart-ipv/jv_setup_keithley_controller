@@ -1,43 +1,74 @@
-import logging
 import serial
-from serial.serialutil import SerialException
-
-log = logging.getLogger(__name__)
-log.addHandler(logging.NullHandler())
+import time
 
 class MuxController:
-    def __init__(self, port: str = "COM3", baud: int = 9600):
-        try:
-            self.ser = serial.Serial(port, baudrate=baud, timeout=1)
-            log.info(f"Opened MUX on {port}@{baud}")
-        except SerialException as e:
-            log.error(f"SerialException: Could not open MUX on {port}: {e}")
-            raise
+    """
+    A controller for the multiplexer device, using the proven hex protocol.
+    """
 
-    def select_channel(self, channel: int) -> None:
-        # translate channel to your device’s hex command
-        cmd = f"{channel:02X}\n".encode()
-        self.ser.write(cmd)
-        log.debug(f"MUX -> select {channel}")
+    def __init__(self, port, baudrate=115200, timeout=1):
+        """
+        Initialize the multiplexer connection.
+        """
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.ser = None
 
-    def close(self) -> None:
-        self.ser.close()
-        log.info("MUX connection closed")
+    def connect(self):
+        """
+        Open the serial port.
+        """
+        self.ser = serial.Serial(
+            port=self.port,
+            baudrate=self.baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=self.timeout
+        )
+        print(f"✅ Mux connected on {self.port}")
 
+    def select_channel(self, channel: int):
+        """
+        Select (turn ON) the specified channel (0–5).
+        """
+        print(f"Selecting channel {channel}")
+        command = f"AA010{channel}000000BB"
+        self._send_hex(command)
 
-# Simulated Mux for fallback
+    def deselect_channel(self, channel: int):
+        """
+        Deselect (turn OFF) the specified channel.
+        """
+        print(f"Deselecting channel {channel}")
+        command = f"AA010{channel}000100BB"
+        self._send_hex(command)
+
+    def _send_hex(self, hex_string):
+        """
+        Convert the hex string to bytes and write it.
+        """
+        if not self.ser:
+            raise RuntimeError("MUX serial port not connected.")
+        data = bytes.fromhex(hex_string)
+        self.ser.write(data)
+        time.sleep(0.5)
+
+    def close(self):
+        """
+        Close the serial port.
+        """
+        if self.ser:
+            self.ser.close()
+            print("✅ Mux connection closed.")
+
 class SimulatedMux:
-    def __init__(self, port: str = "", baud: int = 0):
-        log.warning(f"Simulated MUX init for port {port}@{baud}")
-    def select_channel(self, channel: int) -> None:
-        log.info(f"Simulated MUX -> select {channel}")
-    def close(self) -> None:
-        log.info("Simulated MUX closed")
+    def select_channel(self, channel):
+        print(f"[SimulatedMux] Pretend selecting channel {channel}")
 
-def get_mux(port: str = "COM3") -> MuxController:
-    try:
-        mux = MuxController(port)
-        return mux
-    except Exception as e:
-        log.error(f"Could not open MUX on {port}: {e}. Falling back to SimulatedMux.")
-        return SimulatedMux(port)
+    def deselect_channel(self, channel):
+        print(f"[SimulatedMux] Pretend deselecting channel {channel}")
+
+    def close(self):
+        print("[SimulatedMux] Pretend closing connection")

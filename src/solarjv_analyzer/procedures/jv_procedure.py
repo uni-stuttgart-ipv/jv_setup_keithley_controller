@@ -1,7 +1,7 @@
 import logging
 from typing import List, Dict
 
-from solarjv_analyzer.instruments.mux_controller import get_mux
+#
 from solarjv_analyzer.instruments.instrument_manager import get_keithley
 from pymeasure.experiment import Procedure
 from pymeasure.experiment.parameters import FloatParameter, BooleanParameter, Parameter
@@ -39,6 +39,17 @@ class JVProcedure(Procedure):
     channel4 = BooleanParameter("Channel 4", default=True)
     channel5 = BooleanParameter("Channel 5", default=True)
     channel6 = BooleanParameter("Channel 6", default=True)
+    nplc = FloatParameter("NPLC", default=1)
+    delay_between_points = FloatParameter("Delay Between Points (s)", default=0.1)
+    pre_sweep_delay = FloatParameter("Pre-Sweep Delay (s)", default=0.0)
+    measurement_range = Parameter("Measurement Range", default="Auto")
+    sense_mode = Parameter("Sense Mode", default="2-wire")
+    device_area = FloatParameter("Device Area (cm^2)", default=0.089)
+    incident_power = FloatParameter("Incident Power (mW/cm^2)", default=100)
+    contact_threshold = FloatParameter("Contact Threshold (A)", default=0.001)
+    lateral_factor = FloatParameter("4-Probe Lateral Factor", default=1.0)
+    probe_spacing = FloatParameter("4-Probe Spacing (um)", default=2290)
+    sample_thickness = FloatParameter("Sample Thickness (um)", default=500)
 
     def startup(self) -> None:
         """
@@ -51,9 +62,18 @@ class JVProcedure(Procedure):
         self.instrument = get_keithley()
         self._start_time = time.time()
         # Configure the source-meter for voltage sourcing
-        #self.instrument.apply_voltage(compliance_current=self.compliance_current)
         self.instrument.apply_voltage()
+        self.instrument.compliance_current = self.compliance_current
+        self.instrument.source_voltage = self.start_voltage
         self.instrument.enable_source()
+        self.instrument.nplc = self.nplc
+        self.instrument.delay = self.delay_between_points
+        if self.measurement_range != "Auto":
+            self.instrument.measurement_range = self.measurement_range
+        if self.sense_mode == "4-wire":
+            self.instrument.four_wire = True
+        else:
+            self.instrument.four_wire = False
 
     def execute(self) -> None:
         """
@@ -76,8 +96,9 @@ class JVProcedure(Procedure):
 
         for ch in channels:
             logger.info(f"Measuring Channel {ch}")
-            self.instrument.select_channel(ch)
+            self.mux.select_channel(ch)
             #self.mux.select_channel(ch)
+            sleep(self.pre_sweep_delay)
             for v in voltages:
                 if self.should_stop():
                     logger.warning(
@@ -86,7 +107,7 @@ class JVProcedure(Procedure):
                     return
                 # Source the set voltage and wait for settling
                 self.instrument.source_voltage = v
-                sleep(0.1)
+                sleep(self.delay_between_points)
                 current: float = self.instrument.measure_current()
                 elapsed: float = time.time() - self._start_time
                 status: str = "OK"
@@ -120,10 +141,6 @@ class JVProcedure(Procedure):
             pass
         try:
             self.instrument.close()
-        except Exception:
-            pass
-        try:
-            self.mux.close()
         except Exception:
             pass
         # Placeholder for appending metadata to the data file:

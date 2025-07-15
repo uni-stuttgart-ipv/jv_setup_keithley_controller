@@ -1,5 +1,7 @@
 import logging
 from typing import Union
+from .mux_controller import MuxController
+from solarjv_analyzer import config
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
@@ -56,3 +58,26 @@ def get_keithley(address: str = "GPIB::24") -> Union[FakeKeithley2400, "Keithley
     except Exception as e:
         log.warning(f"Failed to connect to real Keithley2400 at {address}: {e}. Using FakeKeithley2400.")
         return FakeKeithley2400()
+
+class InstrumentManager:
+    def __init__(self):
+        self.mux = None
+
+    def connect_mux(self, simulation=False):
+        if simulation:
+            from .mux_controller import SimulatedMux
+            self.mux = SimulatedMux()
+        else:
+            self.mux = MuxController(port=config.MUX_PORT)
+            self.mux.connect()
+
+    def disconnect_mux(self):
+        if self.mux:
+            self.mux.close()
+            self.mux = None
+
+    def connect_keithley(self, simulation=False):
+        if simulation:
+            self.keithley = FakeKeithley2400()
+        else:
+            self.keithley = get_keithley(address=config.GPIB_ADDRESS)

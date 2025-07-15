@@ -6,9 +6,9 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class _Config:
     # Serial port (or other identifier) for your 6-channel MUX
-    MUX_PORT: str = "/dev/ttyUSB0"
+    MUX_PORT: str = "COM5"
     # VISA resource string for your Keithley SourceMeter
-    GPIB_ADDRESS: str = "GPIB::24"
+    GPIB_ADDRESS = "ASRL4::INSTR"
     # If True, use simulated instruments instead of real hardware
     SIMULATION_MODE: bool = False
     # Base directory for all result files (relative or absolute)
