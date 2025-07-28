@@ -71,13 +71,32 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.stop_voltage = QtWidgets.QLineEdit("1.0")
         self.step_size = QtWidgets.QLineEdit("0.1")
         self.compliance_current = QtWidgets.QLineEdit("0.1")
-        params_layout.addRow("Start Voltage:", self.start_voltage)
-        params_layout.addRow("Stop Voltage:", self.stop_voltage)
-        params_layout.addRow("Step Size:", self.step_size)
-        params_layout.addRow("Compliance Current:", self.compliance_current)
+        params_layout.addRow("Start Voltage (V):", self.start_voltage)
+        params_layout.addRow("Stop Voltage (V):", self.stop_voltage)
+        params_layout.addRow("Step Size (V):", self.step_size)
+        params_layout.addRow("Compliance Current (A):", self.compliance_current)
         # Pre-Sweep Delay stays only here
         self.pre_sweep_delay = QtWidgets.QLineEdit("0.0")
         params_layout.addRow("Pre-Sweep Delay (s):", self.pre_sweep_delay)
+        self.device_area = QtWidgets.QLineEdit("0.089")
+        params_layout.addRow("Device Area (cm²):", self.device_area)
+        # Add a horizontal line separator
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.HLine)
+        line.setFrameShadow(QtWidgets.QFrame.Sunken)
+        params_layout.addRow(line)
+        # Channel selection
+        self.channels = [QtWidgets.QCheckBox(f"Channel {i+1}") for i in range(6)]
+        self.select_all_channels = QtWidgets.QCheckBox("Select All Channels")
+        self.select_all_channels.toggled.connect(self.on_select_all_channels)
+        channel_widget = QtWidgets.QWidget()
+        channel_layout = QtWidgets.QVBoxLayout()
+        channel_layout.setAlignment(QtCore.Qt.AlignRight)
+        for ch in self.channels:
+            channel_layout.addWidget(ch)
+        channel_widget.setLayout(channel_layout)
+        params_layout.addRow("Channels:", channel_widget)
+        channel_layout.addWidget(self.select_all_channels)
         tabs.addTab(params_tab, "Parameters")
 
         # --- Instrument Tab ---
@@ -86,18 +105,11 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.instrument_name = QtWidgets.QComboBox()
         self.instrument_name.addItem("Keithley 2400")
         self.gpib_address = QtWidgets.QLineEdit(GPIB_ADDRESS)
-        self.channels = [QtWidgets.QCheckBox(f"Channel {i+1}") for i in range(6)]
-        # Master toggle for selecting/deselecting all channels
-        self.select_all_channels = QtWidgets.QCheckBox("Select All Channels")
-        self.select_all_channels.toggled.connect(self.on_select_all_channels)
         instr_layout.addRow("Instrument:", self.instrument_name)
         instr_layout.addRow("GPIB Address:", self.gpib_address)
-        for ch in self.channels:
-            instr_layout.addRow(ch)
-        instr_layout.addRow(self.select_all_channels)
         # Instrument-specific settings: NPLC, Delay Between Points, Measurement Range, Sense Mode
         self.nplc = QtWidgets.QLineEdit("1")
-        instr_layout.addRow("NPLC:", self.nplc)
+        instr_layout.addRow("NPLC (PLC units):", self.nplc)
         self.delay_between_points = QtWidgets.QLineEdit("0.1")
         instr_layout.addRow("Delay Between Points (s):", self.delay_between_points)
         self.measurement_range = QtWidgets.QComboBox()
@@ -111,18 +123,16 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         # --- Analysis Tab ---
         analysis_tab = QtWidgets.QWidget()
         analysis_layout = QtWidgets.QFormLayout(analysis_tab)
-        self.device_area = QtWidgets.QLineEdit("0.089")
         self.incident_power = QtWidgets.QLineEdit("100")
         self.contact_threshold = QtWidgets.QLineEdit("0.001")
-        analysis_layout.addRow("Device Area (cm²):", self.device_area)
         analysis_layout.addRow("Incident Power (mW/cm²):", self.incident_power)
         analysis_layout.addRow("Contact Threshold (A):", self.contact_threshold)
         self.lateral_factor = QtWidgets.QLineEdit("1.0")
-        analysis_layout.addRow("4-Probe Lateral Factor:", self.lateral_factor)
+        analysis_layout.addRow("4-Probe Lateral Factor (unitless):", self.lateral_factor)
         self.probe_spacing = QtWidgets.QLineEdit("2290")
-        analysis_layout.addRow("4-Probe Spacing (um):", self.probe_spacing)
+        analysis_layout.addRow("4-Probe Spacing (μm):", self.probe_spacing)
         self.sample_thickness = QtWidgets.QLineEdit("500")
-        analysis_layout.addRow("Sample Thickness (um):", self.sample_thickness)
+        analysis_layout.addRow("Sample Thickness (μm):", self.sample_thickness)
         tabs.addTab(analysis_tab, "Analysis")
 
         # -------- Below Tabs: File Input Section --------
@@ -276,15 +286,8 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
             experiment = self.new_experiment(results)
             self.manager.queue(experiment)
         else:
-            # Separate file per channel, ensure only one channel selected at a time on the multiplexer
+            # Queue one experiment per selected channel
             for ch_num in channels_selected:
-                # Switch multiplexer to the correct channel before measurement
-                try:
-                    self.instrument_manager.mux.select_channel(ch_num)
-                    logger.info(f"Multiplexer channel {ch_num} selected for measurement.")
-                except Exception as e:
-                    QtWidgets.QMessageBox.warning(self, "Multiplexer Error", f"Failed to select channel {ch_num}: {e}")
-                    continue
                 proc = JVProcedure(
                     user_name=self.username,
                     start_voltage=start,
@@ -298,8 +301,9 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
                     channel4=(ch_num == 4),
                     channel5=(ch_num == 5),
                     channel6=(ch_num == 6),
+                    active_channel=ch_num,
+                    simulation=sim_mode
                 )
-                # Assign mux reference to procedure
                 proc.mux = self.instrument_manager.mux
                 single_filename = f"{base}_{timestamp}_ch{ch_num}{ext}"
                 full_path = os.path.join(directory, single_filename)
@@ -309,12 +313,6 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
                 self.browser_widget.browser.measured_quantities.update(JVProcedure.DATA_COLUMNS)
                 experiment = self.new_experiment(results)
                 self.manager.queue(experiment)
-                # Deselect the channel after queuing
-                try:
-                    self.instrument_manager.mux.deselect_channel(ch_num)
-                    logger.info(f"Multiplexer channel {ch_num} deselected after queuing.")
-                except Exception as e:
-                    logger.warning(f"Failed to deselect channel {ch_num}: {e}")
 
     def update_save_directory(self) -> None:
         """

@@ -50,14 +50,20 @@ class JVProcedure(Procedure):
     lateral_factor = FloatParameter("4-Probe Lateral Factor", default=1.0)
     probe_spacing = FloatParameter("4-Probe Spacing (um)", default=2290)
     sample_thickness = FloatParameter("Sample Thickness (um)", default=500)
+    active_channel = Parameter("Active Channel", default="1")
+    simulation = BooleanParameter("Simulation Mode", default=False)
 
     def startup(self) -> None:
         """
         Initialize instruments and record the start time.
         """
         logger.info("Startup: initializing Keithley instrument")
-        #self.mux = get_mux(CONFIG.MUX_PORT)
-        # Use the GPIB address provided by the GUI parameter
+        from solarjv_analyzer.instruments.mux_controller import MuxController, SimulatedMux
+        if self.simulation:
+            self.mux = SimulatedMux()
+        else:
+            self.mux = MuxController(port=CONFIG.MUX_PORT)
+            self.mux.connect()
         #self.instrument = get_keithley(self.gpib_address, simulate=CONFIG.SIMULATION_MODE)
         self.instrument = get_keithley()
         self._start_time = time.time()
@@ -77,56 +83,49 @@ class JVProcedure(Procedure):
 
     def execute(self) -> None:
         """
-        Perform the J–V sweep across the selected channels,
+        Perform the J–V sweep across the selected channel,
         emitting results and progress updates.
         """
         logger.info("Beginning J–V sweep")
+        ch = int(self.active_channel)
         voltages: np.ndarray = np.arange(
             self.start_voltage,
             self.stop_voltage + self.step_size,
             self.step_size
         )
-        # Determine which channels are enabled
-        channels: List[int] = [
-            ch for ch in range(1, 7)
-            if getattr(self, f"channel{ch}")
-        ]
-        total_steps: int = len(voltages) * len(channels) if channels else 1
+        total_steps: int = len(voltages)
         step: int = 0
 
-        for ch in channels:
-            logger.info(f"Measuring Channel {ch}")
-            self.mux.select_channel(ch)
-            #self.mux.select_channel(ch)
-            sleep(self.pre_sweep_delay)
-            for v in voltages:
-                if self.should_stop():
-                    logger.warning(
-                        f"Aborting sweep early at Channel {ch}, Voltage {v:.3f} V"
-                    )
-                    return
-                # Source the set voltage and wait for settling
-                self.instrument.source_voltage = v
-                sleep(self.delay_between_points)
-                current: float = self.instrument.measure_current()
-                elapsed: float = time.time() - self._start_time
-                status: str = "OK"
-                # Emit the measurement data and progress
-                self.emit('results', {
-                    "Channel": ch,
-                    "Voltage (V)": v,
-                    "Current (A)": current,
-                    "Time (s)": elapsed,
-                    "Status": status,
-                })
-                progress: float = 100.0 * step / total_steps
-                self.emit("progress", progress)
-                logger.debug(
-                    f"Step {step}/{total_steps}: "
-                    f"Ch={ch}, V={v:.3f} V, I={current:.6e} A, "
-                    f"Elapsed={elapsed:.2f}s, Progress={progress:.1f}%"
+        logger.info(f"Measuring Channel {ch}")
+        self.mux.select_channel(ch)
+        sleep(self.pre_sweep_delay)
+        for v in voltages:
+            if self.should_stop():
+                logger.warning(
+                    f"Aborting sweep early at Channel {ch}, Voltage {v:.3f} V"
                 )
-                step += 1
+                return
+            self.instrument.source_voltage = v
+            sleep(self.delay_between_points)
+            current: float = self.instrument.measure_current()
+            elapsed: float = time.time() - self._start_time
+            status: str = "OK"
+            self.emit('results', {
+                "Channel": ch,
+                "Voltage (V)": v,
+                "Current (A)": current,
+                "Time (s)": elapsed,
+                "Status": status,
+            })
+            progress: float = 100.0 * step / total_steps
+            self.emit("progress", progress)
+            logger.debug(
+                f"Step {step}/{total_steps}: "
+                f"Ch={ch}, V={v:.3f} V, I={current:.6e} A, "
+                f"Elapsed={elapsed:.2f}s, Progress={progress:.1f}%"
+            )
+            step += 1
+        self.mux.deselect_channel(ch)
         logger.info("J–V sweep complete")
 
     def shutdown(self) -> None:
