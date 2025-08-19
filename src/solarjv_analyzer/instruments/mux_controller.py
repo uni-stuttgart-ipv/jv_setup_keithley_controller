@@ -34,7 +34,7 @@ class MuxController:
         Select (turn ON) the specified channel (1–6).
         """
         print(f"Selecting channel {channel}")
-        pixel = channel - 1
+        pixel=channel-1
         command = f"AA010{pixel}000000BB"
         self._send_hex(command)
 
@@ -43,7 +43,7 @@ class MuxController:
         Deselect (turn OFF) the specified channel.
         """
         print(f"Deselecting channel {channel}")
-        pixel = channel - 1
+        pixel=channel-1
         command = f"AA010{pixel}000100BB"
         self._send_hex(command)
 

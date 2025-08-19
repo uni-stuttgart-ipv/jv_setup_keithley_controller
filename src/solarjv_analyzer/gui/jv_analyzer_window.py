@@ -152,7 +152,23 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
 
         # -------- Queue + Abort Buttons --------
         self.simulation_checkbox = QtWidgets.QCheckBox("Simulation Mode")
-        # Place the simulation checkbox just above the button row
+        # --- Connection status lights (just above the Queue button) ---
+        lights_row = QtWidgets.QHBoxLayout()
+        self.keithley_light = QtWidgets.QLabel("  ")
+        self.keithley_light.setFixedSize(14, 14)
+        self.keithley_light.setStyleSheet("border-radius:7px; background:#c33;")  # red by default
+        self.keithley_light_label = QtWidgets.QLabel("Keithley")
+        self.mux_light = QtWidgets.QLabel("  ")
+        self.mux_light.setFixedSize(14, 14)
+        self.mux_light.setStyleSheet("border-radius:7px; background:#c33;")  # red by default
+        self.mux_light_label = QtWidgets.QLabel("MUX")
+        lights_row.addStretch(1)
+        lights_row.addWidget(self.keithley_light)
+        lights_row.addWidget(self.keithley_light_label)
+        lights_row.addSpacing(12)
+        lights_row.addWidget(self.mux_light)
+        lights_row.addWidget(self.mux_light_label)
+        lights_row.addStretch(1)
         self.queue_button = QtWidgets.QPushButton("Queue")
         self.abort_button = QtWidgets.QPushButton("Abort")
         button_layout = QtWidgets.QHBoxLayout()
@@ -165,6 +181,7 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         sidebar_layout.addWidget(tabs)
         sidebar_layout.addWidget(file_section)
         sidebar_layout.addWidget(self.simulation_checkbox)
+        sidebar_layout.addLayout(lights_row)
         sidebar_layout.addLayout(button_layout)
         sidebar_layout.addStretch()
 
@@ -202,6 +219,8 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         main_layout.addWidget(main_splitter)
 
         self.setCentralWidget(self.main)
+        # Initialize lights to current connection state
+        self.update_instrument_lights()
 
     def on_select_all_channels(self, checked: bool) -> None:
         """Toggle all individual channel checkboxes."""
@@ -256,11 +275,16 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         sim_mode = self.simulation_checkbox.isChecked()
         self.instrument_manager.connect_keithley(simulation=sim_mode)
         self.instrument_manager.connect_mux(simulation=sim_mode)
+        self.update_instrument_lights()
 
         base, ext = os.path.splitext(filename)
         if self.single_file_checkbox.isChecked():
             # Bundle all channels into one procedure/output file
             proc = JVProcedure(
+                manager=self.instrument_manager,
+                mux=self.instrument_manager.mux,
+                instrument=self.instrument_manager.keithley,
+                simulation=sim_mode,
                 user_name=self.username,
                 start_voltage=start,
                 stop_voltage=stop,
@@ -274,8 +298,6 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
                 channel5=5 in channels_selected,
                 channel6=6 in channels_selected,
             )
-            # Assign mux reference to procedure
-            proc.mux = self.instrument_manager.mux
             ch_list_str = "_".join(str(ch) for ch in channels_selected)
             combined_filename = f"{base}_{timestamp}_ch{ch_list_str}{ext}"
             full_path = os.path.join(directory, combined_filename)
@@ -289,6 +311,9 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
             # Queue one experiment per selected channel
             for ch_num in channels_selected:
                 proc = JVProcedure(
+                    manager=self.instrument_manager,
+                    mux=self.instrument_manager.mux,
+                    instrument=self.instrument_manager.keithley,
                     user_name=self.username,
                     start_voltage=start,
                     stop_voltage=stop,
@@ -302,9 +327,8 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
                     channel5=(ch_num == 5),
                     channel6=(ch_num == 6),
                     active_channel=ch_num,
-                    simulation=sim_mode
+                    simulation=sim_mode,
                 )
-                proc.mux = self.instrument_manager.mux
                 single_filename = f"{base}_{timestamp}_ch{ch_num}{ext}"
                 full_path = os.path.join(directory, single_filename)
 
@@ -404,6 +428,18 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
             self.abort_button.setEnabled(False)
             self.abort_button.setText("Abort")
             self.browser_widget.clear_button.setEnabled(True)
+        self.update_instrument_lights()
+
+    def update_instrument_lights(self) -> None:
+        """Green when connected (or simulated), red otherwise."""
+        # Keithley status
+        k_connected = getattr(self.instrument_manager, "keithley", None) is not None
+        self.keithley_light.setStyleSheet(f"border-radius:7px; background:{{'#3c3' if k_connected else '#c33'}};".format(
+            **{"#3c3": "#3c3", "#c33": "#c33"}))
+        # MUX status
+        m_connected = getattr(self.instrument_manager, "mux", None) is not None
+        self.mux_light.setStyleSheet(f"border-radius:7px; background:{{'#3c3' if m_connected else '#c33'}};".format(
+            **{"#3c3": "#3c3", "#c33": "#c33"}))
 
     def show_experiments(self) -> None:
         """Show all curves in the plot by checking all items."""
