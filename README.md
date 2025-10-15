@@ -22,6 +22,7 @@ A Python-based GUI application for performing multi-channel J–V (current–vol
 
 ## Features
 
+- Comprehensive Analysis: Automatically calculates key solar cell metrics (Voc, Isc, Fill Factor, Efficiency, etc.) after each measurement.
 - GUI for configuring and running JV sweeps with PyMeasure
 - Real or simulated instrument backends (Keithley SMU and serial MUX)
 - Live plot and log display
@@ -131,9 +132,39 @@ jv_setup_keithley_controller/
 │       ├── __main__.py
 │       ├── main.py
 │       ├── config.py
-│       ├── procedures/
+│       ├── analysis/
+│       │   ├── efficiency.py
+│       │   ├── fill_factor.py
+│       │   ├── isc.py
+│       │   ├── main_calculator.py
+│       │   ├── mpp.py
+│       │   ├── resistances.py
+│       │   └── voc.py
+│       ├── gui/
+│       │   ├── __init__.py
+│       │   ├── app_controller.py
+│       │   ├── jv_analyzer_window.py
+│       │   ├── login_dialog.py
+│       │   └── widgets/
+│       │       ├── analysis_panel.py
+│       │       ├── analysis_settings_tab.py
+│       │       ├── file_panel.py
+│       │       ├── instrument_tab.py
+│       │       └── parameter_tab.py
 │       ├── instruments/
-│       └── utils/
+│       │   ├── __init__.py
+│       │   ├── instrument_manager.py
+│       │   ├── mux_controller.py
+│       │   └── simulated/
+│       │       ├── simulated_keithley.py
+│       │       └── simulated_mux.py
+│       ├── procedures/
+│       │   ├── __init__.py
+│       │   └── jv_procedure.py
+│       ├── utils/
+│       │   ├── __init__.py
+│       │   └── database.py
+│       └── users.db
 ├── data/
 ├── logs/
 └── reports/
@@ -143,7 +174,6 @@ jv_setup_keithley_controller/
 
 ## Future Extensions
 
-- Automated data analysis (J<sub>SC</sub>, V<sub>OC</sub>, FF, efficiency)
 - Sequence editor for complex experiment workflows
 - Centralized database logging
 - Plugin architecture for additional instruments
