@@ -14,17 +14,17 @@ class AnalysisPanel(QtWidgets.QWidget):
     """
 
     DEFAULT_LABELS_UNITS = [
-        ("EFF - Efficency", "%"),
-        ("FF- fill factor", "%"),
-        ("Voc - open circuit volatge", "mV"),
-        ("Jsc - short circ. current density", "mA/cm2"),
-        ("Vmax", "mV"),
-        ("Jmax", "mA/cm2"),
-        ("Isc - short circ. current", "A"),
-        ("Rsc - short circ. resistence", "Ohm"),
-        ('Roc  open ""', "Ohm"),
-        ("A - Area", "cm2"),
-        ("Incd. Pwr", "mW/cm2"),
+        ("EFF","%"),
+        ("FF","%"),
+        ("Voc","mV"),
+        ("Jsc","mA/cm2"),
+        ("Vmax","mV"),
+        ("Jmax","mA/cm2"),
+        ("Isc","A"),
+        ("Rsc","Ohm"),
+        ("Roc","Ohm"),
+        ("A","cm2"),
+        ("Incd. Pwr","mW/cm2"),
     ]
 
     def __init__(self, parent=None):

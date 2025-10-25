@@ -133,13 +133,7 @@ jv_setup_keithley_controller/
 │       ├── main.py
 │       ├── config.py
 │       ├── analysis/
-│       │   ├── efficiency.py
-│       │   ├── fill_factor.py
-│       │   ├── isc.py
-│       │   ├── main_calculator.py
-│       │   ├── mpp.py
-│       │   ├── resistances.py
-│       │   └── voc.py
+│       │   ├── analysis.py
 │       ├── gui/
 │       │   ├── __init__.py
 │       │   ├── app_controller.py
@@ -165,6 +159,10 @@ jv_setup_keithley_controller/
 │       │   ├── __init__.py
 │       │   └── database.py
 │       └── users.db
+├── tests/
+│     ├── conftest.py
+│     ├── analysis/
+│              ├── test_analysis.py
 ├── data/
 ├── logs/
 └── reports/

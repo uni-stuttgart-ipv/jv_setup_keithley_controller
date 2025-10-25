@@ -26,6 +26,7 @@ dependencies = [
   "matplotlib",
   "reportlab",
   "pandas",
+  "scipy",
 ]
 
 [tool.hatch.envs.default]
