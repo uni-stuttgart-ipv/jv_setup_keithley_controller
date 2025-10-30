@@ -71,17 +71,18 @@ class AppController:
         self.view.instrument_manager.connect_mux(simulation=sim_mode)
         self.view.update_instrument_lights()
 
-        timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
+        timestamp_str = datetime.now().strftime(TIMESTAMP_FORMAT)
+        filename_timestamp = timestamp_str.replace(":", "-").replace(" ", "_")
         base, ext = os.path.splitext(file_params['filename'])
         directory = file_params['directory']
 
         if file_params['single_file']:
             self._queue_single_file_experiment(
-                directory, base, ext, timestamp, channels_selected, procedure_params, sim_mode
+                directory, base, ext, filename_timestamp, channels_selected, procedure_params, sim_mode
             )
         else:
             self._queue_multi_file_experiment(
-                directory, base, ext, timestamp, channels_selected, procedure_params, sim_mode
+                directory, base, ext, filename_timestamp, channels_selected, procedure_params, sim_mode
             )
 
     def _queue_single_file_experiment(self, directory, base, ext, timestamp, channels, params, sim):

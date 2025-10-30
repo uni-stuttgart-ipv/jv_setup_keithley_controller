@@ -45,12 +45,23 @@ start = "python src/solarjv_analyzer/main.py"
 
 [tool.briefcase]
 project_name = "SolarJVAnalyzer"
-formal_name  = "Solar JV Analyzer"
-bundle       = "com.yourorg.solarjvanalyzer"
-version      = "0.0.1"                      # ← Explicit literal version
+formal_name = "Solar JV Analyzer"
+bundle = "com.yourorg.solarjvanalyzer"
+version = "0.0.1"
 
 [tool.briefcase.app.solarjv_analyzer]
-sources     = ["src/solarjv_analyzer"]
+sources = ["src/solarjv_analyzer"]
 entry_point = "solarjv_analyzer.main:main"
-requires    = ["pymeasure", "PyQt5", "pyserial"]
+python_version = "3.9"
+requires = [
+  "pymeasure",
+  "PyQt5",
+  "pyvisa",
+  "matplotlib",
+  "reportlab",
+  "pandas",
+  "scipy",
+  "pyserial",
+  "std-nslog" 
+]
 license.file = "LICENSE.txt"
