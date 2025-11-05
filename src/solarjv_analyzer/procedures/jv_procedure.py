@@ -269,32 +269,55 @@ class JVProcedure(Procedure):
         try:
             results_obj = getattr(self, "results", None)
             data_path = None
+            
             # Probe common attribute names used by pymeasure Results
             for name in ("data_filename", "data_path", "filename", "datafile", "data_file"):
                 p = getattr(results_obj, name, None)
                 if isinstance(p, str) and p:
                     data_path = p
                     break
+            
             # Some Results expose the file handle; try to resolve name
             if data_path is None and hasattr(results_obj, "_data_file") and getattr(results_obj, "_data_file"):
                 try:
                     data_path = results_obj._data_file.name  # type: ignore[attr-defined]
                 except Exception:
                     pass
+            
             # Ensure data is flushed before appending
             try:
                 if hasattr(results_obj, "_data_file") and results_obj._data_file:
                     results_obj._data_file.flush()
             except Exception:
                 pass
-            if data_path and getattr(self, "_last_metrics", None):
-                with open(data_path, "a", encoding="utf-8") as f:
-                    f.write("\n[[ANALYSIS]]\n")
-                    f.write(f"Channel\t{ch}\n")
-                    for label, unit in self.ANALYSIS_LABELS_UNITS:
-                        val = self._last_metrics.get(label, 0.0)
-                        f.write(f"{label}\t{val}\t{unit}\n")
-                    f.write("[[/ANALYSIS]]\n")
+            
+            # Check if metrics were calculated successfully
+            if not getattr(self, "_last_metrics", None):
+                logger.error(
+                    f"Skipping [[ANALYSIS]] block write for ch {ch}: "
+                    f"_last_metrics is missing or None. "
+                    f"Check for earlier 'Metric computation failed' warnings."
+                )
+                return  # Exit method
+
+            # Check if the data_path was found
+            if not data_path:
+                logger.error(
+                    f"Skipping [[ANALYSIS]] block write for ch {ch}: "
+                    f"Could not resolve data_path from results object: {results_obj}"
+                )
+                return  # Exit method
+
+            # If we get here, _last_metrics and data_path are valid
+            logger.info(f"Appending [[ANALYSIS]] block to {data_path}")
+            with open(data_path, "a", encoding="utf-8") as f:
+                f.write("\n[[ANALYSIS]]\n")
+                f.write(f"Channel\t{ch}\n")
+                for label, unit in self.ANALYSIS_LABELS_UNITS:
+                    val = self._last_metrics.get(label, 0.0)
+                    f.write(f"{label}\t{val}\t{unit}\n")
+                f.write("[[/ANALYSIS]]\n")
+                
         except Exception as e:
             logger.warning(f"Failed to append [[ANALYSIS]] block: {e}")
 

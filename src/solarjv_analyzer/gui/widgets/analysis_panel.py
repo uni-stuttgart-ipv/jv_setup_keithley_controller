@@ -21,8 +21,8 @@ class AnalysisPanel(QtWidgets.QWidget):
         ("Vmax","mV"),
         ("Jmax","mA/cm2"),
         ("Isc","A"),
-        ("Rsc","Ohm"),
-        ("Roc","Ohm"),
+        ("Rsh","Ohm"),
+        ("Rs","Ohm"),
         ("A","cm2"),
         ("Incd. Pwr","mW/cm2"),
     ]
