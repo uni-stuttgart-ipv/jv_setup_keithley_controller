@@ -1,14 +1,10 @@
 """
 Main window for the JV Analyzer application.
-
-This class constructs the user interface by assembling various specialized
-widget components. It creates and owns the AppController, which manages all
-application logic and state. The window's role is to display the UI and
-forward user interactions to the controller.
 """
 from PyQt5 import QtWidgets, QtCore
 import os
 from datetime import datetime
+import pyqtgraph.exporters
 
 from pymeasure.display.widgets import PlotWidget, LogWidget, BrowserWidget
 from pymeasure.experiment import Results
@@ -29,17 +25,13 @@ from .app_controller import AppController
 class JVAnalyzerWindow(QtWidgets.QMainWindow):
     """
     The main application window, acting as the 'View'.
-
-    This class builds the visual layout from child widgets and delegates all
-    control logic (e.g., queuing experiments, handling button clicks) to an
-    instance of the AppController.
     """
     def __init__(self, username=None):
         super().__init__()
         self.username = username
         self.instrument_manager = InstrumentManager()
         self.setWindowTitle("Custom JV Analyzer")
-        self.resize(1000, 720)
+        self.resize(1200, 720) # Increased width for new columns
         self.setMinimumSize(1000, 700)
 
         self._layout()
@@ -111,23 +103,61 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         # Assemble the main display area with splitters
         self.tabs = QtWidgets.QTabWidget()
         self.plot_widget = PlotWidget(name="Plot", columns=JVProcedure.DATA_COLUMNS, x_axis="Voltage (V)", y_axis="Current (A)")
+        self.plot_widget.plot.showGrid(x=True, y=True, alpha=0.3)
         self.log_widget = LogWidget(name="Log")
         self.tabs.addTab(self.plot_widget, "Plot")
         self.tabs.addTab(self.log_widget, "Log")
 
-        # Create a temporary procedure instance to dynamically get parameter names
-        procedure_parameters = list(JVProcedure().parameter_objects().keys())
-        self.browser_widget = BrowserWidget(JVProcedure, procedure_parameters, JVProcedure.DATA_COLUMNS)
+        # --- Create Container for Plot + Button ---
+        plot_container = QtWidgets.QWidget()
+        plot_layout = QtWidgets.QVBoxLayout(plot_container)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_layout.addWidget(self.tabs) # Add tabs to container
+        
+        self.save_plot_button = QtWidgets.QPushButton("Save Plot as PNG")
+        plot_layout.addWidget(self.save_plot_button) # Add button to container
+        # ------------------------------------------
+
+        # --- BROWSER COLUMN CONFIGURATION ---
+        # Explicitly filter the parameters shown in the browser.
+        # Graph, Filename, Progress are automatic. Status is in DATA_COLUMNS.
+        
+        display_parameters = [
+            "active_channel",
+            "compliance_current",
+            "delay_between_points",       
+            "device_area",
+            "incident_power",
+            "lateral_factor",   
+            "pre_sweep_delay",
+            "sense_mode",
+            "start_voltage",
+            "step_size",
+            "stop_voltage",
+            "user_name"
+        ]
+        
+        self.browser_widget = BrowserWidget(
+            JVProcedure, 
+            display_parameters, 
+            JVProcedure.DATA_COLUMNS
+        )
+        # ------------------------------------
+
         self.analysis_panel = AnalysisPanel(self)
 
+        # Create Bottom Splitter (Browser | Analysis)
         bottom_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         bottom_splitter.addWidget(self.browser_widget)
         bottom_splitter.addWidget(self.analysis_panel)
         bottom_splitter.setStretchFactor(0, 4)
         bottom_splitter.setStretchFactor(1, 1)
 
+        # Create Vertical Splitter (Plot Container | Bottom Splitter)
         vertical_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        vertical_splitter.addWidget(self.tabs)
+        
+        vertical_splitter.addWidget(plot_container) 
+        
         vertical_splitter.addWidget(bottom_splitter)
         vertical_splitter.setStretchFactor(0, 2)
         vertical_splitter.setStretchFactor(1, 1)
@@ -143,6 +173,8 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.queue_button.clicked.connect(self.controller.queue_experiment)
         self.abort_button.clicked.connect(self.controller.abort_experiment)
 
+        self.save_plot_button.clicked.connect(self.save_plot)
+
         # Browser and file dialog actions are handled by the view
         self.file_panel.browse_button.clicked.connect(self.open_directory_dialog)
         self.browser_widget.show_button.clicked.connect(self.show_experiments)
@@ -150,6 +182,9 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.browser_widget.clear_button.clicked.connect(self.clear_experiments)
         self.browser_widget.open_button.clicked.connect(self.open_experiment)
         self.browser_widget.browser.itemChanged.connect(self.browser_item_changed)
+        
+        # Handle Browser Selection to update Analysis Panel
+        self.browser_widget.browser.itemSelectionChanged.connect(self.controller.on_browser_selection_changed)
 
     def update_save_directory(self) -> None:
         """Sets the default save directory in the file panel to today's date."""
@@ -192,13 +227,12 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.analysis_panel.clear_all()
 
     def open_experiment(self) -> None:
-        """Opens existing result files into the application."""
+        """Opens existing result files using the custom loader."""
         dialog = QtWidgets.QFileDialog(self, "Open Results File")
         if dialog.exec_():
-            for filename in dialog.selectedFiles():
-                results = Results.load(filename)
-                experiment = self.controller._new_experiment(results)
-                self.controller.manager.load(experiment)
+            files = dialog.selectedFiles()
+            # Delegate loading to controller which handles custom parsing
+            self.controller.load_files(files)
 
     def browser_item_changed(self, item, column):
         """Shows or hides a curve when its checkbox is toggled."""
@@ -211,3 +245,27 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
                 else:
                     for curve in experiment.curve_list:
                         curve.wdg.load(curve)
+
+    def save_plot(self) -> None:
+        """Exports the current plot to a PNG file."""
+        try:
+            # Create an exporter for the specific plot item
+            exporter = pyqtgraph.exporters.ImageExporter(self.plot_widget.plot)
+            
+            # Optional: Set a specific width for higher resolution (e.g., 1920px)
+            # exporter.parameters()['width'] = 1920
+            
+            # Open File Dialog
+            filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save Plot", "", "PNG Image (*.png)"
+            )
+            
+            if filename:
+                if not filename.lower().endswith(".png"):
+                    filename += ".png"
+                
+                # Export the image
+                exporter.export(filename)
+                
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Export Error", f"Failed to save image: {str(e)}")

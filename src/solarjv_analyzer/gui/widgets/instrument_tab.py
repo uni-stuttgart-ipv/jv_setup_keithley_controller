@@ -21,7 +21,6 @@ class InstrumentTab(QtWidgets.QWidget):
         
         self.gpib_address = QtWidgets.QLineEdit(GPIB_ADDRESS)
         self.nplc = QtWidgets.QLineEdit("1")
-        self.delay_between_points = QtWidgets.QLineEdit("0.1")
         
         self.measurement_range = QtWidgets.QComboBox()
         self.measurement_range.addItems(["Auto", "1 A", "100 mA", "10 mA", "1 mA", "100 uA"])
@@ -32,7 +31,6 @@ class InstrumentTab(QtWidgets.QWidget):
         layout.addRow("Instrument:", self.instrument_name)
         layout.addRow("GPIB Address:", self.gpib_address)
         layout.addRow("NPLC (PLC units):", self.nplc)
-        layout.addRow("Delay Between Points (s):", self.delay_between_points)
         layout.addRow("Measurement Range:", self.measurement_range)
         layout.addRow("Sense Mode:", self.sense_mode)
 
@@ -43,7 +41,6 @@ class InstrumentTab(QtWidgets.QWidget):
         return {
             'gpib_address': self.gpib_address.text(),
             'nplc': float(self.nplc.text()),
-            'delay_between_points': float(self.delay_between_points.text()),
             'measurement_range': self.measurement_range.currentText(),
             'sense_mode': self.sense_mode.currentText(),
         }

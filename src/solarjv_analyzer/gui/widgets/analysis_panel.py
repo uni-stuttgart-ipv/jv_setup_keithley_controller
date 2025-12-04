@@ -7,10 +7,6 @@ logger = logging.getLogger(__name__)
 class AnalysisPanel(QtWidgets.QWidget):
     """
     A right-side panel that displays per-channel analysis in a compact table.
-
-    This widget uses vertical tabs, one for each measurement channel. Each tab
-    contains a 2-column QTableWidget to display the calculated performance
-    metrics and their corresponding values and units.
     """
 
     DEFAULT_LABELS_UNITS = [
@@ -76,13 +72,6 @@ class AnalysisPanel(QtWidgets.QWidget):
     def reset_channels(self, channels: List[int], labels_units: List[Tuple[str, str]]) -> None:
         """
         Prepares the UI with tabs for the selected channels.
-
-        This method clears any existing tabs and creates a new tab with a table
-        for each channel specified in the list.
-
-        Args:
-            channels: A list of channel numbers to create tabs for.
-            labels_units: A list of (label, unit) tuples for the table rows.
         """
         self._labels_units = labels_units or self.DEFAULT_LABELS_UNITS
         self._tables.clear()
@@ -113,16 +102,13 @@ class AnalysisPanel(QtWidgets.QWidget):
     def analysis(self, data: Dict) -> None:
         """
         Updates a channel's table with the provided analysis metrics.
-
-        Args:
-            data: A dictionary containing the metrics. Must include a 'Channel'
-                  key to identify the correct tab to update.
         """
         try:
             ch = int(data.get("Channel"))
             table = self._tables.get(ch)
             if not table:
-                logger.warning(f"Analysis update called for Channel {ch}, but no table was found.")
+                # If table doesn't exist (e.g. partial loading), we might skip or log
+                # logger.warning(f"Analysis update called for Channel {ch}, but no table was found.")
                 return
 
             label_to_row = {label: idx for idx, (label, _u) in enumerate(self._labels_units)}
@@ -154,6 +140,17 @@ class AnalysisPanel(QtWidgets.QWidget):
 
         except Exception as e:
             logger.warning(f"AnalysisPanel update failed: {e}")
+
+    # --- NEW METHOD ---
+    def set_active_channel(self, channel: int) -> None:
+        """Switches the active tab to the specified channel."""
+        # Find the index of the tab with text "Ch {channel}"
+        target_text = f"Ch {channel}"
+        for i in range(self._tabs.count()):
+            if self._tabs.tabText(i) == target_text:
+                self._tabs.setCurrentIndex(i)
+                return
+    # ------------------
 
     def clear_all(self) -> None:
         """Resets all displayed values to zeros while keeping tabs."""
