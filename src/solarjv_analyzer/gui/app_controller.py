@@ -78,13 +78,43 @@ class AppController:
             self.is_busy = False
             return
 
+        # Reset state for this run
         self.experiment_files = {}
         self.processed_files = set()
         self.is_single_file_mode = file_params['single_file']
 
+        # --- PRESERVE EXISTING CHANNELS ---
+        # 1. Identify all currently loaded channels from the browser
+        existing_channels = set()
+        existing_exps = []
+        root = self.view.browser_widget.browser.invisibleRootItem()
+        for i in range(root.childCount()):
+            item = root.child(i)
+            exp = self.manager.experiments.with_browser_item(item)
+            if exp:
+                existing_exps.append(exp)
+                if hasattr(exp.procedure, 'active_channel'):
+                    try:
+                        existing_channels.add(int(exp.procedure.active_channel))
+                    except (ValueError, TypeError): pass
+
+        # 2. Combine with new selections
+        all_active_channels = sorted(list(existing_channels.union(set(channels_selected))))
+
+        # 3. Reset panel with ALL channels (Old + New)
         self.view.analysis_panel.reset_channels(
-            channels_selected, JVProcedure.ANALYSIS_LABELS_UNITS
+            all_active_channels, JVProcedure.ANALYSIS_LABELS_UNITS
         )
+
+        # 4. Restore data for channels NOT being measured right now
+        # (We leave the new/queued channels as 0.00 so they update live)
+        for exp in existing_exps:
+            if hasattr(exp.procedure, 'analysis_results') and exp.procedure.analysis_results:
+                for ch, metrics in exp.procedure.analysis_results.items():
+                    # Only restore if this channel is NOT in the new queue
+                    if ch not in channels_selected:
+                        self.view.analysis_panel.analysis({'Channel': ch, **metrics})
+        # ---------------------------------------
 
         sim_mode = file_params['simulation']
         
@@ -198,6 +228,7 @@ class AppController:
                 logger.error(f"Failed to load {filename}: {e}", exc_info=True)
                 QtWidgets.QMessageBox.warning(self.view, "Load Error", f"Failed to load {os.path.basename(filename)}\n{e}")
 
+        # Prevent Disappearing Channels on Load
         all_active_channels = set()
         browser = self.view.browser_widget.browser
         root = browser.invisibleRootItem()
@@ -217,10 +248,14 @@ class AppController:
                 JVProcedure.ANALYSIS_LABELS_UNITS
             )
 
-        for analysis_entry in all_analysis_data:
-            ch = analysis_entry.get('Channel')
-            if ch:
-                self.view.analysis_panel.analysis({'Channel': ch, **analysis_entry})
+        # Auto-Load Analysis for ALL channels
+        # Restore data for ALL loaded experiments (both old and new)
+        for i in range(root.childCount()):
+            item = root.child(i)
+            exp = self.manager.experiments.with_browser_item(item)
+            if exp and hasattr(exp.procedure, 'analysis_results') and exp.procedure.analysis_results:
+                for ch, metrics in exp.procedure.analysis_results.items():
+                    self.view.analysis_panel.analysis({'Channel': ch, **metrics})
 
         if newly_loaded_items:
             first_exp = newly_loaded_items[0]
@@ -228,8 +263,9 @@ class AppController:
                 item = root.child(i)
                 if self.manager.experiments.with_browser_item(item) == first_exp:
                     item.setSelected(True)
-                    # Trigger the selection logic manually for the first item
-                    self.on_browser_selection_changed()
+                    # Force update active tab
+                    if hasattr(first_exp.procedure, 'active_channel'):
+                        self.view.analysis_panel.set_active_channel(int(first_exp.procedure.active_channel))
                     break
 
     def _parse_and_load_single_file(self, filename: str) -> tuple:
@@ -327,20 +363,19 @@ class AppController:
             experiment = self.manager.experiments.with_browser_item(item)
             
             if experiment:
-                # 1. Update Analysis Panel if data exists
+                # 1. Update Analysis Panel
                 if hasattr(experiment.procedure, 'analysis_results'):
                     results = experiment.procedure.analysis_results
                     if results:
                         for ch, metrics in results.items():
                             self.view.analysis_panel.analysis({'Channel': ch, **metrics})
                 
-                # 2. FIX: Switch the active tab to match the channel
+                # 2. Switch active tab
                 if hasattr(experiment.procedure, 'active_channel'):
                     try:
                         ch = int(experiment.procedure.active_channel)
                         self.view.analysis_panel.set_active_channel(ch)
-                    except (ValueError, TypeError):
-                        pass
+                    except (ValueError, TypeError): pass
                         
         except Exception as e:
             logger.error(f"Selection handler error: {e}")
