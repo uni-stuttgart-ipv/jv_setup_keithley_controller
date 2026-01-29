@@ -53,6 +53,7 @@ version = "0.0.1"
 sources = ["src/solarjv_analyzer"]
 entry_point = "solarjv_analyzer.main:main"
 python_version = "3.9"
+icon = "app_icon"
 requires = [
   "pymeasure",
   "PyQt5",
