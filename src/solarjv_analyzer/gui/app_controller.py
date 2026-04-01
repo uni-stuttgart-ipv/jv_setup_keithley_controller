@@ -164,6 +164,7 @@ class AppController:
                 manager=self.view.instrument_manager,
                 simulation=sim,
                 active_channel=ch_num,
+                check_errors_between_points=False,
                 **single_ch_params
             )
             
@@ -188,6 +189,7 @@ class AppController:
                 manager=self.view.instrument_manager,
                 simulation=sim,
                 active_channel=ch_num,
+                check_errors_between_points=False,
                 **single_ch_params
             )
 
