@@ -1,475 +1,674 @@
-import logging
-import traceback
-from typing import List, Dict, Optional
-from math import isclose
-from pymeasure.experiment import Procedure
-from pymeasure.experiment.parameters import FloatParameter, BooleanParameter, Parameter, IntegerParameter
-import numpy as np
-from time import sleep
-from solarjv_analyzer.config import CONFIG
-import time
-from solarjv_analyzer.analysis.analysis import compute_jv_metrics, ANALYSIS_LABELS_UNITS
-import os
+"""
+Keithley 2400 J-V Measurement Procedure
 
+Implements hardware-controlled staircase sweep for solar cell characterization.
+Uses the instrument's built-in sweep capability with automatic NPLC calculation
+from user-specified sweep rate.
+"""
+
+import logging
+import time
+import sys
+from typing import Optional
+from math import isclose
+
+import numpy as np
+import pyvisa
+from pymeasure.experiment import Procedure
+from pymeasure.experiment.parameters import (
+    FloatParameter, BooleanParameter, Parameter, IntegerParameter
+)
+
+from solarjv_analyzer.analysis.analysis import compute_jv_metrics, ANALYSIS_LABELS_UNITS
+
+# Configure module logger
 logger = logging.getLogger(__name__)
+
 
 class JVProcedure(Procedure):
     """
-    Implements a multi-channel J-V sweep procedure for solar cells.
-    OPTIMIZED VERSION - Much faster sweep speeds with GUI-respecting configuration.
-    """
-    signals = ['results', 'progress', 'log', 'status', 'analysis']
-    
-    DATA_COLUMNS = [
-        "Channel",
-        "Voltage (V)",
-        "Current (A)",
-        "Time (s)",
-        "Status",
-    ]
+    J-V sweep procedure for Keithley 2400 SourceMeter.
 
+    Executes a hardware-controlled staircase sweep from start_voltage to stop_voltage
+    with specified step_size. The sweep rate determines the measurement speed, and
+    NPLC is automatically calculated to match the requested rate.
+
+    Signals:
+        results: Emits individual data points during sweep
+        progress: Emits progress percentage (0-100)
+        analysis: Emits computed J-V metrics after sweep completion
+    """
+
+    signals = ['results', 'progress', 'log', 'status', 'analysis']
+
+    DATA_COLUMNS = ["Channel", "Voltage (V)", "Current (A)", "Time (s)", "Status"]
     ANALYSIS_LABELS_UNITS = ANALYSIS_LABELS_UNITS
 
-    # --- PARAMETERS ---
+    # =========================================================================
+    # Experiment Parameters
+    # =========================================================================
+
+    # Hardware
     mux = Parameter("MUX Object", default=None)
-    user_name = Parameter("User Name", default="")
-    
+    gpib_address = Parameter("GPIB Address", default="GPIB::1")
+
+    # Sweep Configuration
     start_voltage = FloatParameter("Start Voltage", units="V", default=1.2)
     stop_voltage = FloatParameter("Stop Voltage", units="V", default=-0.2)
     step_size = FloatParameter("Step Size", units="V", default=-0.01)
+    sweep_rate = FloatParameter("Sweep Rate", units="V/s", default=0.1)
     compliance_current = FloatParameter("Compliance Current", units="A", default=0.18)
-    
-    gpib_address = Parameter("GPIB Address", default="GPIB::1")
-    
+
+    # Channel Selection
     channel1 = BooleanParameter("Channel 1", default=True)
     channel2 = BooleanParameter("Channel 2", default=True)
     channel3 = BooleanParameter("Channel 3", default=True)
     channel4 = BooleanParameter("Channel 4", default=True)
     channel5 = BooleanParameter("Channel 5", default=True)
     channel6 = BooleanParameter("Channel 6", default=True)
-    
+    active_channel = Parameter("Active Channel", default="1")
+
+    # Measurement Settings
     nplc = FloatParameter("NPLC", default=0.1)
-    delay_between_points = FloatParameter("Dwell Time", units="s", default=0.01)
+    delay_between_points = FloatParameter("Dwell Time", units="s", default=0.0)
     pre_sweep_delay = FloatParameter("Pre-Sweep Delay", units="s", default=0.0)
-    
     measurement_range = Parameter("Measurement Range", default="Auto")
     sense_mode = Parameter("Sense Mode", default="2-wire")
+
+    # Sample Information
     device_area = FloatParameter("Device Area", units="cm2", default=0.089)
     incident_power = FloatParameter("Incident Power", units="mW/cm2", default=100)
+    user_name = Parameter("User Name", default="")
+
+    # Advanced Timing
+    auto_zero = BooleanParameter("Auto Zero", default=False)
+    line_frequency = FloatParameter("Line Frequency", units="Hz", default=50.0)
+
+    # Analysis (4-Probe)
     contact_threshold = FloatParameter("Contact Threshold", units="A", default=0.001)
     lateral_factor = FloatParameter("4-Probe Lateral Factor", default=1.0)
     probe_spacing = FloatParameter("4-Probe Spacing", units="um", default=2290)
     sample_thickness = FloatParameter("Sample Thickness", units="um", default=500)
-    active_channel = Parameter("Active Channel", default="1")
+
+    # Debug & Validation
     simulation = BooleanParameter("Simulation Mode", default=False)
-    
     check_errors_between_points = BooleanParameter("Check Errors Between Points", default=False)
-    
-    # Number of retry attempts for voltage setting
+    enable_validation = BooleanParameter("Enable Validation", default=False)
     voltage_retry_attempts = IntegerParameter("Voltage Retry Attempts", default=3)
 
-    # Range mapping for GUI selection to Amps
+    # Current range mapping from GUI selection to Amperes
     RANGE_MAP = {
         "1A": 1.0,
-        "100 mA": 0.1,    # Note: GUI uses "100 mA" with space
+        "100 mA": 0.1,
         "10 mA": 0.01,
         "1 mA": 0.001,
         "100 uA": 0.0001,
     }
 
-    def __init__(self, *args, manager: Optional[object] = None,
-                 mux: Optional[object] = None,
-                 instrument: Optional[object] = None,
-                 **kwargs):
+    def __init__(self, *args, manager=None, mux=None, instrument=None, **kwargs):
+        """Initialize the procedure with instrument references."""
         super().__init__(*args, **kwargs)
         self.manager = manager
         self.mux = mux
         self.instrument = instrument
-        try:
-            self._sim = bool(self.simulation)
-        except Exception:
-            self._sim = False
+        self._sim = bool(self.simulation)
+
+        # Data storage
         self._voltages = []
         self._currents = []
-        self.results = None
+        self._expected_voltages = []
         self.analysis_results = {}
-        self._last_v = 0
-        self._direct_visa = None
+        self._last_metrics = None
 
-    def _generate_voltages(self) -> np.ndarray:
+        # Internal state
+        self._total_points = 0
+        self._configured = False
+        self._visa_resource = None
+        self._line_freq = float(self.line_frequency)
+
+        logger.info(f"JVProcedure initialized (Channel {self.active_channel}, "
+                    f"Rate={self.sweep_rate} V/s, AutoZero={'ON' if self.auto_zero else 'OFF'})")
+
+    # -------------------------------------------------------------------------
+    # Hardware Communication
+    # -------------------------------------------------------------------------
+
+    def _write(self, cmd: str, description: str = ""):
+        """Send a command to the instrument with optional logging."""
+        if self._sim:
+            return
+        try:
+            logger.debug(f"Sending: {description or cmd}")
+            self.instrument.write(cmd)
+            time.sleep(0.02)
+        except Exception as e:
+            logger.error(f"Failed to send {description}: {e}")
+            raise
+
+    def _query(self, cmd: str, description: str = "") -> str:
+        """Send a query and return the response."""
+        if self._sim:
+            return "0,No error"
+        try:
+            logger.debug(f"Query: {description or cmd}")
+            response = self.instrument.ask(cmd)
+            logger.debug(f"Response: {response[:200]}")
+            return response
+        except Exception as e:
+            logger.error(f"Failed to query {description}: {e}")
+            raise
+
+    def _check_errors(self, context: str):
+        """Check the instrument's error queue and log any errors."""
+        if self._sim:
+            return
+        try:
+            response = self._query(":SYST:ERR?", "Error check")
+            if not response.startswith("0,"):
+                logger.warning(f"Error at {context}: {response}")
+        except Exception as e:
+            logger.error(f"Error check failed: {e}")
+
+    def _set_timeout(self, seconds: float):
+        """Configure VISA timeout for the instrument."""
+        if self._sim or not self.instrument:
+            return
+        try:
+            if hasattr(self.instrument, 'adapter') and hasattr(self.instrument.adapter, 'connection'):
+                self._visa_resource = self.instrument.adapter.connection
+                self._visa_resource.timeout = int(seconds * 1000)
+                logger.debug(f"VISA timeout: {seconds:.1f}s")
+        except Exception as e:
+            logger.warning(f"Could not set VISA timeout: {e}")
+
+    def _safety_abort(self):
+        """Emergency abort: turn off output and return instrument to idle."""
+        if self._sim or not self.instrument:
+            return
+        try:
+            logger.warning("Safety abort initiated")
+            self.instrument.write(":OUTP OFF")
+            time.sleep(0.05)
+            self.instrument.write(":ABOR")
+            time.sleep(0.05)
+            self.instrument.write("*CLS")
+            logger.info("Safety abort complete")
+        except Exception as e:
+            logger.error(f"Safety abort failed: {e}")
+
+    def _ensure_idle(self):
+        """Bring instrument to IDLE state before configuration."""
+        if self._sim or not self.instrument:
+            return
+        logger.debug("Ensuring idle state")
+        self._write(":OUTP OFF", "Output off")
+        self._write(":ABOR", "Abort")
+        time.sleep(0.1)
+        self._write(":TRIG:CLE", "Clear triggers")
+        self._write("*CLS", "Clear status")
+        time.sleep(0.05)
+
+    # -------------------------------------------------------------------------
+    # Sweep Parameter Calculation
+    # -------------------------------------------------------------------------
+
+    def _generate_voltage_sequence(self) -> list:
+        """
+        Generate the exact voltage sequence for the sweep.
+
+        Creates a list of voltages from start to stop with the specified step size,
+        ensuring the stop voltage is included.
+
+        Returns:
+            List of voltage values for the sweep
+        """
         start = float(self.start_voltage)
         stop = float(self.stop_voltage)
         step = float(self.step_size)
-        if step == 0: 
+
+        if step == 0:
             step = 0.1
-        step = abs(step)
-        if stop < start: 
-            step = -step
-        
-        vals = np.arange(start, stop + (0.5 * step), step)
-        if len(vals) > 0 and not isclose(vals[-1], stop, rel_tol=1e-9, abs_tol=1e-12):
-            if (step > 0 and vals[-1] > stop) or (step < 0 and vals[-1] < stop):
-                vals[-1] = stop
-        return vals
+        if stop < start:
+            step = -abs(step)
+        else:
+            step = abs(step)
 
-    def _fast_read_current(self) -> float:
+        voltages = []
+        current = start
+
+        if step > 0:
+            while current <= stop + (0.5 * step):
+                voltages.append(round(current, 6))
+                current += step
+        else:
+            while current >= stop + (0.5 * step):
+                voltages.append(round(current, 6))
+                current += step
+
+        # Ensure stop voltage is included
+        if voltages and abs(voltages[-1] - stop) > abs(step) * 0.1:
+            voltages.append(stop)
+
+        return voltages
+
+    def _calculate_nplc(self) -> tuple:
         """
-        OPTIMIZED: Bypass PyMeasure overhead for faster readings.
-        Properly parses Keithley's comma-separated response.
+        Calculate NPLC and source delay from the requested sweep rate.
+
+        Uses professor's method: total_time = voltage_range / sweep_rate
+        time_per_point = total_time / total_points
+        NPLC = time_per_point * line_frequency
+
+        Returns:
+            tuple: (nplc_value, source_delay_seconds)
         """
-        inst = self.instrument
-        if inst is None:
-            raise RuntimeError("Instrument is not initialized")
-        
-        # Try direct VISA communication first (fastest)
+        start = float(self.start_voltage)
+        stop = float(self.stop_voltage)
+        step = abs(float(self.step_size))
+
+        total_points = int(abs(stop - start) / step) + 1
+
+        # If sweep_rate is not specified, use user-provided NPLC
+        if self.sweep_rate <= 0:
+            return float(self.nplc), float(self.delay_between_points)
+
+        voltage_range = abs(stop - start)
+        total_time = voltage_range / self.sweep_rate
+        time_per_point = total_time / total_points
+
+        nplc = time_per_point * self._line_freq
+        nplc = max(0.01, min(10.0, nplc))
+
+        # Account for auto-zero measurement cycles
+        measurement_time = (nplc / self._line_freq) * (3 if self.auto_zero else 1)
+        source_delay = max(0, time_per_point - measurement_time)
+
+        logger.info(f"Sweep timing: {total_time:.2f}s total, {time_per_point*1000:.1f}ms/point, "
+                    f"NPLC={nplc:.3f}, delay={source_delay*1000:.1f}ms")
+
+        return nplc, source_delay
+
+    # -------------------------------------------------------------------------
+    # Instrument Configuration
+    # -------------------------------------------------------------------------
+
+    def _configure_instrument(self) -> int:
+        """
+        Configure Keithley 2400 for hardware-controlled staircase sweep.
+
+        Sets up source mode, measurement parameters, buffer, and trigger model.
+        The sweep automatically stores readings in the buffer.
+
+        Returns:
+            int: Number of points in the sweep
+        """
+        if self._configured:
+            return self._total_points
+
+        self._ensure_idle()
+
+        # Generate voltage sequence and calculate timing
+        self._expected_voltages = self._generate_voltage_sequence()
+        total_points = len(self._expected_voltages)
+
+        if total_points > 2500:
+            raise ValueError(f"Sweep requires {total_points} points > 2500 buffer limit")
+
+        self._total_points = total_points
+        nplc_val, source_delay = self._calculate_nplc()
+
+        # Calculate timeout with safety margin
+        measurement_time = (nplc_val / self._line_freq) * (3 if self.auto_zero else 1)
+        time_per_point = measurement_time + source_delay
+        total_time = total_points * time_per_point
+        self._set_timeout(max(30, total_time * 3))
+
+        # Reset instrument
+        self._write("*RST", "Reset")
+        time.sleep(0.2)
+        self._check_errors("After reset")
+
+        # Configure source for staircase sweep
+        start_v = self._expected_voltages[0]
+        stop_v = self._expected_voltages[-1]
+        step_v = self._expected_voltages[1] - self._expected_voltages[0]
+
+        self._write(":SOUR:FUNC VOLT", "Source function")
+        self._write(":SOUR:VOLT:MODE SWE", "Sweep mode")
+        self._write(f":SOUR:VOLT:STAR {start_v}", "Start voltage")
+        self._write(f":SOUR:VOLT:STOP {stop_v}", "Stop voltage")
+        self._write(f":SOUR:VOLT:STEP {step_v}", "Step size")
+        self._check_errors("After source config")
+
+        # Configure measurement
+        self._write(":SENS:FUNC 'CURR'", "Measure current")
+
+        sense_cmd = ":SYST:RSEN ON" if self.sense_mode == "4-wire" else ":SYST:RSEN OFF"
+        self._write(sense_cmd, f"Sense mode: {self.sense_mode}")
+
+        self._write(f":SENS:CURR:NPLC {nplc_val:.3f}", "NPLC")
+
+        # Measurement range
+        if self.measurement_range == "Auto":
+            self._write(":SENS:CURR:RANG:AUTO ON", "Auto range")
+        else:
+            self._write(":SENS:CURR:RANG:AUTO OFF", "Auto range off")
+            range_val = self.RANGE_MAP.get(self.measurement_range)
+            if range_val:
+                self._write(f":SENS:CURR:RANG {range_val}", f"Fixed range: {self.measurement_range}")
+
+        self._write(f":SENS:CURR:PROT {self.compliance_current}", "Compliance")
+        self._check_errors("After measurement config")
+
+        # Source delay
+        self._write(f":SOUR:DEL {source_delay:.6f}", "Source delay")
+        self._write(":SOUR:DEL:AUTO OFF", "Auto delay off")
+
+        # Auto-zero
+        if self.auto_zero:
+            self._write(":SYST:AZER ON", "Auto-zero on")
+        else:
+            self._write(":SYST:AZER OFF", "Auto-zero off")
+
+        # Buffer configuration (sweep automatically stores readings)
+        self._write(":TRAC:CLE", "Clear buffer")
+        self._write(f":TRAC:POIN {total_points}", "Buffer size")
+        self._write(":TRAC:FEED SENS", "Buffer feed")
+        self._write(":TRAC:FEED:CONT NEXT", "Buffer control")
+
+        # Data format
+        self._write(":FORM:ELEM VOLT,CURR", "Format: Voltage,Current")
+        self._write(":FORM:DATA ASC", "Format: ASCII")
+
+        # Trigger model
+        self._write(":TRIG:SOUR IMM", "Trigger source")
+        self._write(f":TRIG:COUN {total_points}", "Trigger count")
+        self._write(":TRIG:DEL 0", "Trigger delay")
+        self._write(":TRIG:OUTP NONE", "No output triggers")
+        self._write(":ARM:OUTP NONE", "No arm triggers")
+
+        time.sleep(0.1)
+        self._check_errors("End of configuration")
+
+        self._configured = True
+        logger.info(f"Instrument configured: {total_points} points")
+        return total_points
+
+    # -------------------------------------------------------------------------
+    # Sweep Execution
+    # -------------------------------------------------------------------------
+
+    def _execute_sweep(self, total_points: int, channel: int) -> bool:
+        """
+        Execute the sweep and collect measurement data.
+
+        Uses :READ? which triggers the sweep, waits for completion, and returns
+        all data. Results are parsed and emitted for real-time display.
+
+        Args:
+            total_points: Number of points expected in the sweep
+            channel: Active channel number
+
+        Returns:
+            bool: True if all points were collected successfully
+        """
+        measured_voltages = []
+        measured_currents = []
+
+        # Enable output
+        self._write(":OUTP ON", "Output on")
+        if self.pre_sweep_delay > 0:
+            time.sleep(self.pre_sweep_delay)
+        self._check_errors("After output on")
+
+        logger.info(f"Starting sweep on Channel {channel}")
+        sweep_start = time.time()
+
         try:
-            if self._direct_visa is None and hasattr(inst, 'adapter') and hasattr(inst.adapter, 'connection'):
-                self._direct_visa = inst.adapter.connection
-            
-            if self._direct_visa is not None:
-                # Direct VISA query - much faster than going through PyMeasure layers
-                response = self._direct_visa.query(":READ?")
-                # FIX: Keithley returns "current,voltage,status,time" - parse correctly
-                # Example: "0.002345,0.000000,0,0"
-                parts = response.strip().split(',')
-                if parts:
-                    return float(parts[0])  # Return the current value
-                else:
-                    raise ValueError(f"Empty response from instrument: {response}")
+            response = self._query(":READ?", "Sweep data")
+        except pyvisa.errors.VisaIOError as e:
+            logger.error(f"Sweep timeout: {e}")
+            self._safety_abort()
+            raise
         except Exception as e:
-            logger.debug(f"Direct VISA read failed, falling back: {e}")
-            # Fall back to other methods if direct fails
-            pass
-            
-        # Try measure_current method (moderate speed)
-        if hasattr(inst, "measure_current") and callable(getattr(inst, "measure_current")):
-            try: 
-                return float(inst.measure_current())
-            except Exception: 
-                pass
-            
-        # Try property access (slowest, but works)
-        if hasattr(inst, "current"):
-            try: 
-                return float(getattr(inst, "current"))
-            except Exception: 
-                pass
-            
-        # Last resort - raw read
-        if hasattr(inst, "read") and callable(getattr(inst, "read")):
-            try: 
-                raw = inst.read()
-                # Try to parse comma-separated if present
-                if ',' in raw:
-                    return float(raw.split(',')[0])
-                return float(raw)
-            except Exception: 
-                pass
-            
-        raise RuntimeError("Could not read current from instrument")
-
-    def _set_voltage_with_retry(self, voltage: float, retries: int = 3) -> bool:
-        """
-        Safely set voltage with retry logic.
-        Returns True if successful, False if all retries failed.
-        """
-        for attempt in range(retries):
-            try:
-                self.instrument.source_voltage = float(voltage)
-                return True
-            except Exception as e:
-                logger.warning(f"Failed to set voltage {voltage}V (attempt {attempt+1}/{retries}): {e}")
-                if attempt < retries - 1:
-                    sleep(0.01)  # Short delay before retry
-                else:
-                    # All retries failed
-                    logger.error(f"Failed to set voltage {voltage}V after {retries} attempts")
-                    return False
-        return False
-
-    def startup(self) -> None:
-        """OPTIMIZED: Instrument initialization that respects ALL GUI selections."""
-        logger.info("Startup: initializing instruments with GUI settings")
-        try:
-            if self.instrument is None and getattr(self, "manager", None) is not None:
-                self.instrument = getattr(self.manager, "keithley", None)
-            if self.mux is None and getattr(self, "manager", None) is not None:
-                self.mux = getattr(self.manager, "mux", None)
-
-            if self.instrument is None and not self._sim:
-                from solarjv_analyzer.instruments.instrument_manager import get_keithley
-                addr = (getattr(self, "gpib_address", None) or "").strip() or CONFIG.GPIB_ADDRESS
-                self.instrument = get_keithley(address=addr)
-
-            self._start_time = time.time()
-
-            if self.instrument is not None and not self._sim:
-                # ------------------------------------------------------------
-                # CRITICAL: Apply ALL GUI settings in the correct order
-                # ------------------------------------------------------------
-                
-                # 1. Set source mode to voltage FIRST
-                logger.info(f"Setting source mode to voltage")
-                if hasattr(self.instrument, "source_mode"):
-                    try:
-                        self.instrument.source_mode = 'voltage'
-                    except Exception as e:
-                        logger.warning(f"Could not set source mode: {e}")
-                
-                # 2. Set compliance current (from GUI)
-                logger.info(f"Setting compliance current to {self.compliance_current} A")
-                if hasattr(self.instrument, "compliance_current"):
-                    try:
-                        self.instrument.compliance_current = self.compliance_current
-                    except Exception as e:
-                        logger.warning(f"Could not set compliance current: {e}")
-                
-                # 3. Apply sense mode (2-wire / 4-wire) from GUI
-                logger.info(f"Setting sense mode to {self.sense_mode}")
-                if hasattr(self.instrument, "write"):
-                    if self.sense_mode == "4-wire":
-                        self.instrument.write(":SYST:RSEN ON")
-                        logger.info("4-wire sensing enabled")
-                    else:
-                        self.instrument.write(":SYST:RSEN OFF")
-                        logger.info("2-wire sensing enabled")
-                
-                # 4. Apply measurement range from GUI
-                logger.info(f"Setting measurement range to {self.measurement_range}")
-                if hasattr(self.instrument, "write"):
-                    if self.measurement_range == "Auto":
-                        self.instrument.write(":SENS:CURR:RANG:AUTO ON")
-                        logger.info("Auto range enabled")
-                    else:
-                        self.instrument.write(":SENS:CURR:RANG:AUTO OFF")
-                        range_val = self.RANGE_MAP.get(self.measurement_range)
-                        if range_val:
-                            self.instrument.write(f":SENS:CURR:RANG {range_val}")
-                            logger.info(f"Fixed range set to {range_val} A")
-                        else:
-                            logger.warning(f"Unknown range value: {self.measurement_range}")
-                
-                # 5. Apply NPLC from GUI
-                logger.info(f"Setting NPLC to {self.nplc}")
-                if hasattr(self.instrument, "write"):
-                    self.instrument.write(f":SENS:CURR:NPLC {float(self.nplc)}")
-                
-                # 6. Set measurement format (only current for speed)
-                if hasattr(self.instrument, "write"):
-                    self.instrument.write(":FORM:ELEM CURR")
-                
-                # 7. Disable concurrent measurements (only measure current)
-                if hasattr(self.instrument, "write"):
-                    self.instrument.write(":SENS:FUNC:CONC OFF")
-                    self.instrument.write(":SENS:FUNC 'CURR:DC'")
-                
-                # 8. NOW set the initial voltage (using actual start_voltage value)
-                logger.info(f"Setting initial voltage to {self.start_voltage}V")
-                if hasattr(self.instrument, "source_voltage"):
-                    try:
-                        self.instrument.source_voltage = float(self.start_voltage)
-                    except Exception as e:
-                        logger.error(f"Could not set initial source voltage: {e}")
-                        raise
-                
-                # 9. Finally enable output
-                if hasattr(self.instrument, "enable_source"):
-                    try:
-                        self.instrument.enable_source()
-                        logger.info("Output enabled")
-                    except Exception as e:
-                        logger.warning(f"Could not enable source: {e}")
-                
-                # --- SPEED OPTIMIZATIONS (These don't affect measurement integrity) ---
-                try:
-                    # Disable delays and auto-zero for speed
-                    if hasattr(self.instrument, "delay"):
-                        self.instrument.delay = 0.0
-                        
-                    if hasattr(self.instrument, "write"):
-                        self.instrument.write(":SYST:AZER OFF")
-                        self.instrument.write(":DISP:ENAB ON")
-                        self.instrument.write("*CLS")  # Clear errors
-                        
-                except Exception as e:
-                    logger.warning(f"Could not apply speed optimizations: {e}")
-                # ----------------------------------------------------------------------
-                
-                # Log final configuration for verification
-                logger.info(f"Instrument configured - Range: {self.measurement_range}, Sense: {self.sense_mode}, NPLC: {self.nplc}")
-                    
-        except Exception as e:
-            logger.error(f"Startup Failed: {e}", exc_info=True)
+            logger.error(f"Sweep failed: {e}")
+            self._safety_abort()
             raise
 
-    def execute(self) -> None:
-        """OPTIMIZED: Perform the J-V sweep with proper error handling."""
-        import os
-        import time
-        import traceback
-        import numpy as np
-        from time import sleep
-        
-        try:
-            logger.info("Beginning J-V sweep")
-            ch = int(self.active_channel)
-            voltages = self._generate_voltages()
-            total_steps = len(voltages)
-            step = 0
-            retry_attempts = int(getattr(self, "voltage_retry_attempts", 3))
+        duration = time.time() - sweep_start
+        logger.info(f"Sweep completed in {duration:.2f}s")
 
-            self._voltages = []
-            self._currents = []
+        # Turn output off for safety
+        self._write(":OUTP OFF", "Output off")
 
-            if self.results is None and getattr(self, "manager", None) is not None:
-                self.results = getattr(self.manager, "results", None)
+        # Parse results (format: VOLT,CURR,VOLT,CURR,...)
+        values = [v.strip() for v in response.split(',') if v.strip()]
+        logger.debug(f"Received {len(values)} values")
 
-            logger.info(f"Measuring Channel {ch}")
-            
-            # MUX selection
-            if self.mux is not None:
-                try: 
-                    self.mux.select_channel(ch)
-                    sleep(0.02)
-                except Exception as e: 
-                    logger.warning(f"MUX select failed: {e}")
+        points_parsed = 0
+        for i in range(0, len(values) - 1, 2):
+            try:
+                voltage = float(values[i])
+                current = float(values[i+1])
 
-            sleep(float(self.pre_sweep_delay))
-            
-            raw_dwell = getattr(self, "delay_between_points", 0.0)
-            dwell = float(raw_dwell if raw_dwell is not None else 0.0)
-            
-            for i, v in enumerate(voltages):
-                if self.should_stop():
-                    logger.warning(f"Aborting sweep early at Channel {ch}")
-                    return
+                measured_voltages.append(voltage)
+                measured_currents.append(current)
+                points_parsed += 1
 
-                # Use retry logic for voltage setting - NO 0.0V fallback
-                voltage_set = self._set_voltage_with_retry(v, retry_attempts)
-                if not voltage_set:
-                    # Critical failure - abort the sweep
-                    error_msg = f"Failed to set voltage {v}V after {retry_attempts} attempts. Aborting sweep."
-                    logger.error(error_msg)
-                    raise RuntimeError(error_msg)
-                
-                self._last_v = v
-                
-                # Software Dwell
-                if dwell > 0.001:
-                    sleep(dwell)
-                
-                # Measure Current
-                if self._sim:
-                    current = (0.1 * v) + np.random.normal(0, 1e-4)
-                else:
-                    try:
-                        current = self._fast_read_current()
-                    except Exception as e:
-                        logger.error(f"Critical: Current read failed at {v}V: {e}")
-                        current = float('nan')
-
-                self._voltages.append(float(v))
-                self._currents.append(float(current))
-                elapsed: float = time.time() - self._start_time
-                
                 self.emit('results', {
-                    "Channel": ch,
-                    "Voltage (V)": v,
+                    "Channel": channel,
+                    "Voltage (V)": voltage,
                     "Current (A)": current,
-                    "Time (s)": elapsed,
-                    "Status": "OK" if not np.isnan(current) else "ERROR",
+                    "Time (s)": duration,
+                    "Status": "OK",
                 })
-                step += 1
-                self.emit("progress", 100.0 * step / max(1, total_steps))
-            
-            self._finalize_analysis(ch)
-            
-        except Exception as e:
-            logger.error(f"CRITICAL EXECUTION ERROR: {e}")
-            logger.error(traceback.format_exc()) 
-            raise  # Re-raise to properly abort the experiment
 
-    def _finalize_analysis(self, ch):
-        """Analysis with minimal overhead."""
-        try:
-            metrics = compute_jv_metrics(
-                v_raw=self._voltages,
-                i_raw=self._currents,
-                area_cm2=float(self.device_area),
-                incident_power_mw_per_cm2=float(self.incident_power),
-            )
-            self._last_metrics = {"Channel": ch, **metrics}
-            self.analysis_results[ch] = metrics
-        except Exception as e:
-            logger.warning(f"Metric computation failed: {e}")
-            self._last_metrics = None
-            
-        if self.mux is not None:
-            try: 
-                self.mux.deselect_channel(ch)
-                sleep(0.02)
-            except Exception: 
-                pass
-            
-        self.emit("progress", 100.0)
-        logger.info("J-V sweep complete")
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Failed to parse point {i//2}: {e}")
 
+        self.emit("progress", 100)
+        logger.info(f"Parsed {points_parsed}/{total_points} points")
+
+        self._voltages = measured_voltages
+        self._currents = measured_currents
+        self._check_errors("After sweep")
+
+        if points_parsed < total_points:
+            logger.warning(f"Only {points_parsed}/{total_points} points received")
+            return False
+        return True
+
+    # -------------------------------------------------------------------------
+    # Analysis and File Writing
+    # -------------------------------------------------------------------------
+
+    def _write_analysis_to_file(self, channel: int, metrics: dict):
+        """Append analysis results to the data file."""
         try:
             results_obj = getattr(self, "results", None)
             data_path = None
+
+            # Locate the data file
             for name in ("data_filename", "data_path", "filename", "datafile", "data_file"):
                 p = getattr(results_obj, name, None)
                 if isinstance(p, str) and p:
                     data_path = p
                     break
-            
-            if data_path is None and hasattr(results_obj, "_data_file") and getattr(results_obj, "_data_file"):
-                try: data_path = results_obj._data_file.name
-                except: pass
-            
-            try:
-                if hasattr(results_obj, "_data_file") and results_obj._data_file:
-                    results_obj._data_file.flush()
-            except: pass
-            
-            if getattr(self, "_last_metrics", None) and data_path:
-                logger.info(f"Appending [[ANALYSIS]] block to {data_path}")
-                with open(data_path, "a", encoding="utf-8") as f:
-                    f.write("\n[[ANALYSIS]]\n")
-                    f.write(f"Channel\t{ch}\n")
-                    for label, unit in self.ANALYSIS_LABELS_UNITS:
-                        val = self._last_metrics.get(label, 0.0)
-                        f.write(f"{label}\t{val}\t{unit}\n")
-                    f.write("[[/ANALYSIS]]\n")
-        except Exception as e:
-            logger.warning(f"Failed to append [[ANALYSIS]] block: {e}")
 
-    def shutdown(self) -> None:
-        """Clean shutdown with hardware reset."""
-        logger.info("Shutting down J-V procedure")
-        try: super().shutdown()
-        except: pass
+            if data_path is None and hasattr(results_obj, "_data_file"):
+                try:
+                    data_path = results_obj._data_file.name
+                except:
+                    pass
+
+            if not data_path or not metrics:
+                return
+
+            # Avoid duplicate analysis blocks
+            try:
+                with open(data_path, 'r', encoding='utf-8') as f:
+                    if f"Channel\t{channel}" in f.read():
+                        logger.debug(f"Analysis for Channel {channel} already exists")
+                        return
+            except FileNotFoundError:
+                pass
+
+            # Write analysis block
+            with open(data_path, "a", encoding="utf-8") as f:
+                f.write("\n[[ANALYSIS]]\n")
+                f.write(f"Channel\t{channel}\n")
+                for label, unit in self.ANALYSIS_LABELS_UNITS:
+                    val = metrics.get(label, 0.0)
+                    if isinstance(val, float):
+                        formatted = f"{val:.6e}" if abs(val) >= 1000 or (abs(val) < 0.01 and val != 0) else f"{val:.6f}"
+                    else:
+                        formatted = str(val)
+                    f.write(f"{label}\t{formatted}\t{unit}\n")
+                f.write("[[/ANALYSIS]]\n")
+
+            logger.debug(f"Analysis written for Channel {channel}")
+
+        except Exception as e:
+            logger.warning(f"Failed to write analysis: {e}")
+
+    def _validate_measurement(self):
+        """Compare measured voltages against expected sequence (debug only)."""
+        if not self._voltages or not self._expected_voltages:
+            return
+
+        measured = np.array(self._voltages)
+        expected = np.array(self._expected_voltages[:len(measured)])
+
+        diff = measured - expected
+        logger.debug(f"Voltage validation: mean error={np.mean(np.abs(diff)):.6f}V, "
+                    f"max error={np.max(np.abs(diff)):.6f}V")
+
+    # -------------------------------------------------------------------------
+    # Lifecycle Methods
+    # -------------------------------------------------------------------------
+
+    def startup(self):
+        """Initialize instrument connections."""
+        logger.info("Initializing instrument")
+
         try:
-            if self.instrument is not None and not self._sim:
-                # Set output to 0V before disabling (safe value)
-                if hasattr(self.instrument, "source_voltage"):
-                    try:
-                        self.instrument.source_voltage = 0.0
-                        sleep(0.01)  # Allow time for voltage to settle
-                    except:
-                        pass
-                
-                # Disable output
-                if hasattr(self.instrument, "disable_source"):
-                    try:
-                        self.instrument.disable_source()
-                    except:
-                        pass
-                
-                # Re-enable auto-zero for future runs
-                if hasattr(self.instrument, "write"):
-                    try: 
-                        self.instrument.write(":SYST:AZER ON")
-                        self.instrument.write(":DISP:ENAB ON")
-                    except: pass
-        except: pass
+            # Get references from manager if not provided
+            if self.instrument is None and self.manager:
+                self.instrument = getattr(self.manager, "keithley", None)
+            if self.mux is None and self.manager:
+                self.mux = getattr(self.manager, "mux", None)
+
+            # Connect if needed
+            if self.instrument is None and not self._sim:
+                from solarjv_analyzer.instruments.instrument_manager import get_keithley
+                self.instrument = get_keithley(address=self.gpib_address)
+                logger.info(f"Connected to Keithley at {self.gpib_address}")
+
+                # Query line frequency
+                try:
+                    resp = self.instrument.ask(":SYST:LFR?")
+                    resp = resp.strip().upper()
+                    if resp in ("50", "60"):
+                        self._line_freq = float(resp)
+                        logger.info(f"Line frequency: {self._line_freq} Hz")
+                except Exception as e:
+                    logger.warning(f"Could not query line frequency: {e}")
+
+            self._configured = False
+            self._last_metrics = None
+            logger.info("Startup complete")
+
+        except Exception as e:
+            logger.error(f"Startup failed: {e}")
+            raise
+
+    def execute(self):
+        """Run the complete J-V sweep procedure."""
+        logger.info("=" * 50)
+        logger.info("Starting J-V sweep")
+
+        try:
+            channel = int(self.active_channel)
+            logger.info(f"Channel {channel}: {self.start_voltage}V → {self.stop_voltage}V, "
+                       f"step={self.step_size}V, rate={self.sweep_rate}V/s")
+
+            # Select MUX channel
+            if self.mux is not None:
+                self.mux.select_channel(channel)
+                time.sleep(self.pre_sweep_delay)
+
+            # Configure and execute
+            total_points = self._configure_instrument()
+            self._voltages = []
+            self._currents = []
+
+            success = self._execute_sweep(total_points, channel)
+
+            if not success and not self.should_stop():
+                raise RuntimeError(f"Sweep incomplete: {len(self._voltages)}/{total_points}")
+
+            if self.enable_validation:
+                self._validate_measurement()
+
+            self._finalize_analysis(channel)
+
+        except pyvisa.errors.VisaIOError as e:
+            logger.error(f"VISA timeout: {e}")
+            self._safety_abort()
+            raise
+        except Exception as e:
+            logger.error(f"Execution failed: {e}")
+            self._safety_abort()
+            raise
+        finally:
+            if self.mux is not None:
+                try:
+                    self.mux.deselect_channel(channel)
+                except:
+                    pass
+            self._configured = False
+            logger.info("Sweep execution finished")
+            logger.info("=" * 50)
+
+    def _finalize_analysis(self, channel: int):
+        """
+        Compute J-V metrics, store results, and write to file.
+
+        Calculates efficiency, fill factor, Voc, Jsc, and other parameters
+        from the collected I-V data.
+        """
+        try:
+            if not self._voltages or not self._currents:
+                return
+
+            min_len = min(len(self._voltages), len(self._currents))
+            voltages = self._voltages[:min_len]
+            currents = self._currents[:min_len]
+
+            metrics = compute_jv_metrics(
+                v_raw=voltages,
+                i_raw=currents,
+                area_cm2=float(self.device_area),
+                incident_power_mw_per_cm2=float(self.incident_power),
+            )
+
+            self.analysis_results[channel] = metrics
+            self._last_metrics = {"Channel": channel, **metrics}
+            self.emit('analysis', {"Channel": channel, **metrics})
+
+            logger.info(f"Channel {channel} Results: "
+                       f"EFF={metrics.get('EFF', 0):.2f}%, "
+                       f"FF={metrics.get('FF', 0):.2f}%, "
+                       f"Voc={metrics.get('Voc', 0):.4f}V, "
+                       f"Jsc={metrics.get('Jsc', 0):.4f}mA/cm²")
+
+            self._write_analysis_to_file(channel, metrics)
+
+        except Exception as e:
+            logger.warning(f"Analysis failed: {e}")
+
+    def shutdown(self):
+        """Clean shutdown - return instrument to safe state."""
+        logger.info("Shutting down")
+        self._safety_abort()
+        logger.info("Shutdown complete")

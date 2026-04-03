@@ -34,19 +34,18 @@ def main():
     calib_window = CalibrationWindow(username)
     main_window = None
 
-    def launch_main_app(user, instr_manager):
-        """Callback: Runs when calibration passes."""
+    def launch_main_app(instr_manager):
+        """Callback: Runs when calibration passes OR skip is clicked."""
         nonlocal main_window
         
         # Open Main Analyzer Window
-        main_window = JVAnalyzerWindow(user)
+        main_window = JVAnalyzerWindow(username)  # Use captured username
         
         # Pass connected instruments to avoid reconnecting
-        # (Checks if main_window has the manager attribute to be safe)
         if hasattr(main_window, 'instrument_manager'):
-             if instr_manager.keithley:
+             if instr_manager and instr_manager.keithley:
                  main_window.instrument_manager.keithley = instr_manager.keithley
-             if instr_manager.mux:
+             if instr_manager and instr_manager.mux:
                  main_window.instrument_manager.mux = instr_manager.mux
              
              # Update UI lights if the method exists
@@ -54,8 +53,9 @@ def main():
                  main_window.update_instrument_lights()
         
         main_window.show()
+        calib_window.close()  # Close calibration window
     
-    # Connect the "Success" signal from Calibration to the Main App launcher
+    # Connect the signal from Calibration to the Main App launcher
     calib_window.calibration_passed.connect(launch_main_app)
     
     # Show the calibration window and start the event loop
