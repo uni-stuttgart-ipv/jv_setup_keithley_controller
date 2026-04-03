@@ -20,7 +20,6 @@ class FilePanel(QtWidgets.QGroupBox):
     - Filename prefix input
     - Directory selection with Browse and Open buttons
     - Single file mode toggle (all channels in one file)
-    - Simulation mode toggle
     """
 
     def __init__(self, parent=None):
@@ -59,9 +58,6 @@ class FilePanel(QtWidgets.QGroupBox):
         # Output mode options
         self.single_file_checkbox = QtWidgets.QCheckBox("Save all channels in one file")
         layout.addRow(self.single_file_checkbox)
-
-        self.simulation_checkbox = QtWidgets.QCheckBox("Simulation Mode")
-        layout.addRow(self.simulation_checkbox)
 
     def _connect_signals(self):
         """Connect UI signals to their handlers."""
@@ -139,5 +135,4 @@ class FilePanel(QtWidgets.QGroupBox):
             'filename': self.filename_input.text(),
             'directory': self.directory_input.text(),
             'single_file': self.single_file_checkbox.isChecked(),
-            'simulation': self.simulation_checkbox.isChecked(),
         }

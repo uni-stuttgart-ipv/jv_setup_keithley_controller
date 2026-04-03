@@ -230,7 +230,6 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.abort_button.clicked.connect(self.controller.abort_experiment)
         self.save_plot_button.clicked.connect(self.save_plot)
 
-        self.file_panel.browse_button.clicked.connect(self.open_directory_dialog)
         self.browser_widget.show_button.clicked.connect(self.show_experiments)
         self.browser_widget.hide_button.clicked.connect(self.hide_experiments)
         self.browser_widget.clear_button.clicked.connect(self.clear_experiments)
@@ -363,16 +362,6 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         current_dir = self.file_panel.get_directory()
         if not current_dir or not os.path.exists(current_dir):
             self.file_panel.set_directory(reports_folder)
-
-    def open_directory_dialog(self):
-        print("Dialog opened")
-        """Open folder picker for output directory selection."""
-        start_dir = self.file_panel.get_directory() or os.getcwd()
-        selected = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Select Output Folder", start_dir
-        )
-        if selected:
-            self.file_panel.set_directory(selected)
 
     # -------------------------------------------------------------------------
     # Instrument Status
