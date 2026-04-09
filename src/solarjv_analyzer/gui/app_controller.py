@@ -119,7 +119,8 @@ class AppController:
         self._preserve_existing_channel_data(selected_channels)
 
         # Connect hardware
-        sim_mode = file_params['simulation']
+        #sim_mode = file_params['simulation']
+        sim_mode = False  # Force real hardware mode for now, as simulation mode is disabled in the UI
         try:
             self.view.instrument_manager.connect_keithley(simulation=sim_mode)
             self.view.instrument_manager.connect_mux(simulation=sim_mode)
