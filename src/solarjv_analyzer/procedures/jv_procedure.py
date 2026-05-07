@@ -2,6 +2,7 @@
 Keithley 2400 J-V Measurement Procedure
 
 Implements hardware-controlled staircase sweep for solar cell characterization.
+Supports dual-direction sweeps (Forward + Reverse) by default, with option for single sweep mode.
 Uses the instrument's built-in sweep capability with automatic NPLC calculation
 from user-specified sweep rate.
 """
@@ -30,8 +31,8 @@ class JVProcedure(Procedure):
     J-V sweep procedure for Keithley 2400 SourceMeter.
 
     Executes a hardware-controlled staircase sweep from start_voltage to stop_voltage
-    with specified step_size. The sweep rate determines the measurement speed, and
-    NPLC is automatically calculated to match the requested rate.
+    with specified step_size. By default, performs Forward + Reverse sweeps.
+    Single sweep mode (Forward only) can be enabled in Analysis tab.
 
     Signals:
         results: Emits individual data points during sweep
@@ -90,6 +91,10 @@ class JVProcedure(Procedure):
     probe_spacing = FloatParameter("4-Probe Spacing", units="um", default=2290)
     sample_thickness = FloatParameter("Sample Thickness", units="um", default=500)
 
+    # Sweep Mode
+    single_sweep_mode = BooleanParameter("Single Sweep Mode", default=False)
+    sweep_direction = Parameter("Sweep Direction", default="Forward")
+
     # Debug & Validation
     simulation = BooleanParameter("Simulation Mode", default=False)
     check_errors_between_points = BooleanParameter("Check Errors Between Points", default=False)
@@ -127,7 +132,8 @@ class JVProcedure(Procedure):
         self._line_freq = float(self.line_frequency)
 
         logger.info(f"JVProcedure initialized (Channel {self.active_channel}, "
-                    f"Rate={self.sweep_rate} V/s, AutoZero={'ON' if self.auto_zero else 'OFF'})")
+                    f"Rate={self.sweep_rate} V/s, AutoZero={'ON' if self.auto_zero else 'OFF'}, "
+                    f"SingleSweep={'ON' if self.single_sweep_mode else 'OFF'}")
 
     # -------------------------------------------------------------------------
     # Hardware Communication
@@ -212,43 +218,42 @@ class JVProcedure(Procedure):
     # Sweep Parameter Calculation
     # -------------------------------------------------------------------------
 
-    def _generate_voltage_sequence(self) -> list:
-        """
-        Generate the exact voltage sequence for the sweep.
-
-        Creates a list of voltages from start to stop with the specified step size,
-        ensuring the stop voltage is included.
-
-        Returns:
-            List of voltage values for the sweep
-        """
+    def _generate_voltage_sequence(self):
+        """Generate voltage sequence based on sweep direction."""
         start = float(self.start_voltage)
         stop = float(self.stop_voltage)
-        step = float(self.step_size)
-
-        if step == 0:
-            step = 0.1
-        if stop < start:
-            step = -abs(step)
-        else:
-            step = abs(step)
-
+        step = abs(float(self.step_size))
+        
+        # Generate sequence
         voltages = []
         current = start
-
-        if step > 0:
-            while current <= stop + (0.5 * step):
-                voltages.append(round(current, 6))
-                current += step
+        
+        if self.sweep_direction == "Reverse":
+            # Reverse: start at stop, go to start
+            current = start
+            if start > stop:
+                while current >= stop - (0.5 * step):
+                    voltages.append(round(current, 6))
+                    current -= step
+            else:
+                while current <= stop + (0.5 * step):
+                    voltages.append(round(current, 6))
+                    current += step
         else:
-            while current >= stop + (0.5 * step):
-                voltages.append(round(current, 6))
-                current += step
-
+            # Forward: start to stop
+            if start > stop:
+                while current >= stop - (0.5 * step):
+                    voltages.append(round(current, 6))
+                    current -= step
+            else:
+                while current <= stop + (0.5 * step):
+                    voltages.append(round(current, 6))
+                    current += step
+        
         # Ensure stop voltage is included
-        if voltages and abs(voltages[-1] - stop) > abs(step) * 0.1:
+        if voltages and abs(voltages[-1] - stop) > step * 0.1:
             voltages.append(stop)
-
+        
         return voltages
 
     def _calculate_nplc(self) -> tuple:
@@ -256,7 +261,7 @@ class JVProcedure(Procedure):
         Calculate NPLC and source delay from the requested sweep rate.
 
         Uses professor's method: total_time = voltage_range / sweep_rate
-        time_per_point = total_time / total_points
+        time_per_point = total_time / single_points
         NPLC = time_per_point * line_frequency
 
         Returns:
@@ -266,7 +271,12 @@ class JVProcedure(Procedure):
         stop = float(self.stop_voltage)
         step = abs(float(self.step_size))
 
-        total_points = int(abs(stop - start) / step) + 1
+        single_points = int(abs(stop - start) / step) + 1
+
+        if self.single_sweep_mode:
+            total_points = single_points
+        else:
+            total_points = (single_points * 2) - 1
 
         # If sweep_rate is not specified, use user-provided NPLC
         if self.sweep_rate <= 0:
@@ -274,7 +284,7 @@ class JVProcedure(Procedure):
 
         voltage_range = abs(stop - start)
         total_time = voltage_range / self.sweep_rate
-        time_per_point = total_time / total_points
+        time_per_point = total_time / single_points
 
         nplc = time_per_point * self._line_freq
         nplc = max(0.01, min(10.0, nplc))
@@ -285,6 +295,7 @@ class JVProcedure(Procedure):
 
         logger.info(f"Sweep timing: {total_time:.2f}s total, {time_per_point*1000:.1f}ms/point, "
                     f"NPLC={nplc:.3f}, delay={source_delay*1000:.1f}ms")
+        logger.info(f"Points: single direction={single_points}, total={total_points}")
 
         return nplc, source_delay
 
@@ -482,8 +493,8 @@ class JVProcedure(Procedure):
     # Analysis and File Writing
     # -------------------------------------------------------------------------
 
-    def _write_analysis_to_file(self, channel: int, metrics: dict):
-        """Append analysis results to the data file."""
+    def _write_analysis_to_file(self, channel: int, metrics: dict, direction: str = "Forward"):
+        """Write analysis block to the temp file with direction."""
         try:
             results_obj = getattr(self, "results", None)
             data_path = None
@@ -507,8 +518,8 @@ class JVProcedure(Procedure):
             # Avoid duplicate analysis blocks
             try:
                 with open(data_path, 'r', encoding='utf-8') as f:
-                    if f"Channel\t{channel}" in f.read():
-                        logger.debug(f"Analysis for Channel {channel} already exists")
+                    if f"Channel\t{channel}_{direction}" in f.read():
+                        logger.debug(f"Analysis for Channel {channel} ({direction}) already exists")
                         return
             except FileNotFoundError:
                 pass
@@ -516,7 +527,7 @@ class JVProcedure(Procedure):
             # Write analysis block
             with open(data_path, "a", encoding="utf-8") as f:
                 f.write("\n[[ANALYSIS]]\n")
-                f.write(f"Channel\t{channel}\n")
+                f.write(f"Channel\t{channel}_{direction}\n")
                 for label, unit in self.ANALYSIS_LABELS_UNITS:
                     val = metrics.get(label, 0.0)
                     if isinstance(val, float):
@@ -526,7 +537,7 @@ class JVProcedure(Procedure):
                     f.write(f"{label}\t{formatted}\t{unit}\n")
                 f.write("[[/ANALYSIS]]\n")
 
-            logger.debug(f"Analysis written for Channel {channel}")
+            logger.debug(f"Analysis written for Channel {channel} ({direction})")
 
         except Exception as e:
             logger.warning(f"Failed to write analysis: {e}")
@@ -589,8 +600,9 @@ class JVProcedure(Procedure):
 
         try:
             channel = int(self.active_channel)
+            mode = "Single (Forward only)" if self.single_sweep_mode else "Dual (Forward + Reverse)"
             logger.info(f"Channel {channel}: {self.start_voltage}V → {self.stop_voltage}V, "
-                       f"step={self.step_size}V, rate={self.sweep_rate}V/s")
+                       f"step={self.step_size}V, rate={self.sweep_rate}V/s, mode={mode}")
 
             # Select MUX channel
             if self.mux is not None:
@@ -634,8 +646,8 @@ class JVProcedure(Procedure):
         """
         Compute J-V metrics, store results, and write to file.
 
-        Calculates efficiency, fill factor, Voc, Jsc, and other parameters
-        from the collected I-V data.
+        For dual sweep mode, computes separate metrics for Forward and Reverse directions.
+        For single sweep mode, computes metrics for the current sweep direction only.
         """
         try:
             if not self._voltages or not self._currents:
@@ -645,24 +657,80 @@ class JVProcedure(Procedure):
             voltages = self._voltages[:min_len]
             currents = self._currents[:min_len]
 
-            metrics = compute_jv_metrics(
-                v_raw=voltages,
-                i_raw=currents,
-                area_cm2=float(self.device_area),
-                incident_power_mw_per_cm2=float(self.incident_power),
-            )
+            total_points = len(voltages)
 
-            self.analysis_results[channel] = metrics
-            self._last_metrics = {"Channel": channel, **metrics}
-            self.emit('analysis', {"Channel": channel, **metrics})
+            # Calculate points per direction
+            start = float(self.start_voltage)
+            stop = float(self.stop_voltage)
+            step = abs(float(self.step_size))
+            points_per_direction = int(abs(stop - start) / step) + 1
 
-            logger.info(f"Channel {channel} Results: "
-                       f"EFF={metrics.get('EFF', 0):.2f}%, "
-                       f"FF={metrics.get('FF', 0):.2f}%, "
-                       f"Voc={metrics.get('Voc', 0):.4f}V, "
-                       f"Jsc={metrics.get('Jsc', 0):.4f}mA/cm²")
+            if self.single_sweep_mode or total_points == points_per_direction:
+                # Single sweep mode — use the actual sweep direction
+                direction = self.sweep_direction  # "Forward" or "Reverse"
+                
+                metrics = compute_jv_metrics(
+                    v_raw=voltages,
+                    i_raw=currents,
+                    area_cm2=float(self.device_area),
+                    incident_power_mw_per_cm2=float(self.incident_power),
+                )
 
-            self._write_analysis_to_file(channel, metrics)
+                self.analysis_results[channel] = {direction: metrics}
+                self._last_metrics = {"Channel": channel, "Direction": direction, **metrics}
+                
+                self.emit('analysis', {"Channel": channel, "Direction": direction, **metrics})
+                self._write_analysis_to_file(channel, metrics, direction)
+
+                logger.info(f"Channel {channel} ({direction}): "
+                        f"EFF={metrics.get('EFF', 0):.2f}%, "
+                        f"FF={metrics.get('FF', 0):.2f}%, "
+                        f"Voc={metrics.get('Voc', 0):.2f}mV, "
+                        f"Jsc={metrics.get('Jsc', 0):.3f}mA/cm²")
+
+            else:
+                # Dual sweep mode — split into Forward and Reverse
+                forward_v = voltages[:points_per_direction]
+                forward_i = currents[:points_per_direction]
+
+                reverse_v = list(reversed(voltages[points_per_direction - 1:]))
+                reverse_i = list(reversed(currents[points_per_direction - 1:]))
+
+                forward_metrics = compute_jv_metrics(
+                    v_raw=forward_v,
+                    i_raw=forward_i,
+                    area_cm2=float(self.device_area),
+                    incident_power_mw_per_cm2=float(self.incident_power),
+                )
+
+                reverse_metrics = compute_jv_metrics(
+                    v_raw=reverse_v,
+                    i_raw=reverse_i,
+                    area_cm2=float(self.device_area),
+                    incident_power_mw_per_cm2=float(self.incident_power),
+                )
+
+                self.analysis_results[channel] = {
+                    "Forward": forward_metrics,
+                    "Reverse": reverse_metrics
+                }
+
+                self.emit('analysis', {"Channel": channel, "Direction": "Forward", **forward_metrics})
+                self.emit('analysis', {"Channel": channel, "Direction": "Reverse", **reverse_metrics})
+
+                self._write_analysis_to_file(channel, forward_metrics, "Forward")
+                self._write_analysis_to_file(channel, reverse_metrics, "Reverse")
+
+                logger.info(f"Channel {channel} - Forward: "
+                        f"EFF={forward_metrics.get('EFF', 0):.2f}%, "
+                        f"FF={forward_metrics.get('FF', 0):.2f}%, "
+                        f"Voc={forward_metrics.get('Voc', 0):.2f}mV, "
+                        f"Jsc={forward_metrics.get('Jsc', 0):.3f}mA/cm²")
+                logger.info(f"Channel {channel} - Reverse: "
+                        f"EFF={reverse_metrics.get('EFF', 0):.2f}%, "
+                        f"FF={reverse_metrics.get('FF', 0):.2f}%, "
+                        f"Voc={reverse_metrics.get('Voc', 0):.2f}mV, "
+                        f"Jsc={reverse_metrics.get('Jsc', 0):.3f}mA/cm²")
 
         except Exception as e:
             logger.warning(f"Analysis failed: {e}")

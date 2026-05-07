@@ -63,6 +63,7 @@ requires = [
   "pandas",
   "scipy",
   "pyserial",
-  "std-nslog" 
+  "std-nslog",
+  "argon2-cffi" 
 ]
 license.file = "LICENSE.txt"

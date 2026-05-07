@@ -10,6 +10,7 @@ import os
 import io
 import tempfile
 from datetime import datetime
+from PyQt5 import QtCore
 
 import numpy as np
 import pandas as pd
@@ -60,6 +61,16 @@ class AppController:
         )
         self._connect_manager_signals()
 
+        # Channel color mapping for consistent colors across forward and reverse curves
+        self.CHANNEL_COLORS = {
+            1: pg.mkColor('#0984e3'),  # Blue
+            2: pg.mkColor('#00b894'),  # Green
+            3: pg.mkColor('#e17055'),  # Orange
+            4: pg.mkColor('#a29bfe'),  # Purple
+            5: pg.mkColor('#fdcb6e'),  # Yellow
+            6: pg.mkColor('#e84393'),  # Pink
+        }
+
         self.view.abort_button.setEnabled(False)
 
     # -------------------------------------------------------------------------
@@ -102,6 +113,10 @@ class AppController:
             **analysis_dict,
         }
 
+        # Keep a snapshot of the notes – they are not part of the procedure itself,
+        # but we need them when writing the final report.
+        self.current_notes_text = procedure_params.pop('notes_text', '')
+        self.current_save_notes = procedure_params.pop('save_notes', False)
         file_params = self.view.file_panel.get_parameters()
         selected_channels = self.view.params_tab.get_selected_channels()
 
@@ -119,7 +134,7 @@ class AppController:
         self._preserve_existing_channel_data(selected_channels)
 
         # Connect hardware
-        sim_mode = file_params['simulation']
+        sim_mode = False  
         try:
             self.view.instrument_manager.connect_keithley(simulation=sim_mode)
             self.view.instrument_manager.connect_mux(simulation=sim_mode)
@@ -151,9 +166,6 @@ class AppController:
     def _preserve_existing_channel_data(self, new_channels):
         """
         Preserve analysis data for channels not being re-measured.
-
-        Args:
-            new_channels: List of channel numbers being queued for measurement
         """
         # Collect existing channels and experiments
         existing_channels = set()
@@ -178,16 +190,31 @@ class AppController:
         # Restore data for channels not being measured
         for exp in existing_experiments:
             if hasattr(exp.procedure, 'analysis_results') and exp.procedure.analysis_results:
-                for channel, metrics in exp.procedure.analysis_results.items():
+                results = exp.procedure.analysis_results
+                for channel, metrics in results.items():
                     if channel not in new_channels:
-                        self.view.analysis_panel.analysis({'Channel': channel, **metrics})
+                        if isinstance(metrics, dict):
+                            # Handle both single-direction keys ("Forward" or "Reverse")
+                            # and dual-direction keys ({"Forward": ..., "Reverse": ...})
+                            for direction, dir_metrics in metrics.items():
+                                self.view.analysis_panel.analysis({
+                                    'Channel': channel,
+                                    'Direction': direction,
+                                    **dir_metrics
+                                })
+                        else:
+                            # Legacy format: single metrics dict without direction nesting
+                            self.view.analysis_panel.analysis({
+                                'Channel': channel,
+                                'Direction': 'Forward',
+                                **metrics
+                            })
 
     def _queue_single_file_experiment(self, directory, base, ext, timestamp,
-                                      channels, params, sim_mode):
+                                  channels, params, sim_mode):
         """
         Queue experiments for single-file output mode.
-
-        Each channel writes to a temporary file; files are merged later.
+        In single sweep mode, only forward sweeps are queued.
         """
         channel_list_str = "_".join(map(str, channels))
         self.merged_file_path = os.path.join(
@@ -199,82 +226,184 @@ class AppController:
         logger.info(f"Single file mode: merging to {merged_filename}")
 
         for channel_num in channels:
-            temp_file_path = os.path.join(
-                directory, f"{base}_{timestamp}_ch{channel_num}_temp{ext}"
-            )
-            self.experiment_files[channel_num] = temp_file_path
-
-            # Set channel-specific parameters
-            single_ch_params = params.copy()
+            base_params = params.copy()
             for i in range(1, 7):
-                single_ch_params[f'channel{i}'] = (i == channel_num)
+                base_params[f'channel{i}'] = (i == channel_num)
 
-            procedure = JVProcedure(
+            # ---------- Forward Sweep ----------
+            forward_params = base_params.copy()
+            forward_params['single_sweep_mode'] = True
+            forward_params['sweep_direction'] = 'Forward'
+
+            forward_temp_path = os.path.join(
+                directory, f"{base}_{timestamp}_ch{channel_num}_forward_temp{ext}"
+            )
+            forward_key = f"{channel_num}_forward"
+            self.experiment_files[forward_key] = forward_temp_path
+
+            proc_forward = JVProcedure(
                 instrument=self.view.instrument_manager.keithley,
                 mux=self.view.instrument_manager.mux,
                 manager=self.view.instrument_manager,
                 simulation=sim_mode,
                 active_channel=channel_num,
                 check_errors_between_points=False,
-                **single_ch_params
+                **forward_params
             )
 
-            results = Results(procedure, temp_file_path)
-            procedure.results = results
+            results_forward = Results(proc_forward, forward_temp_path)
+            proc_forward.results = results_forward
 
-            display_name = f"Ch {channel_num} - {merged_filename}"
-            experiment = self._create_experiment(results, display_name)
-            self.manager.queue(experiment)
+            display_name_forward = f"Ch {channel_num} (Fwd) - {merged_filename}"
+            experiment_forward = self._create_experiment(
+                results_forward, display_name_forward,
+                channel=channel_num, is_reverse=False
+            )
+            self.manager.queue(experiment_forward)
+            logger.info(f"Queued Channel {channel_num} (Forward)")
+
+            # ---------- Reverse Sweep (only in dual‑sweep mode) ----------
+            if not params.get('single_sweep_mode', False):
+                reverse_params = base_params.copy()
+                reverse_params['single_sweep_mode'] = True
+                reverse_params['sweep_direction'] = 'Reverse'
+                reverse_params['start_voltage'] = params.get('stop_voltage', -0.2)
+                reverse_params['stop_voltage'] = params.get('start_voltage', 1.2)
+
+                reverse_temp_path = os.path.join(
+                    directory, f"{base}_{timestamp}_ch{channel_num}_reverse_temp{ext}"
+                )
+                reverse_key = f"{channel_num}_reverse"
+                self.experiment_files[reverse_key] = reverse_temp_path
+
+                proc_reverse = JVProcedure(
+                    instrument=self.view.instrument_manager.keithley,
+                    mux=self.view.instrument_manager.mux,
+                    manager=self.view.instrument_manager,
+                    simulation=sim_mode,
+                    active_channel=channel_num,
+                    check_errors_between_points=False,
+                    **reverse_params
+                )
+
+                results_reverse = Results(proc_reverse, reverse_temp_path)
+                proc_reverse.results = results_reverse
+
+                display_name_reverse = f"Ch {channel_num} (Rev) - {merged_filename}"
+                experiment_reverse = self._create_experiment(
+                    results_reverse, display_name_reverse,
+                    channel=channel_num, is_reverse=True
+                )
+                self.manager.queue(experiment_reverse)
+                logger.info(f"Queued Channel {channel_num} (Reverse)")
 
     def _queue_multi_file_experiment(self, directory, base, ext, timestamp,
-                                     channels, params, sim_mode):
+                                 channels, params, sim_mode):
         """
         Queue experiments for multi-file output mode.
-
-        Each channel writes directly to its own final file.
+        In single sweep mode, only forward sweeps are queued.
         """
         for channel_num in channels:
-            file_path = os.path.join(directory, f"{base}_{timestamp}_ch{channel_num}{ext}")
-            self.experiment_files[channel_num] = file_path
-
             # Set channel-specific parameters
-            single_ch_params = params.copy()
+            base_params = params.copy()
             for i in range(1, 7):
-                single_ch_params[f'channel{i}'] = (i == channel_num)
+                base_params[f'channel{i}'] = (i == channel_num)
 
-            procedure = JVProcedure(
+            # ---------- Forward Sweep (always queued) ----------
+            forward_params = base_params.copy()
+            forward_params['single_sweep_mode'] = True
+            forward_params['sweep_direction'] = 'Forward'
+
+            forward_path = os.path.join(
+                directory, f"{base}_{timestamp}_ch{channel_num}_forward{ext}"
+            )
+            self.experiment_files[f"{channel_num}_forward"] = forward_path
+
+            proc_forward = JVProcedure(
                 instrument=self.view.instrument_manager.keithley,
                 mux=self.view.instrument_manager.mux,
                 manager=self.view.instrument_manager,
                 simulation=sim_mode,
                 active_channel=channel_num,
                 check_errors_between_points=False,
-                **single_ch_params
+                **forward_params
             )
 
-            results = Results(procedure, file_path)
-            procedure.results = results
+            results_forward = Results(proc_forward, forward_path)
+            proc_forward.results = results_forward
 
-            experiment = self._create_experiment(results)
-            self.manager.queue(experiment)
-            logger.info(f"Queued Channel {channel_num} to {os.path.basename(file_path)}")
+            experiment_forward = self._create_experiment(
+                results_forward, channel=channel_num, is_reverse=False
+            )
+            self.manager.queue(experiment_forward)
+            logger.info(f"Queued Channel {channel_num} (Forward)")
 
-    def _create_experiment(self, results: Results, display_filename: str = None) -> Experiment:
+            # ---------- Reverse Sweep (only in dual‑sweep mode) ----------
+            if not params.get('single_sweep_mode', False):
+                reverse_params = base_params.copy()
+                reverse_params['single_sweep_mode'] = True
+                reverse_params['sweep_direction'] = 'Reverse'
+                reverse_params['start_voltage'] = params.get('stop_voltage', -0.2)
+                reverse_params['stop_voltage'] = params.get('start_voltage', 1.2)
+
+                reverse_path = os.path.join(
+                    directory, f"{base}_{timestamp}_ch{channel_num}_reverse{ext}"
+                )
+                self.experiment_files[f"{channel_num}_reverse"] = reverse_path
+
+                proc_reverse = JVProcedure(
+                    instrument=self.view.instrument_manager.keithley,
+                    mux=self.view.instrument_manager.mux,
+                    manager=self.view.instrument_manager,
+                    simulation=sim_mode,
+                    active_channel=channel_num,
+                    check_errors_between_points=False,
+                    **reverse_params
+                )
+
+                results_reverse = Results(proc_reverse, reverse_path)
+                proc_reverse.results = results_reverse
+
+                experiment_reverse = self._create_experiment(
+                    results_reverse, channel=channel_num, is_reverse=True
+                )
+                self.manager.queue(experiment_reverse)
+                logger.info(f"Queued Channel {channel_num} (Reverse)")
+
+    def _create_experiment(self, results: Results, display_filename: str = None, 
+                       channel: int = None, is_reverse: bool = False) -> Experiment:
         """
         Create an Experiment object with associated plot curve and browser item.
 
         Args:
             results: PyMeasure Results object
             display_filename: Optional custom filename for browser display
+            channel: Channel number (for consistent color mapping)
+            is_reverse: True for reverse sweep (dashed line), False for forward (solid line)
 
         Returns:
             Experiment: Configured experiment ready for queueing
         """
         browser = self.view.browser_widget.browser
-        color = pg.intColor(browser.topLevelItemCount() % 8)
-        curve = self.view.plot_widget.new_curve(results, color=color)
+        
+        # Use channel-specific color if provided, otherwise default
+        if channel and channel in self.CHANNEL_COLORS:
+            base_color = self.CHANNEL_COLORS[channel]
+        else:
+            base_color = pg.intColor(browser.topLevelItemCount() % 8)
+        
+        if is_reverse:
+            # Reverse curve: dashed line, semi-transparent
+            color = pg.mkColor(base_color)
+            color.setAlpha(180)
+            pen = pg.mkPen(color=color, width=2, style=QtCore.Qt.DashLine)
+            curve = self.view.plot_widget.new_curve(results, pen=pen)
+        else:
+            # Forward curve: solid line
+            pen = pg.mkPen(color=base_color, width=2, style=QtCore.Qt.SolidLine)
+            curve = self.view.plot_widget.new_curve(results, pen=pen)
 
-        browser_item = BrowserItem(results, color)
+        browser_item = BrowserItem(results, base_color)
         if display_filename:
             browser_item.setText(1, display_filename)
 
@@ -323,18 +452,51 @@ class AppController:
                 except (ValueError, TypeError):
                     pass
 
+        # ===== 1. Determine sweep mode (single vs dual) BEFORE reset =====
+        has_reverse = False
+        for i in range(root.childCount()):
+            item = root.child(i)
+            exp = self.manager.experiments.with_browser_item(item)
+            if exp and hasattr(exp.procedure, 'sweep_direction') and exp.procedure.sweep_direction == 'Reverse':
+                has_reverse = True
+                break
+        self.view.analysis_panel.set_single_sweep_mode(not has_reverse)
+        # =================================================================
+
         if active_channels:
             self.view.analysis_panel.reset_channels(
                 sorted(active_channels), JVProcedure.ANALYSIS_LABELS_UNITS
             )
 
-        # Restore analysis data for all experiments
+        # ===== 2. Restore analysis data (now handles nested direction dicts) =====
         for i in range(root.childCount()):
             item = root.child(i)
             exp = self.manager.experiments.with_browser_item(item)
             if exp and hasattr(exp.procedure, 'analysis_results'):
-                for channel, metrics in exp.procedure.analysis_results.items():
-                    self.view.analysis_panel.analysis({'Channel': channel, **metrics})
+                results = exp.procedure.analysis_results
+                if results:
+                    for channel, metrics in results.items():
+                        if isinstance(metrics, dict):
+                            # Nested: e.g., {1: {"Forward": {...}, "Reverse": {...}}}
+                            for direction, dir_metrics in metrics.items():
+                                self.view.analysis_panel.analysis({
+                                    'Channel': channel,
+                                    'Direction': direction,
+                                    **dir_metrics
+                                })
+                        else:
+                            # Legacy flat dict
+                            self.view.analysis_panel.analysis({
+                                'Channel': channel,
+                                'Direction': 'Forward',
+                                **metrics
+                            })
+        # ==========================================================================
+
+        # Enable Show/Hide/Clear after loading
+        self.view.browser_widget.show_button.setEnabled(True)
+        self.view.browser_widget.hide_button.setEnabled(True)
+        self.view.browser_widget.clear_button.setEnabled(True)
 
         # Select the first loaded experiment
         if newly_loaded_items:
@@ -351,14 +513,10 @@ class AppController:
 
     def _parse_and_load_file(self, filename: str) -> tuple:
         """
-        Parse a saved file and create experiment objects.
-
-        Args:
-            filename: Path to the saved measurement file
-
-        Returns:
-            tuple: (experiments, analysis_data, channels)
+        Parse a saved file and create experiment objects (one per direction per channel).
         """
+        import uuid  # for unique temp file names
+
         with open(filename, 'r') as f:
             content = f.read()
 
@@ -382,6 +540,15 @@ class AppController:
                 lines = block.split(']]')[1].strip()
                 if lines and "No analysis" not in lines:
                     analysis_df = pd.read_csv(io.StringIO(lines))
+                    # Strip units from column headers
+                    metric_units_map = {
+                        "EFF (%)": "EFF", "FF (%)": "FF", "Voc (mV)": "Voc",
+                        "Jsc (mA/cm2)": "Jsc", "Vmax (mV)": "Vmax",
+                        "Jmax (mA/cm2)": "Jmax", "Isc (A)": "Isc",
+                        "Rsh (Ohm)": "Rsh", "Rs (Ohm)": "Rs",
+                        "Area (cm2)": "A", "Incd. Pwr (mW/cm2)": "Incd. Pwr",
+                    }
+                    analysis_df.rename(columns=metric_units_map, inplace=True)
                     analysis_data = analysis_df.to_dict(orient='records')
             elif "MEASUREMENT DATA" in block:
                 lines = block.split(']]')[1].strip()
@@ -395,7 +562,35 @@ class AppController:
         experiments = []
         channels = []
         display_name = os.path.basename(filename)
-        area = float(params_dict.get("Device Area (cm^2)", 0.089))
+
+        # Extract device area
+        area_str = params_dict.get("Device Area (cm^2)", "0.089")
+        if isinstance(area_str, str):
+            area = float(area_str.split()[0]) if area_str else 0.089
+        else:
+            area = float(area_str)
+
+        # Pre-process analysis: parse "Channel" -> (channel_int, direction, metrics)
+        parsed_analysis = []
+        for row in analysis_data:
+            ch_str = str(row.get('Channel', ''))
+            channel_num = None
+            direction = 'Forward'
+            try:
+                if '_' in ch_str:
+                    parts = ch_str.split('_', 1)
+                    channel_num = int(parts[0])
+                    direction = parts[1] if parts[1] in ('Forward', 'Reverse') else 'Forward'
+                else:
+                    channel_num = int(ch_str)
+            except ValueError:
+                continue
+            if channel_num is not None:
+                parsed_analysis.append({
+                    'Channel': channel_num,
+                    'Direction': direction,
+                    'metrics': {k: v for k, v in row.items() if k != 'Channel'}
+                })
 
         channel_cols = measurement_df.columns.get_level_values(0).unique()
 
@@ -409,45 +604,71 @@ class AppController:
 
             channel_df = measurement_df[ch_str]
             directions = channel_df.columns.get_level_values(0).unique()
-            direction = "Forward" if "Forward" in directions else directions[0]
-            data_subset = channel_df[direction]
 
-            if 'V' not in data_subset.columns or 'J' not in data_subset.columns:
-                continue
+            for direction in directions:
+                if direction not in ('Forward', 'Reverse'):
+                    continue
+                data_subset = channel_df[direction]
+                if 'V' not in data_subset.columns or 'J' not in data_subset.columns:
+                    continue
 
-            # Create plot data
-            plot_df = pd.DataFrame()
-            plot_df["Voltage (V)"] = data_subset['V']
-            plot_df["Current (A)"] = data_subset['J'] * area / 1000.0
-            plot_df["Channel"] = channel_num
-            plot_df["Time (s)"] = np.nan
-            plot_df["Status"] = "Loaded"
+                # Extract voltage and current (already in Amperes)
+                v_raw = data_subset['V'].values
+                i_raw = data_subset['J'].values
 
-            # Write to temporary CSV
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode='w')
-            temp_file.write(",".join(plot_df.columns) + "\n")
-            plot_df.to_csv(temp_file, index=False, header=False)
-            temp_file.close()
+                # Sort by voltage to guarantee monotonic line
+                sort_idx = np.argsort(v_raw)
+                v_sorted = v_raw[sort_idx]
+                i_sorted = i_raw[sort_idx]
 
-            # Create procedure and results
-            procedure = JVProcedure()
-            procedure.active_channel = channel_num
+                plot_df = pd.DataFrame({
+                    "Channel": channel_num,
+                    "Voltage (V)": v_sorted,
+                    "Current (A)": i_sorted,
+                    "Time (s)": np.nan,
+                    "Status": "Loaded"
+                })
 
-            results = Results(procedure, temp_file.name)
+                # Write to unique temporary CSV
+                temp_file = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".csv", mode='w',
+                    prefix=f"ch{channel_num}_{direction}_"
+                )
+                temp_file.write("Channel,Voltage (V),Current (A),Time (s),Status\n")
+                plot_df.to_csv(temp_file, index=False, header=False)
+                temp_file.close()
 
-            display_filename = f"Ch {channel_num} - {display_name}"
-            experiment = self._create_experiment(results, display_filename)
+                logger.debug(f"Loaded {len(plot_df)} points for Ch{channel_num} {direction}")
 
-            # Restore analysis data if available
-            channel_metrics = next(
-                (a for a in analysis_data if a.get('Channel') == channel_num), None
-            )
-            if channel_metrics:
-                experiment.procedure.analysis_results = {channel_num: channel_metrics}
+                procedure = JVProcedure()
+                procedure.active_channel = channel_num
+                procedure.sweep_direction = direction
 
-            self.manager.load(experiment)
-            experiments.append(experiment)
-            channels.append(channel_num)
+                results = Results(procedure, temp_file.name)
+
+                display_filename = f"Ch {channel_num} ({direction[:3].capitalize()}) - {display_name}"
+                experiment = self._create_experiment(
+                    results, display_filename,
+                    channel=channel_num,
+                    is_reverse=(direction == 'Reverse')
+                )
+
+                # Restore analysis for this channel & direction
+                ch_analysis = next(
+                    (pa for pa in parsed_analysis
+                    if pa['Channel'] == channel_num and pa['Direction'] == direction),
+                    None
+                )
+                if ch_analysis:
+                    experiment.procedure.analysis_results = {
+                        channel_num: {direction: ch_analysis['metrics']}
+                    }
+                else:
+                    experiment.procedure.analysis_results = {}
+
+                self.manager.load(experiment)
+                experiments.append(experiment)
+                channels.append(channel_num)
 
         return experiments, analysis_data, channels
 
@@ -468,20 +689,43 @@ class AppController:
             if not experiment:
                 return
 
+            # Get channel and direction from experiment
+            channel = None
+            direction = "Forward"
+            
+            if hasattr(experiment.procedure, 'active_channel'):
+                try:
+                    channel = int(experiment.procedure.active_channel)
+                except (ValueError, TypeError):
+                    pass
+            
+            if hasattr(experiment.procedure, 'sweep_direction'):
+                direction = experiment.procedure.sweep_direction
+
             # Update analysis panel with stored results
             if hasattr(experiment.procedure, 'analysis_results'):
                 results = experiment.procedure.analysis_results
                 if results:
-                    for channel, metrics in results.items():
-                        self.view.analysis_panel.analysis({'Channel': channel, **metrics})
+                    for ch, metrics in results.items():
+                        if isinstance(metrics, dict) and "Forward" in metrics:
+                            # Dual sweep mode
+                            for dir_name, dir_metrics in metrics.items():
+                                self.view.analysis_panel.analysis({
+                                    'Channel': ch,
+                                    'Direction': dir_name,
+                                    **dir_metrics
+                                })
+                        else:
+                            # Single sweep mode
+                            self.view.analysis_panel.analysis({
+                                'Channel': ch,
+                                'Direction': 'Forward',
+                                **metrics
+                            })
 
             # Switch to the active channel tab
-            if hasattr(experiment.procedure, 'active_channel'):
-                try:
-                    channel = int(experiment.procedure.active_channel)
-                    self.view.analysis_panel.set_active_channel(channel)
-                except (ValueError, TypeError):
-                    pass
+            if channel:
+                self.view.analysis_panel.set_active_channel(channel, direction)
 
         except Exception as e:
             logger.error(f"Selection handler error: {e}")
@@ -498,7 +742,10 @@ class AppController:
             self.view.abort_button.setEnabled(False)
             self.view.abort_button.setText("Abort")
             self.view.browser_widget.clear_button.setEnabled(True)
+            self.view.browser_widget.show_button.setEnabled(True)
+            self.view.browser_widget.hide_button.setEnabled(True)
 
+            # Merge / process files when all sweeps are done
             try:
                 if self.is_single_file_mode:
                     self._merge_channel_files()
@@ -511,10 +758,9 @@ class AppController:
             self.view.queue_button.setEnabled(True)
             self.is_busy = False
         else:
+            # More experiments in queue – keep instruments connected
             self.view.queue_button.setEnabled(False)
             self.is_busy = True
-
-        self.view.update_instrument_lights()
 
     def abort_experiment(self):
         """Abort the currently running experiment."""
@@ -605,20 +851,80 @@ class AppController:
             browser = self.view.browser_widget.browser
             root = browser.invisibleRootItem()
 
+            # First, collect all channels that have experiments
+            all_channels = set()
+            channel_directions = {}  # Store which directions exist per channel
+            
+            for i in range(root.childCount()):
+                item = root.child(i)
+                exp = self.manager.experiments.with_browser_item(item)
+                if exp and hasattr(exp.procedure, 'active_channel'):
+                    try:
+                        channel = int(exp.procedure.active_channel)
+                        all_channels.add(channel)
+                        
+                        # Check if this is a reverse experiment
+                        if hasattr(exp.procedure, 'sweep_direction'):
+                            direction = exp.procedure.sweep_direction
+                            if channel not in channel_directions:
+                                channel_directions[channel] = set()
+                            channel_directions[channel].add(direction)
+                    except (ValueError, TypeError):
+                        pass
+
+            # Determine if we're in single sweep mode (no reverse experiments)
+            has_reverse = any("Reverse" in dirs for dirs in channel_directions.values())
+            self.view.analysis_panel.set_single_sweep_mode(not has_reverse)
+
+            # Reset analysis panel with all channels
+            if all_channels:
+                self.view.analysis_panel.reset_channels(
+                    sorted(all_channels), JVProcedure.ANALYSIS_LABELS_UNITS
+                )
+
+            # Clear the 'analysis_shown' flag on all items so they will be re-populated
+            # after the panel has been rebuilt. This handles transitions from single
+            # to dual sweep mode when reverse sweeps complete after forward sweeps.
+            for i in range(root.childCount()):
+                item = root.child(i)
+                if hasattr(item, 'analysis_shown'):
+                    del item.analysis_shown
+
+            # Now process results
             for i in range(root.childCount()):
                 item = root.child(i)
                 experiment = self.manager.experiments.with_browser_item(item)
 
-                if (experiment and experiment.procedure.analysis_results and
+                if (experiment and hasattr(experiment.procedure, 'analysis_results') and
                         not hasattr(item, 'analysis_shown')):
-                    for channel, metrics in experiment.procedure.analysis_results.items():
-                        self.view.analysis_panel.analysis({'Channel': channel, **metrics})
+                    results = experiment.procedure.analysis_results
+                    if results:
+                        for channel, metrics in results.items():
+                            if isinstance(metrics, dict):
+                                # Handle both single-direction keys ("Forward" or "Reverse")
+                                # and dual-direction keys ({"Forward": ..., "Reverse": ...})
+                                for direction, dir_metrics in metrics.items():
+                                    self.view.analysis_panel.analysis({
+                                        'Channel': channel,
+                                        'Direction': direction,
+                                        **dir_metrics
+                                    })
+                                    logger.debug(f"Analysis updated: Ch{channel} {direction}")
+                            else:
+                                # Legacy format: single metrics dict without direction nesting
+                                self.view.analysis_panel.analysis({
+                                    'Channel': channel,
+                                    'Direction': 'Forward',
+                                    **metrics
+                                })
                     item.analysis_shown = True
 
             self.finished_experiment_count = root.childCount()
 
         except Exception as e:
             logger.error(f"Analysis update error: {e}")
+            import traceback
+            traceback.print_exc()
 
     # -------------------------------------------------------------------------
     # File Processing and Formatting
@@ -631,13 +937,20 @@ class AppController:
 
         try:
             logger.info("Merging channel files...")
-            all_channel_dfs = []
+            
+            # Group by channel number
+            channel_data_map = {}
             analysis_summary = []
-            experiment_params = []
+            experiment_params = None
 
-            for channel_num, file_path in sorted(self.experiment_files.items()):
+            for key, file_path in self.experiment_files.items():
                 if not os.path.exists(file_path):
                     continue
+
+                # Parse key: format "channel_direction" (e.g., "1_forward")
+                parts = key.split("_")
+                channel_num = int(parts[0])
+                direction = parts[1].capitalize()  # "Forward" or "Reverse"
 
                 channel_data, channel_analysis, channel_params = self._parse_temp_file(file_path)
 
@@ -645,109 +958,316 @@ class AppController:
                     experiment_params = channel_params
 
                 if channel_analysis:
-                    channel_analysis['Channel'] = channel_num
+                    channel_analysis['Channel'] = f"{channel_num}_{direction}"
                     analysis_summary.append(channel_analysis)
 
-                formatted_df = self._format_channel_dataframe(channel_num, channel_data, channel_analysis)
-                all_channel_dfs.append(formatted_df)
+                # Store data for combining
+                if channel_num not in channel_data_map:
+                    channel_data_map[channel_num] = {}
+                channel_data_map[channel_num][direction] = channel_data
 
                 try:
                     os.remove(file_path)
                 except OSError:
                     pass
 
+            # Combine data for each channel
+            all_channel_dfs = []
+            for channel_num, data in sorted(channel_data_map.items()):
+                if 'Forward' in data and 'Reverse' in data:
+                    formatted_df = self._combine_forward_reverse_data(channel_num, data['Forward'], data['Reverse'])
+                elif 'Forward' in data:
+                    formatted_df = self._format_channel_dataframe(channel_num, data['Forward'], {})
+                elif 'Reverse' in data:
+                    formatted_df = self._format_channel_dataframe(channel_num, data['Reverse'], {})
+                else:
+                    continue
+                all_channel_dfs.append(formatted_df)
+
             if not all_channel_dfs:
                 return
 
             final_df = pd.concat(all_channel_dfs, axis=1)
             self._write_formatted_report(self.merged_file_path, experiment_params,
-                                         analysis_summary, final_df)
-
+                                        analysis_summary, final_df,
+                                        notes_text=getattr(self, 'current_notes_text', ''),
+                                        save_notes=getattr(self, 'current_save_notes', False))
             self.merged_data_written = True
             logger.info(f"Merged report saved: {self.merged_file_path}")
 
         except Exception as e:
             logger.error(f"Merge failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _process_multi_files(self):
-        """Format individual channel files (multi-file mode)."""
+        """Merge forward and reverse files into a single file per channel."""
         try:
-            logger.info("Formatting individual channel files...")
-
-            for channel_num, file_path in sorted(self.experiment_files.items()):
-                if file_path in self.processed_files or not os.path.exists(file_path):
+            logger.info("Merging forward/reverse files per channel...")
+            
+            # Group by channel number
+            channel_files = {}
+            for key, file_path in self.experiment_files.items():
+                if not os.path.exists(file_path):
                     continue
-
-                channel_data, channel_analysis, channel_params = self._parse_temp_file(file_path)
-
+                    
+                if isinstance(key, str) and "_" in key:
+                    parts = key.split("_")
+                    channel = int(parts[0])
+                    direction = parts[1]
+                    channel_files.setdefault(channel, {})[direction] = (file_path, key)
+                else:
+                    # Fallback for legacy keys (should not happen)
+                    channel = int(key)
+                    channel_files.setdefault(channel, {})['single'] = (file_path, key)
+            
+            from solarjv_analyzer.config import TIMESTAMP_FORMAT
+            timestamp = datetime.now().strftime(TIMESTAMP_FORMAT).replace(":", "-").replace(" ", "_")
+            
+            for channel, files in channel_files.items():
+                final_path = None
                 analysis_summary = []
-                if channel_analysis:
-                    channel_analysis['Channel'] = channel_num
-                    analysis_summary.append(channel_analysis)
-
-                formatted_df = self._format_channel_dataframe(channel_num, channel_data, channel_analysis)
-                self._write_formatted_report(file_path, channel_params, analysis_summary, formatted_df)
-
-                self.processed_files.add(file_path)
-                logger.info(f"Formatted: {file_path}")
-
+                experiment_params = None
+                combined_df = None
+                
+                if 'single' in files:
+                    # Legacy single-file handling
+                    file_path, key = files['single']
+                    if os.path.exists(file_path):
+                        channel_data, channel_analysis, channel_params = self._parse_temp_file(file_path)
+                        if channel_analysis:
+                            channel_analysis['Channel'] = f"{channel}"
+                            analysis_summary.append(channel_analysis)
+                        if not experiment_params and channel_params:
+                            experiment_params = channel_params
+                        combined_df = self._format_channel_dataframe(channel, channel_data, channel_analysis)
+                        final_path = file_path.replace("_temp", "")
+                        self.processed_files.add(key)
+                
+                elif 'forward' in files and 'reverse' in files:
+                    # Dual sweep mode
+                    forward_path, forward_key = files['forward']
+                    reverse_path, reverse_key = files['reverse']
+                    
+                    forward_data, forward_analysis, forward_params = self._parse_temp_file(forward_path)
+                    if forward_analysis:
+                        forward_analysis['Channel'] = f"{channel}_Forward"
+                        analysis_summary.append(forward_analysis)
+                    if not experiment_params and forward_params:
+                        experiment_params = forward_params
+                    
+                    reverse_data, reverse_analysis, reverse_params = self._parse_temp_file(reverse_path)
+                    if reverse_analysis:
+                        reverse_analysis['Channel'] = f"{channel}_Reverse"
+                        analysis_summary.append(reverse_analysis)
+                    
+                    combined_df = self._combine_forward_reverse_data(channel, forward_data, reverse_data)
+                    
+                    base_dir = os.path.dirname(forward_path)
+                    final_path = os.path.join(base_dir, f"Output_{timestamp}_ch{channel}.csv")
+                    
+                    # Delete temp files after merging
+                    for p in [forward_path, reverse_path]:
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+                    
+                    self.processed_files.add(forward_key)
+                    self.processed_files.add(reverse_key)
+                
+                elif 'forward' in files:
+                    # Single sweep forward mode
+                    forward_path, forward_key = files['forward']
+                    
+                    forward_data, forward_analysis, forward_params = self._parse_temp_file(forward_path)
+                    if forward_analysis:
+                        forward_analysis['Channel'] = f"{channel}"
+                        analysis_summary.append(forward_analysis)
+                    if not experiment_params and forward_params:
+                        experiment_params = forward_params
+                    
+                    # Format with multi-index including Forward direction
+                    combined_df = self._format_channel_dataframe(channel, forward_data, forward_analysis)
+                    
+                    # Create a clean output file name (remove "_forward")
+                    base_dir = os.path.dirname(forward_path)
+                    final_path = os.path.join(base_dir, f"Output_{timestamp}_ch{channel}.csv")
+                    
+                    # Delete the temp forward file
+                    try:
+                        os.remove(forward_path)
+                    except OSError:
+                        pass
+                    
+                    self.processed_files.add(forward_key)
+                
+                # Write the formatted report
+                if final_path and combined_df is not None and not combined_df.empty:
+                    self._write_formatted_report(final_path, experiment_params, analysis_summary, combined_df,
+                                                notes_text=getattr(self, 'current_notes_text', ''),
+                                                save_notes=getattr(self, 'current_save_notes', False))
+                    logger.info(f"Formatted Channel {channel} -> {final_path}")
+                else:
+                    logger.warning(f"No data to write for Channel {channel}")
+            
+            logger.info(f"Multi-file formatting complete")
+            
         except Exception as e:
             logger.error(f"File formatting failed: {e}")
+            import traceback
+            traceback.print_exc()
 
-    def _write_formatted_report(self, filepath, parameters, analysis_summary, final_df):
+    def _combine_forward_reverse_data(self, channel_num, forward_df, reverse_df):
+        """
+        Combine forward and reverse data into a single multi-index DataFrame.
+        
+        Args:
+            channel_num: Channel number
+            forward_df: DataFrame with forward sweep data
+            reverse_df: DataFrame with reverse sweep data
+        
+        Returns:
+            pd.DataFrame: Combined DataFrame with both directions
+        """
+        if forward_df.empty and reverse_df.empty:
+            return pd.DataFrame()
+        
+        data_map = {}
+        
+        # Process forward data
+        if not forward_df.empty:
+            curr_col = 'Current (A)' if 'Current (A)' in forward_df.columns else 'Current'
+            volt_col = 'Voltage (V)' if 'Voltage (V)' in forward_df.columns else 'Voltage'
+            
+            if curr_col in forward_df.columns and volt_col in forward_df.columns:
+                data_map[(channel_num, "Forward", 'V')] = forward_df[volt_col].values
+                data_map[(channel_num, "Forward", 'J')] = forward_df[curr_col].values
+        
+        # Process reverse data
+        if not reverse_df.empty:
+            curr_col = 'Current (A)' if 'Current (A)' in reverse_df.columns else 'Current'
+            volt_col = 'Voltage (V)' if 'Voltage (V)' in reverse_df.columns else 'Voltage'
+            
+            if curr_col in reverse_df.columns and volt_col in reverse_df.columns:
+                data_map[(channel_num, "Reverse", 'V')] = reverse_df[volt_col].values
+                data_map[(channel_num, "Reverse", 'J')] = reverse_df[curr_col].values
+        
+        if not data_map:
+            return pd.DataFrame()
+        
+        # Align lengths (pad with NaN for uneven data)
+        max_len = max((len(arr) for arr in data_map.values()), default=0)
+        aligned_data = {}
+        
+        for key, arr in data_map.items():
+            if len(arr) < max_len:
+                padded = np.full(max_len, np.nan)
+                padded[:len(arr)] = arr
+                aligned_data[key] = padded
+            else:
+                aligned_data[key] = arr
+        
+        # Create MultiIndex DataFrame
+        multi_index = pd.MultiIndex.from_tuples(
+            aligned_data.keys(), names=["channel", "direction", "value"]
+        )
+        final_df = pd.DataFrame(aligned_data)
+        final_df.columns = multi_index
+        
+        return final_df
+
+    def _write_formatted_report(self, filepath, parameters, analysis_summary, final_df,
+                                notes_text='', save_notes=False):
         """
         Write a formatted report with experimental parameters, analysis, and data.
 
-        Args:
-            filepath: Output file path
-            parameters: List of (key, value) parameter tuples
-            analysis_summary: List of analysis dictionaries
-            final_df: Multi-index DataFrame with measurement data
+        The analysis summary will have column headers with units included.
         """
-        with open(filepath, 'w', newline='') as f:
-            # Write experimental parameters
-            if parameters:
-                f.write("[[ EXPERIMENTAL PARAMETERS ]]\n")
-                exclude_keys = {
-                    "Parameter", "Parameters", "Procedure", "Active Channel",
-                    "GPIB Address", "Measurement Range", "MUX Object"
-                }
-                filtered_params = [
-                    (k, v) for k, v in parameters
-                    if k not in exclude_keys and not k.startswith("Channel ")
-                ]
-                if filtered_params:
-                    param_dict = dict(filtered_params)
-                    param_df = pd.DataFrame([param_dict])
-                    param_df.to_csv(f, index=False, sep=',')
+        try:
+            with open(filepath, 'w', newline='') as f:
+                # Write experimental parameters
+                if parameters:
+                    f.write("[[ EXPERIMENTAL PARAMETERS ]]\n")
+                    exclude_keys = {
+                        "Parameter", "Parameters", "Procedure", "Active Channel",
+                        "GPIB Address", "Measurement Range", "MUX Object"
+                    }
+                    filtered_params = [
+                        (k, v) for k, v in parameters
+                        if k not in exclude_keys and not k.startswith("Channel ")
+                    ]
+                    if filtered_params:
+                        param_dict = dict(filtered_params)
+                        param_df = pd.DataFrame([param_dict])
+                        param_df.to_csv(f, index=False, sep=',')
+                    f.write("\n")
+
+                # Write analysis summary
+                f.write("[[ ANALYSIS SUMMARY ]]\n")
+                if analysis_summary:
+                    summary_df = pd.DataFrame(analysis_summary)
+
+                    # Ensure 'Channel' column exists
+                    if 'Channel' not in summary_df.columns:
+                        for col in summary_df.columns:
+                            if 'channel' in col.lower():
+                                summary_df.rename(columns={col: 'Channel'}, inplace=True)
+                                break
+                        else:
+                            summary_df['Channel'] = range(1, len(summary_df) + 1)
+
+                    # Reorder columns to put Channel first
+                    cols = ['Channel'] + [c for c in summary_df.columns if c != 'Channel']
+                    summary_df = summary_df[cols]
+
+                    # Add units to metric column headers
+                    metric_units = {
+                        "EFF": "EFF (%)",
+                        "FF": "FF (%)",
+                        "Voc": "Voc (mV)",
+                        "Jsc": "Jsc (mA/cm2)",
+                        "Vmax": "Vmax (mV)",
+                        "Jmax": "Jmax (mA/cm2)",
+                        "Isc": "Isc (A)",
+                        "Rsh": "Rsh (Ohm)",
+                        "Rs": "Rs (Ohm)",
+                        "A": "Area (cm2)",
+                        "Incd. Pwr": "Incd. Pwr (mW/cm2)",
+                    }
+                    summary_df.rename(columns=metric_units, inplace=True)
+                    summary_df.to_csv(f, index=False, sep=',')
+                else:
+                    f.write("No analysis data available.\n")
+
                 f.write("\n")
 
-            # Write analysis summary
-            f.write("[[ ANALYSIS SUMMARY ]]\n")
-            if analysis_summary:
-                summary_df = pd.DataFrame(analysis_summary)
-                cols = ['Channel'] + [c for c in summary_df.columns if c != 'Channel']
-                summary_df = summary_df[cols]
-                summary_df.to_csv(f, index=False, sep=',')
-            else:
-                f.write("No analysis data available.\n")
+                # Optional notes
+                if save_notes and notes_text.strip():
+                    f.write("[[ NOTES ]]\n")
+                    f.write(notes_text.strip())
+                    f.write("\n\n")
+                    
+                f.write("[[ MEASUREMENT DATA ]]\n")
 
-            f.write("\n")
-            f.write("[[ MEASUREMENT DATA ]]\n")
+                if not final_df.empty:
+                    final_df = final_df.round(6)
+                    final_df.index = [''] * len(final_df)
 
-            if not final_df.empty:
-                final_df = final_df.round(6)
-                final_df.index = [''] * len(final_df)
+                    header_ch = ["channel"] + [str(col[0]) for col in final_df.columns]
+                    f.write(",".join(header_ch) + "\n")
+                    header_dir = ["direction"] + [str(col[1]) for col in final_df.columns]
+                    f.write(",".join(header_dir) + "\n")
+                    header_type = ["value"] + [str(col[2]) for col in final_df.columns]
+                    f.write(",".join(header_type) + "\n")
 
-                # Multi-level header
-                header_ch = ["channel"] + [str(col[0]) for col in final_df.columns]
-                f.write(",".join(header_ch) + "\n")
-                header_dir = ["direction"] + [str(col[1]) for col in final_df.columns]
-                f.write(",".join(header_dir) + "\n")
-                header_type = ["value"] + [str(col[2]) for col in final_df.columns]
-                f.write(",".join(header_type) + "\n")
+                    final_df.to_csv(f, header=False, index=True)
 
-                final_df.to_csv(f, header=False, index=True)
+            logger.info(f"Formatted report saved: {filepath}")
+
+        except Exception as e:
+            logger.error(f"Failed to write formatted report: {e}")
+            raise
 
     def _parse_temp_file(self, filepath: str):
         """
@@ -775,10 +1295,11 @@ class AppController:
                 if in_analysis:
                     parts = stripped.split('\t')
                     if len(parts) >= 2:
+                        key = parts[0].strip()
                         try:
-                            analysis_dict[parts[0]] = float(parts[1])
+                            analysis_dict[key] = float(parts[1])
                         except ValueError:
-                            pass
+                            analysis_dict[key] = parts[1]
                 else:
                     if stripped.startswith("#"):
                         content = stripped.lstrip("#").strip()
@@ -795,7 +1316,8 @@ class AppController:
             csv_data = StringIO("".join(data_lines))
             try:
                 df = pd.read_csv(csv_data)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Failed to parse CSV data: {e}")
                 df = pd.DataFrame()
         else:
             df = pd.DataFrame()
@@ -809,7 +1331,7 @@ class AppController:
         Args:
             channel_num: Channel number
             df: Raw DataFrame with Current (A) and Voltage (V) columns
-            analysis_dict: Analysis metrics for this channel
+            analysis_dict: Analysis metrics for this channel (may contain direction info)
 
         Returns:
             pd.DataFrame: Multi-index DataFrame with channel/direction/value levels
@@ -817,21 +1339,19 @@ class AppController:
         if df.empty:
             return pd.DataFrame()
 
-        # Identify current and voltage columns
         curr_col = 'Current (A)' if 'Current (A)' in df.columns else 'Current'
         volt_col = 'Voltage (V)' if 'Voltage (V)' in df.columns else 'Voltage'
 
         if curr_col not in df.columns:
             return pd.DataFrame()
 
-        area = analysis_dict.get("A", 1.0) if analysis_dict else 1.0
+        area = analysis_dict.get("Area", 1.0) if analysis_dict else 1.0
         df['J'] = (df[curr_col] / area) * 1000.0
         df['V'] = df[volt_col]
 
         voltages = df['V'].values
         data_map = {}
 
-        # Detect sweep direction change for forward/reverse splitting
         if len(voltages) > 2:
             diff = np.diff(voltages)
             sign_changes = np.where(np.diff(np.sign(diff)))[0]
@@ -854,17 +1374,25 @@ class AppController:
                 }
             else:
                 direction = "Forward"
+                if analysis_dict and "Channel" in analysis_dict:
+                    channel_label = analysis_dict.get("Channel", "")
+                    if "_Reverse" in str(channel_label) or "_reverse" in str(channel_label):
+                        direction = "Reverse"
                 data_map = {
                     (channel_num, direction, 'V'): df['V'],
                     (channel_num, direction, 'J'): df['J']
                 }
         else:
+            direction = "Forward"
+            if analysis_dict and "Channel" in analysis_dict:
+                channel_label = analysis_dict.get("Channel", "")
+                if "_Reverse" in str(channel_label) or "_reverse" in str(channel_label):
+                    direction = "Reverse"
             data_map = {
-                (channel_num, "Forward", 'V'): df['V'],
-                (channel_num, "Forward", 'J'): df['J']
+                (channel_num, direction, 'V'): df['V'],
+                (channel_num, direction, 'J'): df['J']
             }
 
-        # Align lengths (pad with NaN for uneven data)
         max_len = max((len(arr) for arr in data_map.values()), default=0)
         aligned_data = {}
 

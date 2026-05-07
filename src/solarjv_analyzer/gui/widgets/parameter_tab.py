@@ -27,6 +27,17 @@ class ParameterTab(QtWidgets.QWidget):
         self._layout()
         self._connect_signals()
 
+        # Set all channels selected by default
+        for channel in self.channels:
+            channel.setChecked(True)
+        self.select_all_channels.setChecked(True)
+
+        # Initialize traffic lights to green (all selected)
+        for light in self.channel_lights:
+            light.setStyleSheet(
+                "border-radius: 6px; background-color: #2ecc71; border: 1px solid #27ae60;"
+            )
+
         # Update time estimate after UI is ready
         QtCore.QTimer.singleShot(100, self._update_time_estimate)
 
@@ -59,9 +70,10 @@ class ParameterTab(QtWidgets.QWidget):
         layout.addRow("Step Size:", self._row(self.step_size, self.step_unit))
 
         # Sweep Rate
-        self.sweep_rate = QtWidgets.QLineEdit("0.1")
+        self.sweep_rate = QtWidgets.QLineEdit("100")  # 100 mV/s instead of 0.1 V/s
         self.sweep_rate_unit = QtWidgets.QComboBox()
         self.sweep_rate_unit.addItems(["V/s", "mV/s"])
+        self.sweep_rate_unit.setCurrentText("mV/s")  # Set mV/s as default
         layout.addRow("Sweep Rate:", self._row(self.sweep_rate, self.sweep_rate_unit))
 
         helper_text = QtWidgets.QLabel("(Determines measurement speed and NPLC)")
@@ -90,6 +102,27 @@ class ParameterTab(QtWidgets.QWidget):
         # Channel Selection
         self._create_channel_selector(layout)
 
+        # Notes section
+        self.notes_field = QtWidgets.QTextEdit()
+        self.notes_field.setPlaceholderText("Enter any notes or comments...")
+        self.notes_field.setFixedHeight(80)
+        self.save_notes_checkbox = QtWidgets.QCheckBox("Save in file")
+        self.save_notes_checkbox.setChecked(True)
+        self.clear_notes_button = QtWidgets.QPushButton("Clear")
+        self.clear_notes_button.clicked.connect(self._clear_notes)
+
+        notes_widget = QtWidgets.QWidget()
+        notes_layout = QtWidgets.QVBoxLayout(notes_widget)
+        notes_layout.setContentsMargins(0, 0, 0, 0)
+        notes_layout.addWidget(self.notes_field)
+        notes_controls = QtWidgets.QHBoxLayout()
+        notes_controls.addWidget(self.save_notes_checkbox)
+        notes_controls.addStretch(1)
+        notes_controls.addWidget(self.clear_notes_button)
+        notes_layout.addLayout(notes_controls)
+
+        layout.addRow("Notes:", notes_widget)
+
         # Estimated Time Display
         self.estimated_time_label = QtWidgets.QLabel("Estimated sweep time: --")
         self.estimated_time_label.setStyleSheet("color: blue; font-weight: bold;")
@@ -105,27 +138,75 @@ class ParameterTab(QtWidgets.QWidget):
 
     def _create_channel_selector(self, parent_layout):
         """
-        Create the channel selection checkboxes.
+        Create the channel selection checkboxes with traffic‑light indicators.
 
-        Args:
-            parent_layout: QFormLayout to add the channel selector to
+        Layout (physical):
+            Ch3   Ch4
+            Ch2   Ch5
+            Ch1   Ch6
         """
-        self.channels: List[QtWidgets.QCheckBox] = [
-            QtWidgets.QCheckBox(f"Channel {i+1}") for i in range(6)
-        ]
-        self.select_all_channels = QtWidgets.QCheckBox("Select All Channels")
+        self.channels: List[QtWidgets.QCheckBox] = []
+        self.channel_lights: List[QtWidgets.QLabel] = []
 
+        # Master widget to hold the grid + select all
         channel_widget = QtWidgets.QWidget()
         channel_layout = QtWidgets.QVBoxLayout(channel_widget)
-        channel_layout.setAlignment(QtCore.Qt.AlignRight)
-        channel_layout.setSpacing(2)
         channel_layout.setContentsMargins(0, 0, 0, 0)
+        channel_layout.setSpacing(4)
 
-        for channel in self.channels:
-            channel_layout.addWidget(channel)
-        channel_layout.addWidget(self.select_all_channels)
+        # Grid for lights + checkboxes
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(4)
+
+        # Mapping: channel number -> (row, col_of_checkbox, col_of_light)
+        # lights are to the left of each checkbox, so we place light at column (checkbox_col - 1)
+        mapping = {
+            3: (0, 1),
+            4: (0, 3),
+            2: (1, 1),
+            5: (1, 3),
+            1: (2, 1),
+            6: (2, 3),
+        }
+
+        # Create checkboxes and lights in order 1..6 for list indexing
+        for i in range(1, 7):
+            cb = QtWidgets.QCheckBox(f"Channel {i}")
+            self.channels.append(cb)
+
+            # Traffic light (small circle)
+            light = QtWidgets.QLabel("")
+            light.setFixedSize(12, 12)
+            light.setStyleSheet("border-radius: 6px; background-color: #bdc3c7; border: 1px solid #95a5a6;")
+            self.channel_lights.append(light)
+
+        # Place them in the grid according to the physical layout
+        for ch_num, (row, col) in mapping.items():
+            idx = ch_num - 1
+            # Place light to the left (column -1)
+            grid.addWidget(self.channel_lights[idx], row, col - 1, QtCore.Qt.AlignCenter)
+            grid.addWidget(self.channels[idx], row, col)
+
+        # Center the grid horizontally by adding stretches on the sides
+        hbox = QtWidgets.QHBoxLayout()
+        hbox.addStretch(1)
+        hbox.addLayout(grid)
+        hbox.addStretch(1)
+
+        channel_layout.addLayout(hbox)
+
+        # Select All checkbox (centered below the grid)
+        self.select_all_channels = QtWidgets.QCheckBox("Select All Channels")
+        select_all_layout = QtWidgets.QHBoxLayout()
+        select_all_layout.addStretch(1)
+        select_all_layout.addWidget(self.select_all_channels)
+        select_all_layout.addStretch(1)
+        channel_layout.addLayout(select_all_layout)
 
         parent_layout.addRow("Channels:", channel_widget)
+
+        
 
     @staticmethod
     def _row(input_field, combo_box) -> QtWidgets.QWidget:
@@ -147,10 +228,14 @@ class ParameterTab(QtWidgets.QWidget):
         layout.addWidget(combo_box)
         return container
 
+    def _clear_notes(self):
+        """Clear the notes text field."""
+        self.notes_field.clear()
+
     # -------------------------------------------------------------------------
     # Time Estimation
     # -------------------------------------------------------------------------
-
+    
     def _update_time_estimate(self):
         """Calculate and display estimated sweep time based on current parameters."""
         try:
@@ -239,6 +324,10 @@ class ParameterTab(QtWidgets.QWidget):
             area /= 100.0
         elif area_unit == "m²":
             area *= 10000.0
+            
+        # Notes
+        notes_text = self.notes_field.toPlainText().strip()
+        save_notes = self.save_notes_checkbox.isChecked()
 
         return {
             'start_voltage': start_v,
@@ -247,6 +336,8 @@ class ParameterTab(QtWidgets.QWidget):
             'sweep_rate': sweep_rate,
             'compliance_current': compliance,
             'device_area': area,
+            'notes_text': notes_text if save_notes else '',
+            'save_notes': save_notes,
         }
 
     # -------------------------------------------------------------------------
@@ -257,15 +348,36 @@ class ParameterTab(QtWidgets.QWidget):
         """Connect UI signals to their handlers."""
         self.select_all_channels.toggled.connect(self.on_select_all_channels)
 
-    def on_select_all_channels(self, checked: bool):
-        """
-        Select or deselect all channel checkboxes.
+        # Connect each individual channel to update Select All checkbox state and traffic light
+        for idx, channel in enumerate(self.channels):
+            channel.toggled.connect(self._update_select_all_state)
+            # Use a lambda with a default argument to capture the correct index
+            channel.toggled.connect(lambda checked, i=idx: self._update_channel_light(i, checked))
 
-        Args:
-            checked: True to select all, False to deselect all
-        """
+    def _update_channel_light(self, index: int, checked: bool):
+        """Turn the traffic light green if checked, grey otherwise."""
+        if checked:
+            self.channel_lights[index].setStyleSheet(
+                "border-radius: 6px; background-color: #2ecc71; border: 1px solid #27ae60;"
+            )
+        else:
+            self.channel_lights[index].setStyleSheet(
+                "border-radius: 6px; background-color: #bdc3c7; border: 1px solid #95a5a6;"
+            )
+
+    def _update_select_all_state(self):
+        """Update Select All checkbox state based on individual channel selections."""
+        all_checked = all(channel.isChecked() for channel in self.channels)
+        self.select_all_channels.blockSignals(True)
+        self.select_all_channels.setChecked(all_checked)
+        self.select_all_channels.blockSignals(False)
+
+    def on_select_all_channels(self, checked: bool):
+        """Select or deselect all channel checkboxes."""
         for channel in self.channels:
+            channel.blockSignals(True)
             channel.setChecked(checked)
+            channel.blockSignals(False)
 
     # -------------------------------------------------------------------------
     # Channel Selection

@@ -1,5 +1,6 @@
 # src/solarjv_analyzer/config.py
 
+import os
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -12,7 +13,10 @@ class _Config:
     # If True, use simulated instruments instead of real hardware
     SIMULATION_MODE: bool = False
     # Base directory for all result files (relative or absolute)
-    RESULTS_ROOT: Path = Path.home() / "Reports"
+    import os
+
+    # Base directory for all user data
+    RESULTS_ROOT = os.path.join(Path.home(), "SolarJV_Data")  # or "~/Reports"
     # Format string for date-based subfolders or filenames (day-month-year)
     DATE_FORMAT: str = "%d-%m-%Y"
     # Default prefix for result filenames

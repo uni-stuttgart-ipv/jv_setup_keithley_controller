@@ -10,13 +10,17 @@ import os
 import sys
 from datetime import datetime
 
+from pathlib import Path
+from PyQt5.QtGui import QIcon
 import pyqtgraph as pg
+from pyqtgraph.exporters import ImageExporter
 from PyQt5 import QtWidgets, QtCore
 from pymeasure.display.widgets import PlotWidget, LogWidget, BrowserWidget
 
 from solarjv_analyzer.config import RESULTS_ROOT, DATE_FORMAT
 from solarjv_analyzer.instruments.instrument_manager import InstrumentManager
 from solarjv_analyzer.procedures.jv_procedure import JVProcedure
+from solarjv_analyzer.utils.directory_manager import DirectoryManager
 
 from .widgets.parameter_tab import ParameterTab
 from .widgets.instrument_tab import InstrumentTab
@@ -30,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 class JVAnalyzerWindow(QtWidgets.QMainWindow):
     """
-    Main application window for J-V measurement and analysis.
+    Main application window for J‑V measurement and analysis.
 
     Provides:
     - Parameter input tabs for experiment configuration
@@ -39,6 +43,169 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
     - Browser for managing multiple experiments
     - Analysis panel for displaying solar cell metrics
     """
+    # Signal emitted when the user confirms logout
+    logged_out = QtCore.pyqtSignal()
+
+    # -------------------------------------------------------------------------
+    # Modern stylesheet
+    @staticmethod
+    def _app_stylesheet() -> str:
+        return """
+            /* Global Pure White Background & Modern System Font */
+            QMainWindow { background-color: #ffffff; }
+            QWidget {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+                font-size: 13px;
+                color: #1e293b;
+            }
+
+            /* Group Boxes (Cards) */
+            QGroupBox {
+                font-weight: 600;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                margin-top: 20px;
+                padding: 16px;
+                background-color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 5px;
+                color: #475569;
+                left: 10px;
+            }
+
+            /* Dock Widget */
+            QDockWidget { border: none; }
+            QDockWidget::title {
+                font-weight: 600;
+                font-size: 14px;
+                color: #0f172a;
+                padding: 12px;
+                background: #ffffff;
+                border-bottom: 1px solid #f1f5f9;
+            }
+
+            /* Buttons */
+            QPushButton {
+                font-weight: 500;
+                border-radius: 6px;
+                padding: 8px 16px;
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                color: #334155;
+            }
+            QPushButton:hover {
+                background-color: #f8fafc;
+                border-color: #94a3b8;
+            }
+            QPushButton:pressed {
+                background-color: #f1f5f9;
+            }
+
+            /* Primary Button (Queue) */
+            QPushButton#QueueButton {
+                background-color: #2563eb;
+                color: white;
+                border: none;
+                font-weight: 600;
+            }
+            QPushButton#QueueButton:hover { background-color: #1d4ed8; }
+            QPushButton#QueueButton:pressed { background-color: #1e40af; }
+
+            /* Danger Button (Abort) */
+            QPushButton#AbortButton {
+                background-color: #ef4444;
+                color: white;
+                border: none;
+                font-weight: 600;
+            }
+            QPushButton#AbortButton:hover { background-color: #dc2626; }
+            QPushButton#AbortButton:pressed { background-color: #b91c1c; }
+
+            /* Success Button (Save Plot) */
+            QPushButton#SavePlotButton {
+                background-color: #10b981;
+                color: white;
+                border: none;
+                font-weight: 600;
+                margin: 8px 0px;
+            }
+            QPushButton#SavePlotButton:hover { background-color: #059669; }
+
+            /* Modern Tabs */
+            QTabWidget::pane {
+                border: 1px solid #e2e8f0;
+                background: #ffffff;
+                border-radius: 8px;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background: transparent;
+                padding: 10px 20px;
+                border: 1px solid transparent;
+                border-bottom: 2px solid transparent;
+                color: #64748b;
+                font-weight: 500;
+            }
+            QTabBar::tab:hover {
+                color: #0f172a;
+            }
+            QTabBar::tab:selected {
+                color: #2563eb;
+                border-bottom: 2px solid #2563eb;
+                font-weight: 600;
+            }
+
+            /* Inputs */
+            QLineEdit, QComboBox, QDoubleSpinBox {
+                padding: 8px 12px;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                background: #ffffff;
+                color: #0f172a;
+                selection-background-color: #bfdbfe;
+            }
+            QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus {
+                border: 1px solid #3b82f6;
+                outline: none;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 24px;
+            }
+
+            /* Scrollbars & Splitters */
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            QSplitter::handle {
+                background: #f1f5f9;
+                width: 4px;
+                height: 4px;
+            }
+            QSplitter::handle:hover {
+                background: #cbd5e1;
+            }
+
+            /* Tables & Lists */
+            QTableWidget {
+                background: #ffffff;
+                gridline-color: #f1f5f9;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+            }
+            QHeaderView::section {
+                background: #f8fafc;
+                padding: 10px;
+                border: none;
+                border-bottom: 1px solid #e2e8f0;
+                font-weight: 600;
+                color: #475569;
+            }
+        """
 
     def __init__(self, username=None):
         """
@@ -51,11 +218,18 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.username = username
         self.instrument_manager = InstrumentManager()
 
+        # Initialize directory manager FIRST (before UI)
+        self.dir_manager = DirectoryManager(username=self.username, parent=self, mode="Main")
+        self.dir_manager.set_mode("Main") 
+
         self.setWindowTitle("Custom JV Analyzer")
         self.resize(1200, 720)
         self.setMinimumSize(1000, 700)
 
-        # Build the user interface
+        # Apply modern stylesheet globally
+        self.setStyleSheet(self._app_stylesheet())
+
+        # Build the user interface (this will also set up the file panel)
         self._layout()
 
         # Initialize controller
@@ -103,26 +277,41 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         # File panel and control buttons
         self.file_panel = FilePanel()
         self.queue_button = QtWidgets.QPushButton("Queue")
+        self.queue_button.setObjectName("QueueButton")
         self.abort_button = QtWidgets.QPushButton("Abort")
+        self.abort_button.setObjectName("AbortButton")
 
         button_layout = QtWidgets.QHBoxLayout()
+        button_layout.setSpacing(12) # Added spacing between buttons
         button_layout.addWidget(self.queue_button)
         button_layout.addWidget(self.abort_button)
 
         # Instrument status lights
         lights_row = self._create_status_lights()
 
-        # Left sidebar
+        # Left sidebar (now inside a scroll area)
         sidebar_widget = QtWidgets.QWidget()
+        sidebar_widget.setMinimumWidth(400) # Increased width slightly for breathing room
+        
         sidebar_layout = QtWidgets.QVBoxLayout(sidebar_widget)
+        # Added margins and spacing for a cleaner, modern flow
+        sidebar_layout.setContentsMargins(16, 16, 16, 16)
+        sidebar_layout.setSpacing(20) 
+        
         sidebar_layout.addWidget(input_tabs)
         sidebar_layout.addWidget(self.file_panel)
         sidebar_layout.addLayout(lights_row)
         sidebar_layout.addLayout(button_layout)
         sidebar_layout.addStretch()
 
+        # Wrap in a scroll area for small screens
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll_area.setWidget(sidebar_widget)
+
         sidebar_dock = QtWidgets.QDockWidget("Inputs")
-        sidebar_dock.setWidget(sidebar_widget)
+        sidebar_dock.setWidget(scroll_area)
         sidebar_dock.setFeatures(QtWidgets.QDockWidget.NoDockWidgetFeatures)
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, sidebar_dock)
 
@@ -136,25 +325,61 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         vertical_splitter.setStretchFactor(1, 1)
 
         main_layout = QtWidgets.QVBoxLayout(self.main)
+        main_layout.setContentsMargins(0, 0, 0, 0) # Removed hard main margins for edge-to-edge splitters
         main_layout.addWidget(vertical_splitter)
+
+        # ----- Top‑right logout button (text) -----
+        logout_toolbar = QtWidgets.QToolBar("Logout")
+        logout_toolbar.setMovable(False)
+        logout_toolbar.setContentsMargins(12, 12, 12, 0)   # left, top, right, bottom
+
+        # Spacer that pushes the button to the right edge
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        logout_toolbar.addWidget(spacer)
+
+        self.logout_btn = QtWidgets.QPushButton("Logout")
+        self.logout_btn.setToolTip("Logout and return to login screen")
+        self.logout_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        # Updated to match the new flat UI aesthetic
+        self.logout_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #fee2e2;
+                color: #ef4444;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 14px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #fca5a5;
+            }
+        """)
+        self.logout_btn.clicked.connect(self._confirm_logout)
+
+        logout_toolbar.addWidget(self.logout_btn)
+        self.addToolBar(QtCore.Qt.TopToolBarArea, logout_toolbar)
 
         self.update_instrument_lights()
 
     def _create_status_lights(self):
         """Create instrument connection status indicators."""
         lights_row = QtWidgets.QHBoxLayout()
+        lights_row.setSpacing(8) # Unified spacing
+
         self.keithley_light = QtWidgets.QLabel("  ")
-        self.keithley_light.setFixedSize(14, 14)
-        self.keithley_light.setStyleSheet("border-radius:7px; background:#c33;")
+        self.keithley_light.setFixedSize(12, 12)
+        self.keithley_light.setStyleSheet("border-radius:6px; background:#ef4444;")
 
         self.mux_light = QtWidgets.QLabel("  ")
-        self.mux_light.setFixedSize(14, 14)
-        self.mux_light.setStyleSheet("border-radius:7px; background:#c33;")
+        self.mux_light.setFixedSize(12, 12)
+        self.mux_light.setStyleSheet("border-radius:6px; background:#ef4444;")
 
         lights_row.addStretch(1)
         lights_row.addWidget(self.keithley_light)
         lights_row.addWidget(QtWidgets.QLabel("Keithley"))
-        lights_row.addSpacing(12)
+        lights_row.addSpacing(20)
         lights_row.addWidget(self.mux_light)
         lights_row.addWidget(QtWidgets.QLabel("MUX"))
         lights_row.addStretch(1)
@@ -178,17 +403,17 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
 
         container = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(12, 12, 12, 12) # Added proper padding around plot
         layout.addWidget(self.tabs)
 
         self.save_plot_button = QtWidgets.QPushButton("Save Plot as PNG")
+        self.save_plot_button.setObjectName("SavePlotButton")
         layout.addWidget(self.save_plot_button)
 
         return container
 
     def _create_bottom_splitter(self):
         """Create the bottom splitter with browser and analysis panel."""
-        # Browser configuration
         display_parameters = [
             "active_channel",
             "compliance_current",
@@ -217,8 +442,43 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         splitter.addWidget(self.analysis_panel)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
+        
+        # Add a wrapper to ensure padding around the bottom section
+        wrapper = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(wrapper)
+        layout.setContentsMargins(12, 0, 12, 12)
+        layout.addWidget(splitter)
 
-        return splitter
+        return wrapper
+
+    def _create_file_panel(self):
+        """Create the file output panel with directory from manager."""
+        self.file_panel = FilePanel()
+
+        self.dir_manager.set_mode("Main")
+        self.dir_manager.set_username(self.username)
+
+        # Set the directory to the full Main path
+        main_dir = self.dir_manager.get_current_directory(create=True)
+        self.file_panel.set_directory(main_dir)
+        return self.file_panel
+
+    # -------------------------------------------------------------------------
+    # Logout
+    # -------------------------------------------------------------------------
+
+    def _confirm_logout(self):
+        """Ask the user to confirm logout, then emit logged_out if accepted."""
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm Logout",
+            "Are you sure you want to log out?\n\n"
+            "This will disconnect instruments and return to the login screen.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.logged_out.emit()
 
     # -------------------------------------------------------------------------
     # Signal Connections
@@ -256,20 +516,17 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
 
     def _setup_logging(self):
         """Route logging messages to the LogWidget."""
-        # Remove existing handlers to avoid duplicates
         for handler in logging.root.handlers[:]:
             logging.root.removeHandler(handler)
 
         logging.root.setLevel(logging.INFO)
 
-        # Use LogWidget's built-in handler if available
         if hasattr(self.log_widget, 'handler'):
             logging.root.addHandler(self.log_widget.handler)
             logger.info("Log routing configured")
         else:
             self._create_fallback_handler()
 
-        # Console handler for debugging (WARNING level only)
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.WARNING)
         console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
@@ -314,23 +571,19 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
     def _update_nplc_from_sweep_rate(self):
         """Calculate NPLC from sweep rate and update instrument tab preview."""
         try:
-            # Parse start voltage
             start_v = float(self.params_tab.start_voltage.text() or "0")
             if self.params_tab.start_unit.currentText() == "mV":
                 start_v /= 1000.0
 
-            # Parse stop voltage
             stop_v = float(self.params_tab.stop_voltage.text() or "0")
             if self.params_tab.stop_unit.currentText() == "mV":
                 stop_v /= 1000.0
 
-            # Parse step size
             step_v = float(self.params_tab.step_size.text() or "0.01")
             if self.params_tab.step_unit.currentText() == "mV":
                 step_v /= 1000.0
             step_v = abs(step_v)
 
-            # Parse sweep rate
             sweep_rate = float(self.params_tab.sweep_rate.text() or "0.1")
             if self.params_tab.sweep_rate_unit.currentText() == "mV/s":
                 sweep_rate /= 1000.0
@@ -344,24 +597,17 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
                 nplc = max(0.01, min(10.0, nplc))
 
                 self.instr_tab.update_nplc(nplc)
-
         except Exception:
-            pass  # Silent failure - user input may be incomplete
+            pass
 
     # -------------------------------------------------------------------------
     # File and Directory Management
     # -------------------------------------------------------------------------
 
     def _update_save_directory(self):
-        """Set default save directory to today's date folder (only if not set)."""
-        today = datetime.now().strftime(DATE_FORMAT)
-        reports_folder = os.path.join(RESULTS_ROOT, today)
-        os.makedirs(reports_folder, exist_ok=True)
-
-        # Only set if directory is empty or doesn't exist
-        current_dir = self.file_panel.get_directory()
-        if not current_dir or not os.path.exists(current_dir):
-            self.file_panel.set_directory(reports_folder)
+        """Update save directory using directory manager."""
+        main_dir = self.dir_manager.get_current_directory(create=True)
+        self.file_panel.set_directory(main_dir)
 
     # -------------------------------------------------------------------------
     # Instrument Status
@@ -372,11 +618,11 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         k_connected = self.instrument_manager.keithley is not None
         m_connected = self.instrument_manager.mux is not None
 
-        k_color = '#3c3' if k_connected else '#c33'
-        m_color = '#3c3' if m_connected else '#c33'
+        k_color = '#10b981' if k_connected else '#ef4444' # Updated to modern success/danger hex colors
+        m_color = '#10b981' if m_connected else '#ef4444'
 
-        self.keithley_light.setStyleSheet(f"border-radius:7px; background:{k_color};")
-        self.mux_light.setStyleSheet(f"border-radius:7px; background:{m_color};")
+        self.keithley_light.setStyleSheet(f"border-radius:6px; background:{k_color};")
+        self.mux_light.setStyleSheet(f"border-radius:6px; background:{m_color};")
 
     # -------------------------------------------------------------------------
     # Browser and Experiment Management
@@ -403,7 +649,13 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
 
     def open_experiment(self):
         """Open saved result files."""
-        dialog = QtWidgets.QFileDialog(self, "Open Results File")
+        main_dir = self.dir_manager.get_current_directory(create=False)
+        if not main_dir or not os.path.exists(main_dir):
+            main_dir = os.path.expanduser("~")
+
+        dialog = QtWidgets.QFileDialog(self, "Open Results File", main_dir)
+        dialog.setFileMode(QtWidgets.QFileDialog.ExistingFiles)
+        dialog.setNameFilter("CSV Files (*.csv);;All Files (*)")
         if dialog.exec_():
             files = dialog.selectedFiles()
             self.controller.load_files(files)
@@ -427,7 +679,7 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
     def save_plot(self):
         """Export the current plot as a PNG image."""
         try:
-            exporter = pg.exporters.ImageExporter(self.plot_widget.plot)
+            exporter = ImageExporter(self.plot_widget.plot)
             filename, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self, "Save Plot", "", "PNG Image (*.png)"
             )
