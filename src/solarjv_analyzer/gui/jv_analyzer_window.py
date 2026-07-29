@@ -28,6 +28,17 @@ from .widgets.analysis_settings_tab import AnalysisSettingsTab
 from .widgets.file_panel import FilePanel
 from .widgets.analysis_panel import AnalysisPanel
 from .app_controller import AppController
+from .style import BASE_STYLESHEET
+
+# SPO is a self-contained, optional module: if the spo/ package is removed,
+# the JV application must still compile and run (SPO mode is simply hidden).
+try:
+    from solarjv_analyzer.spo.spo_widget import SpoWidget, SpoParameterTab
+    SPO_AVAILABLE = True
+except ImportError:
+    SpoWidget = None
+    SpoParameterTab = None
+    SPO_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -50,32 +61,7 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
     # Modern stylesheet
     @staticmethod
     def _app_stylesheet() -> str:
-        return """
-            /* Global Pure White Background & Modern System Font */
-            QMainWindow { background-color: #ffffff; }
-            QWidget {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-                font-size: 13px;
-                color: #1e293b;
-            }
-
-            /* Group Boxes (Cards) */
-            QGroupBox {
-                font-weight: 600;
-                border: 1px solid #e2e8f0;
-                border-radius: 8px;
-                margin-top: 20px;
-                padding: 16px;
-                background-color: #ffffff;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                padding: 0 5px;
-                color: #475569;
-                left: 10px;
-            }
-
+        return BASE_STYLESHEET + """
             /* Dock Widget */
             QDockWidget { border: none; }
             QDockWidget::title {
@@ -85,23 +71,6 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
                 padding: 12px;
                 background: #ffffff;
                 border-bottom: 1px solid #f1f5f9;
-            }
-
-            /* Buttons */
-            QPushButton {
-                font-weight: 500;
-                border-radius: 6px;
-                padding: 8px 16px;
-                background-color: #ffffff;
-                border: 1px solid #cbd5e1;
-                color: #334155;
-            }
-            QPushButton:hover {
-                background-color: #f8fafc;
-                border-color: #94a3b8;
-            }
-            QPushButton:pressed {
-                background-color: #f1f5f9;
             }
 
             /* Primary Button (Queue) */
@@ -124,6 +93,18 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
             QPushButton#AbortButton:hover { background-color: #dc2626; }
             QPushButton#AbortButton:pressed { background-color: #b91c1c; }
 
+            /* Mode Toggle Buttons (JV Sweep / SPO) */
+            QPushButton#ModeButton {
+                font-weight: 600;
+            }
+            QPushButton#ModeButton:checked {
+                background-color: #16a34a;
+                color: white;
+                border: 1px solid #15803d;
+            }
+            QPushButton#ModeButton:checked:hover { background-color: #15803d; }
+            QPushButton#ModeButton:checked:pressed { background-color: #166534; }
+
             /* Success Button (Save Plot) */
             QPushButton#SavePlotButton {
                 background-color: #10b981;
@@ -133,79 +114,8 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
                 margin: 8px 0px;
             }
             QPushButton#SavePlotButton:hover { background-color: #059669; }
-
-            /* Modern Tabs */
-            QTabWidget::pane {
-                border: 1px solid #e2e8f0;
-                background: #ffffff;
-                border-radius: 8px;
-                top: -1px;
-            }
-            QTabBar::tab {
-                background: transparent;
-                padding: 10px 20px;
-                border: 1px solid transparent;
-                border-bottom: 2px solid transparent;
-                color: #64748b;
-                font-weight: 500;
-            }
-            QTabBar::tab:hover {
-                color: #0f172a;
-            }
-            QTabBar::tab:selected {
-                color: #2563eb;
-                border-bottom: 2px solid #2563eb;
-                font-weight: 600;
-            }
-
-            /* Inputs */
-            QLineEdit, QComboBox, QDoubleSpinBox {
-                padding: 8px 12px;
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
-                background: #ffffff;
-                color: #0f172a;
-                selection-background-color: #bfdbfe;
-            }
-            QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus {
-                border: 1px solid #3b82f6;
-                outline: none;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 24px;
-            }
-
-            /* Scrollbars & Splitters */
-            QScrollArea {
-                background: transparent;
-                border: none;
-            }
-            QSplitter::handle {
-                background: #f1f5f9;
-                width: 4px;
-                height: 4px;
-            }
-            QSplitter::handle:hover {
-                background: #cbd5e1;
-            }
-
-            /* Tables & Lists */
-            QTableWidget {
-                background: #ffffff;
-                gridline-color: #f1f5f9;
-                border: 1px solid #e2e8f0;
-                border-radius: 8px;
-            }
-            QHeaderView::section {
-                background: #f8fafc;
-                padding: 10px;
-                border: none;
-                border-bottom: 1px solid #e2e8f0;
-                font-weight: 600;
-                color: #475569;
-            }
         """
+
 
     def __init__(self, username=None):
         """
@@ -270,7 +180,20 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.params_tab = ParameterTab()
         self.instr_tab = InstrumentTab()
         self.analysis_settings_tab = AnalysisSettingsTab()
-        input_tabs.addTab(self.params_tab, "Parameters")
+
+        # SPO parameter fields occupy the same "Parameters" tab slot as the
+        # JV ParameterTab; a QStackedWidget swaps between them by mode so
+        # the Instrument/Analysis tabs and the tab bar itself never change.
+        self.params_stack = QtWidgets.QStackedWidget()
+        self.params_stack.addWidget(self.params_tab)
+        if SPO_AVAILABLE:
+            self.spo_param_tab = SpoParameterTab(self)
+        else:
+            logger.warning("SPO module unavailable; SPO mode disabled.")
+            self.spo_param_tab = QtWidgets.QWidget()
+        self.params_stack.addWidget(self.spo_param_tab)
+
+        input_tabs.addTab(self.params_stack, "Parameters")
         input_tabs.addTab(self.instr_tab, "Instrument")
         input_tabs.addTab(self.analysis_settings_tab, "Analysis")
 
@@ -286,6 +209,38 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         button_layout.addWidget(self.queue_button)
         button_layout.addWidget(self.abort_button)
 
+        # SPO Start/Abort buttons (hidden until SPO mode is selected)
+        self.spo_start_button = QtWidgets.QPushButton("Start SPO")
+        self.spo_start_button.setObjectName("QueueButton")
+        self.spo_start_button.setEnabled(False)  # enabled once a Vmax is available
+        self.spo_abort_button = QtWidgets.QPushButton("Abort SPO")
+        self.spo_abort_button.setObjectName("AbortButton")
+        self.spo_abort_button.setEnabled(False)
+
+        spo_button_layout = QtWidgets.QHBoxLayout()
+        spo_button_layout.setSpacing(12)
+        spo_button_layout.addWidget(self.spo_start_button)
+        spo_button_layout.addWidget(self.spo_abort_button)
+
+        # Mode toggle: JV Sweep vs SPO (mutually exclusive)
+        self.jv_mode_button = QtWidgets.QPushButton("JV Sweep")
+        self.spo_mode_button = QtWidgets.QPushButton("SPO")
+        for btn in (self.jv_mode_button, self.spo_mode_button):
+            btn.setCheckable(True)
+            btn.setCursor(QtCore.Qt.PointingHandCursor)
+            btn.setObjectName("ModeButton")
+        self.jv_mode_button.setChecked(True)
+
+        self.mode_button_group = QtWidgets.QButtonGroup(self)
+        self.mode_button_group.setExclusive(True)
+        self.mode_button_group.addButton(self.jv_mode_button)
+        self.mode_button_group.addButton(self.spo_mode_button)
+
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.setSpacing(8)
+        mode_row.addWidget(self.jv_mode_button)
+        mode_row.addWidget(self.spo_mode_button)
+
         # Instrument status lights
         lights_row = self._create_status_lights()
 
@@ -298,11 +253,17 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         sidebar_layout.setContentsMargins(16, 16, 16, 16)
         sidebar_layout.setSpacing(20) 
         
+        sidebar_layout.addLayout(mode_row)
         sidebar_layout.addWidget(input_tabs)
         sidebar_layout.addWidget(self.file_panel)
         sidebar_layout.addLayout(lights_row)
         sidebar_layout.addLayout(button_layout)
+        sidebar_layout.addLayout(spo_button_layout)
         sidebar_layout.addStretch()
+
+        # SPO buttons stay hidden until SPO mode is selected
+        self.spo_start_button.hide()
+        self.spo_abort_button.hide()
 
         # Wrap in a scroll area for small screens
         scroll_area = QtWidgets.QScrollArea()
@@ -318,25 +279,52 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         # Main display area
         plot_container = self._create_plot_container()
         bottom_splitter = self._create_bottom_splitter()
-        vertical_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        vertical_splitter.addWidget(plot_container)
-        vertical_splitter.addWidget(bottom_splitter)
-        vertical_splitter.setStretchFactor(0, 2)
-        vertical_splitter.setStretchFactor(1, 1)
+        self.vertical_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.vertical_splitter.addWidget(plot_container)
+        self.vertical_splitter.addWidget(bottom_splitter)
+        self.vertical_splitter.setStretchFactor(0, 2)
+        self.vertical_splitter.setStretchFactor(1, 1)
+
+        # SPO view: replaces the JV display area entirely while active.
+        # SPO is optional/self-contained: if unavailable, fall back to a
+        # disabled placeholder so the rest of the JV app still runs.
+        if SPO_AVAILABLE:
+            self.spo_widget = SpoWidget(self, self.spo_param_tab)
+        else:
+            self.spo_widget = QtWidgets.QWidget()
+            self.spo_mode_button.setEnabled(False)
+            self.spo_mode_button.setToolTip("SPO module is not installed.")
+        self.spo_widget.hide()
 
         main_layout = QtWidgets.QVBoxLayout(self.main)
         main_layout.setContentsMargins(0, 0, 0, 0) # Removed hard main margins for edge-to-edge splitters
-        main_layout.addWidget(vertical_splitter)
+        main_layout.addWidget(self.vertical_splitter)
+        main_layout.addWidget(self.spo_widget)
 
-        # ----- Top‑right logout button (text) -----
+        # ----- Top‑right user info + logout button -----
         logout_toolbar = QtWidgets.QToolBar("Logout")
         logout_toolbar.setMovable(False)
         logout_toolbar.setContentsMargins(12, 12, 12, 0)   # left, top, right, bottom
 
-        # Spacer that pushes the button to the right edge
+        # Spacer that pushes the user info + button to the right edge
         spacer = QtWidgets.QWidget()
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
         logout_toolbar.addWidget(spacer)
+
+        # Logged-in username pill, shown to the left of the Logout button
+        self.user_label = QtWidgets.QLabel(f"👤 {self.username or 'Guest'}")
+        self.user_label.setStyleSheet("""
+            QLabel {
+                background-color: #f1f5f9;
+                color: #334155;
+                border-radius: 6px;
+                padding: 6px 14px;
+                font-size: 13px;
+                font-weight: 600;
+                margin-right: 8px;
+            }
+        """)
+        logout_toolbar.addWidget(self.user_label)
 
         self.logout_btn = QtWidgets.QPushButton("Logout")
         self.logout_btn.setToolTip("Logout and return to login screen")
@@ -469,6 +457,13 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
 
     def _confirm_logout(self):
         """Ask the user to confirm logout, then emit logged_out if accepted."""
+        if getattr(self.controller, 'spo_running', False):
+            if not self._confirm_abort_spo(
+                "An SPO measurement is currently running.\n\n"
+                "Logging out will abort it and save the partial data. Continue?"
+            ):
+                return
+
         reply = QtWidgets.QMessageBox.question(
             self,
             "Confirm Logout",
@@ -479,6 +474,104 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         )
         if reply == QtWidgets.QMessageBox.Yes:
             self.logged_out.emit()
+
+    # -------------------------------------------------------------------------
+    # Mode Switching (JV Sweep <-> SPO)
+    # -------------------------------------------------------------------------
+
+    def _confirm_abort_spo(self, message: str) -> bool:
+        """Ask for confirmation, then abort the running SPO test if accepted."""
+        reply = QtWidgets.QMessageBox.question(
+            self, "SPO Running", message,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return False
+        self.controller.abort_spo()
+        return True
+
+    def _jv_is_busy(self) -> bool:
+        """True if a JV experiment is currently queued or running."""
+        return bool(getattr(self.controller, 'is_busy', False)) and not getattr(
+            self.controller, 'spo_running', False
+        )
+
+    def _on_mode_button_clicked(self, button):
+        """Handle JV Sweep / SPO mode toggle button clicks.
+
+        Per design: mode switching is simply BLOCKED (with a warning) while
+        either an SPO measurement is running, or a JV measurement is
+        queued/running — the switch is cancelled and the previous mode
+        button state is restored.
+        """
+        switching_to_spo = button is self.spo_mode_button
+
+        if getattr(self.controller, 'spo_running', False):
+            QtWidgets.QMessageBox.warning(
+                self, "SPO Running",
+                "An SPO measurement is currently running.\n\n"
+                "Please abort it before switching modes."
+            )
+            self._revert_mode_button(switching_to_spo)
+            return
+
+        if self._jv_is_busy():
+            QtWidgets.QMessageBox.warning(
+                self, "JV Measurement Active",
+                "A JV measurement is currently queued or running.\n\n"
+                "Please wait for it to finish, or abort it, before switching modes."
+            )
+            self._revert_mode_button(switching_to_spo)
+            return
+
+        if switching_to_spo:
+            self._show_spo_mode()
+        else:
+            self._show_jv_mode()
+
+    def _revert_mode_button(self, was_switching_to_spo: bool):
+        """Restore the mode toggle to reflect the mode we're actually still in."""
+        if was_switching_to_spo:
+            self.jv_mode_button.setChecked(True)
+        else:
+            self.spo_mode_button.setChecked(True)
+
+    def _show_spo_mode(self):
+        """Show the SPO view and hide the JV plot/browser/analysis views."""
+        self.vertical_splitter.hide()
+        self.spo_widget.show()
+        self.params_stack.setCurrentWidget(self.spo_param_tab)
+        self.queue_button.hide()
+        self.abort_button.hide()
+        self.spo_start_button.show()
+        self.spo_abort_button.show()
+        self._update_spo_save_directory()
+        self._set_file_panel_spo_mode(True)
+        self.spo_widget.set_mode_spo()
+
+    def _show_jv_mode(self):
+        """Show the JV plot/browser/analysis views and hide the SPO view."""
+        self.spo_widget.hide()
+        self.vertical_splitter.show()
+        self.params_stack.setCurrentWidget(self.params_tab)
+        self.spo_start_button.hide()
+        self.spo_abort_button.hide()
+        self.queue_button.show()
+        self.abort_button.show()
+        self._set_file_panel_spo_mode(False)
+        self._update_save_directory()
+
+    def _set_file_panel_spo_mode(self, spo_mode: bool):
+        """Adapt the File Panel for SPO mode: SPO writes its own raw CSV /
+        report filenames via DirectoryManager, so the filename prefix and
+        single-file options (which only apply to JV sweeps) are locked."""
+        self.file_panel.filename_input.setEnabled(not spo_mode)
+        self.file_panel.single_file_checkbox.setEnabled(not spo_mode)
+
+    def _on_spo_vmax_ready(self, ready: bool):
+        """Enable Start SPO only once a Vmax is available and nothing is running."""
+        self.spo_start_button.setEnabled(ready and not getattr(self.controller, 'spo_running', False))
 
     # -------------------------------------------------------------------------
     # Signal Connections
@@ -498,6 +591,13 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.browser_widget.browser.itemSelectionChanged.connect(
             self.controller.on_browser_selection_changed
         )
+
+        # SPO mode toggle and Start/Abort buttons
+        self.mode_button_group.buttonClicked.connect(self._on_mode_button_clicked)
+        if SPO_AVAILABLE:
+            self.spo_start_button.clicked.connect(self.controller.start_spo)
+            self.spo_abort_button.clicked.connect(self.controller.abort_spo)
+            self.spo_widget.vmax_ready.connect(self._on_spo_vmax_ready)
 
     def _connect_nplc_preview_signals(self):
         """Connect parameter signals for NPLC preview calculation."""
@@ -608,6 +708,17 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         """Update save directory using directory manager."""
         main_dir = self.dir_manager.get_current_directory(create=True)
         self.file_panel.set_directory(main_dir)
+
+    def _update_spo_save_directory(self):
+        """Show the SPO output directory in the file panel while SPO mode
+        is active. The directory manager mode is restored to "Main"
+        immediately afterward by the shared singleton's own bookkeeping in
+        SpoProcedure, so we just need to reflect the right path here."""
+        previous_mode = self.dir_manager.mode
+        self.dir_manager.set_mode("SPO")
+        spo_dir = self.dir_manager.get_current_directory(create=False)
+        self.dir_manager.set_mode(previous_mode)
+        self.file_panel.set_directory(spo_dir)
 
     # -------------------------------------------------------------------------
     # Instrument Status

@@ -22,6 +22,7 @@ from solarjv_analyzer.auth import init_db, show_login_dialog
 from solarjv_analyzer.auth.session import SessionManager, logout as auth_logout
 from solarjv_analyzer.windows.calibration_window import CalibrationWindow
 from solarjv_analyzer.gui.jv_analyzer_window import JVAnalyzerWindow
+from solarjv_analyzer.gui.style import DIALOG_STYLESHEET
 
 
 def main():
@@ -30,6 +31,11 @@ def main():
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    # Apply a shared modern style to ALL popups/dialogs app-wide (QMessageBox,
+    # QInputDialog, QDialog, ...) so they match the main/calibration window
+    # look regardless of which window spawns them. Windows still set their
+    # own full stylesheet on top of this for their own widgets.
+    app.setStyleSheet(DIALOG_STYLESHEET)
 
     # Instrument manager may be reused across sessions
     instrument_manager = None

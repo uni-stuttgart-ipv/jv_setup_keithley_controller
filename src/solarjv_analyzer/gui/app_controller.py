@@ -22,6 +22,17 @@ from pymeasure.experiment import Results
 from solarjv_analyzer.procedures.jv_procedure import JVProcedure
 from solarjv_analyzer.config import TIMESTAMP_FORMAT
 
+# SPO is a self-contained, optional module: if the spo/ package is removed,
+# the JV application must still compile and run (SPO features simply no-op).
+try:
+    from solarjv_analyzer.spo.spo_procedure import SpoProcedure, SpoWorker
+    from solarjv_analyzer.spo.spo_analysis import compute_spo_metrics, SPO_METRICS_UNITS
+    SPO_AVAILABLE = True
+except ImportError:
+    SpoProcedure = SpoWorker = compute_spo_metrics = None
+    SPO_METRICS_UNITS = []
+    SPO_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,6 +83,17 @@ class AppController:
         }
 
         self.view.abort_button.setEnabled(False)
+
+        # ---------------------------------------------------------------
+        # SPO (Set-Point Operation) state
+        # ---------------------------------------------------------------
+        self.spo_widget = self.view.spo_widget
+        self.spo_running = False
+        self._spo_worker = None
+        self._spo_procedure = None
+        self._spo_times = []
+        self._spo_currents = []
+        self._spo_voltages = []
 
     # -------------------------------------------------------------------------
     # Signal Connections
@@ -809,6 +831,146 @@ class AppController:
             pass
         finally:
             self.view.update_instrument_lights()
+
+    # -------------------------------------------------------------------------
+    # SPO (Set-Point Operation) Lifecycle
+    # -------------------------------------------------------------------------
+
+    def start_spo(self):
+        """Collect parameters from spo_widget, create a SpoProcedure, and run it."""
+        if not SPO_AVAILABLE:
+            logger.warning("Cannot start SPO: SPO module is not available.")
+            return
+
+        if self.is_busy or self.spo_running:
+            logger.warning("Cannot start SPO: another operation is in progress.")
+            return
+
+        if not self.spo_widget.has_valid_hold_voltage():
+            logger.warning("Cannot start SPO: no valid Vmax has been set.")
+            return
+
+        spo_params = self.spo_widget.get_parameters()
+
+        # Reuse existing parameter tabs for shared measurement settings.
+        params_dict = self.view.params_tab.get_parameters()
+        analysis_dict = self.view.analysis_settings_tab.get_parameters()
+
+        device_area = params_dict.get('device_area', 0.089)
+        compliance_current = params_dict.get('compliance_current', 0.18)
+        incident_power = analysis_dict.get('incident_power', 100.0)
+
+        sim_mode = False
+        try:
+            self.view.instrument_manager.connect_keithley(simulation=sim_mode)
+            self.view.instrument_manager.connect_mux(simulation=sim_mode)
+        except Exception as e:
+            logger.error(f"SPO hardware connection failed: {e}")
+            self.view.update_instrument_lights()
+            return
+        self.view.update_instrument_lights()
+
+        self._spo_times = []
+        self._spo_currents = []
+        self._spo_voltages = []
+
+        self._spo_procedure = SpoProcedure(
+            instrument=self.view.instrument_manager.keithley,
+            mux=self.view.instrument_manager.mux,
+            manager=self.view.instrument_manager,
+            simulation=sim_mode,
+            active_channel=spo_params['active_channel'],
+            hold_voltage=spo_params['hold_voltage'],
+            hold_duration=spo_params['hold_duration'],
+            sampling_interval=spo_params['sampling_interval'],
+            preconditioning_time=spo_params['preconditioning_time'],
+            device_area=device_area,
+            incident_power=incident_power,
+            compliance_current=compliance_current,
+            nplc=1.0,  # stable DC reading; SPO does not use sweep-rate-derived NPLC
+            user_name=self.view.username,
+            username=self.view.username,
+            check_errors_between_points=False,
+        )
+
+        self._spo_worker = SpoWorker(self._spo_procedure)
+        self._spo_worker.results_ready.connect(self._on_spo_results)
+        self._spo_worker.status_changed.connect(self._on_spo_status)
+        self._spo_worker.run_finished.connect(self._on_spo_run_finished)
+        self._spo_worker.run_failed.connect(self._on_spo_run_failed)
+
+        self.spo_running = True
+        self.is_busy = True
+        self.spo_widget.start_spo()
+        self.view.spo_start_button.setEnabled(False)
+        self.view.spo_abort_button.setEnabled(True)
+
+        self._spo_worker.start()
+        logger.info(f"SPO started on Channel {spo_params['active_channel']}")
+
+    def abort_spo(self):
+        """Abort the currently running SPO test via the SpoWorker."""
+        if not SPO_AVAILABLE or not self.spo_running or self._spo_worker is None:
+            return
+        logger.info("SPO abort requested")
+        self.view.spo_abort_button.setEnabled(False)
+        self.spo_widget.abort_spo()
+        self._spo_worker.abort()
+
+    def _on_spo_results(self, record: dict):
+        """Handle each live SPO sample: accumulate for metrics and update the plot."""
+        self._spo_times.append(record["Time (s)"])
+        self._spo_currents.append(record["Current (A)"])
+        self._spo_voltages.append(record["Voltage (V)"])
+        self.spo_widget.update_plot(record["Time (s)"], record["Power (W)"])
+
+        # Throttle metric recomputation to avoid excessive numpy calls.
+        if len(self._spo_times) % 5 == 0:
+            metrics = compute_spo_metrics(
+                self._spo_times, self._spo_currents, self._spo_voltages
+            )
+            self.spo_widget.update_metrics(metrics)
+
+    def _on_spo_status(self, status: str):
+        logger.info(f"SPO status: {status}")
+
+    def _on_spo_run_finished(self, proc):
+        """Compute final metrics, finalize the report, and reset SPO UI state.
+
+        Args:
+            proc: The SpoProcedure instance that just finished, emitted by
+                SpoWorker.run_finished so we can read proc.csv_path / proc.report.
+        """
+        self.spo_running = False
+        self.is_busy = False
+        self.view.spo_abort_button.setEnabled(False)
+
+        report_path = None
+        metrics = {}
+        try:
+            if self._spo_times:
+                metrics = compute_spo_metrics(
+                    self._spo_times, self._spo_currents, self._spo_voltages
+                )
+                report = proc.report if proc is not None else None
+                if report is not None:
+                    metrics_units = dict(SPO_METRICS_UNITS)
+                    report_path = report.finalize(metrics, metrics_units)
+                    logger.info(f"SPO raw CSV: {proc.csv_path}")
+        except Exception as e:
+            logger.error(f"Failed to finalize SPO report: {e}")
+
+        self.spo_widget.on_spo_finished(metrics, report_path)
+        self._disconnect_instruments()
+        self.view.spo_start_button.setEnabled(self.spo_widget.has_valid_hold_voltage())
+
+        self._spo_worker = None
+        self._spo_procedure = None
+
+    def _on_spo_run_failed(self, message: str):
+        """Log the failure; cleanup and report finalization happen in
+        `_on_spo_run_finished`, which SpoWorker always emits afterward."""
+        logger.error(f"SPO run failed: {message}")
 
     def on_abort_returned(self):
         """Handle post-abort state - instruments remain connected."""

@@ -9,6 +9,9 @@ from typing import List
 
 from PyQt5 import QtWidgets, QtCore
 
+from .toggle_switch import ToggleSwitch
+from .channel_pinout import build_pinout_label
+
 
 class ParameterTab(QtWidgets.QWidget):
     """
@@ -32,11 +35,9 @@ class ParameterTab(QtWidgets.QWidget):
             channel.setChecked(True)
         self.select_all_channels.setChecked(True)
 
-        # Initialize traffic lights to green (all selected)
-        for light in self.channel_lights:
-            light.setStyleSheet(
-                "border-radius: 6px; background-color: #2ecc71; border: 1px solid #27ae60;"
-            )
+        # Initialize number chips to the "selected" style (all selected)
+        for i in range(len(self.channel_number_labels)):
+            self._update_channel_number_chip(i, True)
 
         # Update time estimate after UI is ready
         QtCore.QTimer.singleShot(100, self._update_time_estimate)
@@ -138,75 +139,96 @@ class ParameterTab(QtWidgets.QWidget):
 
     def _create_channel_selector(self, parent_layout):
         """
-        Create the channel selection checkboxes with traffic‑light indicators.
-
-        Layout (physical):
+        Create the "Channel Selection" card: a reference pinout image on
+        the left, and a grid of numbered toggle switches on the right,
+        plus a "Select All" toggle in the header. Row order follows the
+        physical pinout layout (channel_pinout.png):
             Ch3   Ch4
             Ch2   Ch5
             Ch1   Ch6
         """
-        self.channels: List[QtWidgets.QCheckBox] = []
-        self.channel_lights: List[QtWidgets.QLabel] = []
+        self.channels: List[ToggleSwitch] = []
+        self.channel_number_labels: List[QtWidgets.QLabel] = []
 
-        # Master widget to hold the grid + select all
-        channel_widget = QtWidgets.QWidget()
-        channel_layout = QtWidgets.QVBoxLayout(channel_widget)
-        channel_layout.setContentsMargins(0, 0, 0, 0)
-        channel_layout.setSpacing(4)
+        card = QtWidgets.QGroupBox("Channel Selection")
+        card_layout = QtWidgets.QVBoxLayout(card)
+        card_layout.setSpacing(10)
 
-        # Grid for lights + checkboxes
+        # ----- Header row: title (from QGroupBox) ... Select All toggle -----
+        header_layout = QtWidgets.QHBoxLayout()
+        header_layout.addStretch(1)
+        select_all_label = QtWidgets.QLabel("Select All")
+        select_all_label.setStyleSheet("font-weight: 600;")
+        self.select_all_channels = ToggleSwitch()
+        header_layout.addWidget(select_all_label)
+        header_layout.addWidget(self.select_all_channels)
+        card_layout.addLayout(header_layout)
+
+        # ----- Body: pinout image | vertical divider | toggle grid -----
+        body_layout = QtWidgets.QHBoxLayout()
+        body_layout.setSpacing(16)
+
+        pinout_column = QtWidgets.QVBoxLayout()
+        pinout_column.addWidget(build_pinout_label())
+        caption = QtWidgets.QLabel("Reference Pinout")
+        caption.setAlignment(QtCore.Qt.AlignCenter)
+        caption.setStyleSheet("color: #64748b; font-size: 8pt;")
+        pinout_column.addWidget(caption)
+        body_layout.addLayout(pinout_column)
+
+        divider = QtWidgets.QFrame()
+        divider.setFrameShape(QtWidgets.QFrame.VLine)
+        divider.setFrameShadow(QtWidgets.QFrame.Sunken)
+        body_layout.addWidget(divider)
+
         grid = QtWidgets.QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(4)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
 
-        # Mapping: channel number -> (row, col_of_checkbox, col_of_light)
-        # lights are to the left of each checkbox, so we place light at column (checkbox_col - 1)
+        # Mapping: channel number -> (row, col) matching the physical pinout.
         mapping = {
-            3: (0, 1),
-            4: (0, 3),
-            2: (1, 1),
-            5: (1, 3),
-            1: (2, 1),
-            6: (2, 3),
+            3: (0, 0), 4: (0, 1),
+            2: (1, 0), 5: (1, 1),
+            1: (2, 0), 6: (2, 1),
         }
 
-        # Create checkboxes and lights in order 1..6 for list indexing
         for i in range(1, 7):
-            cb = QtWidgets.QCheckBox(f"Channel {i}")
-            self.channels.append(cb)
+            number_label = QtWidgets.QLabel(str(i))
+            number_label.setFixedSize(28, 28)
+            number_label.setAlignment(QtCore.Qt.AlignCenter)
+            self.channel_number_labels.append(number_label)
 
-            # Traffic light (small circle)
-            light = QtWidgets.QLabel("")
-            light.setFixedSize(12, 12)
-            light.setStyleSheet("border-radius: 6px; background-color: #bdc3c7; border: 1px solid #95a5a6;")
-            self.channel_lights.append(light)
+            toggle = ToggleSwitch()
+            self.channels.append(toggle)
 
-        # Place them in the grid according to the physical layout
         for ch_num, (row, col) in mapping.items():
             idx = ch_num - 1
-            # Place light to the left (column -1)
-            grid.addWidget(self.channel_lights[idx], row, col - 1, QtCore.Qt.AlignCenter)
-            grid.addWidget(self.channels[idx], row, col)
+            pair_layout = QtWidgets.QHBoxLayout()
+            pair_layout.setSpacing(8)
+            pair_layout.addWidget(self.channel_number_labels[idx])
+            pair_layout.addWidget(self.channels[idx])
+            grid.addLayout(pair_layout, row, col)
 
-        # Center the grid horizontally by adding stretches on the sides
-        hbox = QtWidgets.QHBoxLayout()
-        hbox.addStretch(1)
-        hbox.addLayout(grid)
-        hbox.addStretch(1)
+        body_layout.addLayout(grid)
+        body_layout.addStretch(1)
 
-        channel_layout.addLayout(hbox)
+        card_layout.addLayout(body_layout)
 
-        # Select All checkbox (centered below the grid)
-        self.select_all_channels = QtWidgets.QCheckBox("Select All Channels")
-        select_all_layout = QtWidgets.QHBoxLayout()
-        select_all_layout.addStretch(1)
-        select_all_layout.addWidget(self.select_all_channels)
-        select_all_layout.addStretch(1)
-        channel_layout.addLayout(select_all_layout)
+        parent_layout.addRow(card)
 
-        parent_layout.addRow("Channels:", channel_widget)
-
-        
+    def _update_channel_number_chip(self, index: int, checked: bool):
+        """Style the channel number chip: soft green background when the
+        channel is selected, plain/muted when it isn't."""
+        label = self.channel_number_labels[index]
+        if checked:
+            label.setStyleSheet(
+                "background-color: #dcfce7; color: #16a34a; font-weight: 600;"
+                "border-radius: 14px;"
+            )
+        else:
+            label.setStyleSheet(
+                "background-color: transparent; color: #94a3b8; font-weight: 600;"
+            )
 
     @staticmethod
     def _row(input_field, combo_box) -> QtWidgets.QWidget:
@@ -348,36 +370,28 @@ class ParameterTab(QtWidgets.QWidget):
         """Connect UI signals to their handlers."""
         self.select_all_channels.toggled.connect(self.on_select_all_channels)
 
-        # Connect each individual channel to update Select All checkbox state and traffic light
+        # Connect each individual channel to update Select All state and its number chip
         for idx, channel in enumerate(self.channels):
             channel.toggled.connect(self._update_select_all_state)
             # Use a lambda with a default argument to capture the correct index
-            channel.toggled.connect(lambda checked, i=idx: self._update_channel_light(i, checked))
-
-    def _update_channel_light(self, index: int, checked: bool):
-        """Turn the traffic light green if checked, grey otherwise."""
-        if checked:
-            self.channel_lights[index].setStyleSheet(
-                "border-radius: 6px; background-color: #2ecc71; border: 1px solid #27ae60;"
-            )
-        else:
-            self.channel_lights[index].setStyleSheet(
-                "border-radius: 6px; background-color: #bdc3c7; border: 1px solid #95a5a6;"
-            )
+            channel.toggled.connect(lambda checked, i=idx: self._update_channel_number_chip(i, checked))
 
     def _update_select_all_state(self):
-        """Update Select All checkbox state based on individual channel selections."""
+        """Update Select All toggle state based on individual channel selections."""
         all_checked = all(channel.isChecked() for channel in self.channels)
         self.select_all_channels.blockSignals(True)
         self.select_all_channels.setChecked(all_checked)
         self.select_all_channels.blockSignals(False)
+        self.select_all_channels.sync_visual_state()
 
     def on_select_all_channels(self, checked: bool):
-        """Select or deselect all channel checkboxes."""
-        for channel in self.channels:
+        """Select or deselect all channel toggles."""
+        for idx, channel in enumerate(self.channels):
             channel.blockSignals(True)
             channel.setChecked(checked)
             channel.blockSignals(False)
+            channel.sync_visual_state()
+            self._update_channel_number_chip(idx, checked)
 
     # -------------------------------------------------------------------------
     # Channel Selection

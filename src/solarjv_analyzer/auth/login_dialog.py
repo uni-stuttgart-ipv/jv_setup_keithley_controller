@@ -4,7 +4,7 @@ Login and registration dialog for SolarJV Analyzer.
 Modern UI with clean, flat design.
 """
 
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets, QtCore, QtGui
 
 from .database import register_user, authenticate_user, reset_password
 from .session import SessionManager
@@ -45,7 +45,7 @@ QLineEdit {
 
 QLineEdit:focus {
     border: 2px solid #0984e3;
-    padding: 5px 9px;               /* compensate for thicker border */
+    padding: 5px 9px;                /* compensate for thicker border */
 }
 
 QLineEdit::placeholder {
@@ -291,16 +291,27 @@ class LoginDialog(QtWidgets.QDialog):
         btn_layout = QtWidgets.QHBoxLayout()
         self.login_btn = QtWidgets.QPushButton("Login")
         self.login_btn.clicked.connect(self._on_login)
+        
         self.register_nav_btn = QtWidgets.QPushButton("Register")
         self.register_nav_btn.setObjectName("SecondaryButton")
         self.register_nav_btn.clicked.connect(self._show_registration)
+        
         self.forgot_pw_btn = QtWidgets.QPushButton("Forgot Password?")
         self.forgot_pw_btn.setObjectName("SecondaryButton")
         self.forgot_pw_btn.clicked.connect(self._on_forgot_password)
+        
         btn_layout.addWidget(self.login_btn)
         btn_layout.addWidget(self.register_nav_btn)
         btn_layout.addWidget(self.forgot_pw_btn)
         login_layout.addRow(btn_layout)
+
+        # --- NEW: Hide admin buttons by default ---
+        self.register_nav_btn.hide()
+        self.forgot_pw_btn.hide()
+
+        # --- NEW: Setup Admin Shortcut (Ctrl+Shift+A) ---
+        self.admin_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Shift+A"), self)
+        self.admin_shortcut.activated.connect(self._toggle_admin_controls)
 
         self.stacked.addWidget(self.login_page)
 
@@ -310,6 +321,13 @@ class LoginDialog(QtWidgets.QDialog):
         self.stacked.addWidget(self.reg_form)
 
         self.stacked.setCurrentIndex(0)
+
+    # --- NEW: Method to toggle visibility ---
+    def _toggle_admin_controls(self):
+        """Toggle the visibility of the Register and Forgot Password buttons."""
+        is_hidden = self.register_nav_btn.isHidden()
+        self.register_nav_btn.setVisible(is_hidden)
+        self.forgot_pw_btn.setVisible(is_hidden)
 
     def _show_registration(self):
         """Switch to the registration form."""

@@ -1,75 +1,92 @@
+"""
+Instrument manager – live hardware only.
+
+The `simulation` parameter is kept for compatibility with existing calls
+but is ignored. All connections are to real instruments.
+"""
+
 import logging
-from typing import Union
+
 from .mux_controller import MuxController
 from solarjv_analyzer import config
 
 log = logging.getLogger(__name__)
 
+
 def get_keithley(address: str):
     """
-    Factory function to connect to a real Keithley 2400, falling back to
-    a simulated version on failure.
+    Connect to a real Keithley 2400.
+
+    Raises:
+        Exception: if the connection or initialisation fails.
     """
-    try:
-        from pymeasure.adapters import VISAAdapter
-        from pymeasure.instruments.keithley import Keithley2400
-        
-        adapter = VISAAdapter(address)
-        instrument = Keithley2400(adapter)
-        instrument.reset()
-        instrument.apply_voltage(compliance_current=0.1)
-        instrument.measure_current()
-        _ = instrument.id
-        log.info(f"Connected real Keithley2400 at {address}")
-        return instrument
-    except Exception as e:
-        # Import the simulated class from its new location
-        from .simulated.simulated_keithley import SimulatedKeithley2400
-        log.warning(f"Failed to connect to real Keithley2400: {e}. Using simulated version.")
-        return SimulatedKeithley2400()
+    from pymeasure.adapters import VISAAdapter
+    from pymeasure.instruments.keithley import Keithley2400
+
+    adapter = VISAAdapter(address)
+    instrument = Keithley2400(adapter)
+    instrument.reset()
+    instrument.apply_voltage(compliance_current=0.1)
+    instrument.measure_current()
+    _ = instrument.id
+    log.info(f"Connected real Keithley2400 at {address}")
+    return instrument
+
 
 class InstrumentManager:
     """
-    Manages the lifecycle (connection, disconnection) of all instruments
-    used in the application, handling both real and simulated hardware.
+    Manages the lifecycle (connection, disconnection) of real instruments only.
     """
+
     def __init__(self):
         self.mux = None
         self.keithley = None
 
     def connect_mux(self, simulation=False):
-        """Connects to the MUX, choosing between real or simulated."""
+        """
+        Connect to the real multiplexer.
+
+        Args:
+            simulation: Ignored (kept for compatibility). Always uses real hardware.
+        """
         if self.mux:
             return
-        if simulation:
-            # Import the simulated class from its new location
-            from .simulated.simulated_mux import SimulatedMux
-            self.mux = SimulatedMux()
-            self.mux.connect()
-        else:
-            self.mux = MuxController(port=config.MUX_PORT)
-            self.mux.connect()
+        # No fallback; always real.
+        self.mux = MuxController(port=config.MUX_PORT)
+        self.mux.connect()
 
     def connect_keithley(self, simulation=False):
-        """Connects to the Keithley SMU, choosing between real or simulated."""
+        """
+        Connect to the real Keithley 2400.
+
+        Args:
+            simulation: Ignored (kept for compatibility). Always uses real hardware.
+        """
         if self.keithley:
             return
-        if simulation:
-            # Import and instantiate the simulated class from its new location
-            from .simulated.simulated_keithley import SimulatedKeithley2400
-            self.keithley = SimulatedKeithley2400()
-            log.info("Connected SimulatedKeithley2400.")
-        else:
-            self.keithley = get_keithley(address=config.GPIB_ADDRESS)
+        # No fallback; always real.
+        self.keithley = get_keithley(address=config.GPIB_ADDRESS)
 
     def disconnect_mux(self):
-        """Disconnects the MUX if it is connected."""
+        """Disconnect the multiplexer and release the serial port."""
         if self.mux:
-            self.mux.close()
+            try:
+                self.mux.close()
+            except Exception as e:
+                log.error(f"Error disconnecting MUX: {e}")
             self.mux = None
 
     def disconnect_keithley(self):
-        """Disconnects the Keithley SMU if it is connected."""
-        if self.keithley and hasattr(self.keithley, "shutdown"):
-            self.keithley.shutdown()
-        self.keithley = None
+        """Disconnect the Keithley and release the VISA resource."""
+        if self.keithley:
+            try:
+                if hasattr(self.keithley, "shutdown"):
+                    self.keithley.shutdown()
+                # Close the VISA adapter to free the port
+                if hasattr(self.keithley, "close"):
+                    self.keithley.close()
+                elif hasattr(self.keithley, "adapter") and hasattr(self.keithley.adapter, "close"):
+                    self.keithley.adapter.close()
+            except Exception as e:
+                log.error(f"Error disconnecting Keithley: {e}")
+            self.keithley = None

@@ -23,6 +23,7 @@ from pymeasure.experiment import Results
 from solarjv_analyzer.instruments.instrument_manager import InstrumentManager
 from solarjv_analyzer.procedures.jv_procedure import JVProcedure
 from solarjv_analyzer.utils.directory_manager import DirectoryManager
+from solarjv_analyzer.gui.style import BASE_STYLESHEET, FONT_FAMILY
 
 logger = logging.getLogger(__name__)
 
@@ -61,52 +62,56 @@ class CalibrationChecklistDialog(QtWidgets.QDialog):
 
     def _setup_ui(self):
         """Build the checklist dialog UI."""
-        self.setStyleSheet("""
-            QDialog {
+        self.setStyleSheet(f"""
+            QDialog {{
                 background-color: #ffffff;
-            }
-            QLabel#Header {
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            }}
+            QLabel#Header {{
+                font-family: {FONT_FAMILY};
                 font-size: 18px;
                 font-weight: 600;
-                color: #2c3e50;
+                color: #0f172a;
                 margin-bottom: 10px;
-            }
-            QLabel#SubHeader {
+            }}
+            QLabel#SubHeader {{
                 font-size: 13px;
-                color: #7f8c8d;
+                color: #64748b;
                 margin-bottom: 15px;
-            }
-            QCheckBox {
+            }}
+            QCheckBox {{
+                font-family: {FONT_FAMILY};
                 font-size: 14px;
                 padding: 8px;
                 spacing: 10px;
-                color: #34495e;
-                border: 1px solid #ecf0f1;
-                border-radius: 5px;
-                background-color: #fcfcfc;
+                color: #334155;
+                border: 1px solid #e2e8f0;
+                border-radius: 6px;
+                background-color: #ffffff;
                 margin-bottom: 4px;
-            }
-            QCheckBox:hover {
-                background-color: #f7f9fa;
-                border-color: #bdc3c7;
-            }
-            QPushButton {
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            }}
+            QCheckBox:hover {{
+                background-color: #f8fafc;
+                border-color: #94a3b8;
+            }}
+            QPushButton {{
+                font-family: {FONT_FAMILY};
                 font-size: 13px;
                 font-weight: 600;
                 padding: 10px 20px;
-                border-radius: 5px;
-            }
-            QPushButton#ConfirmBtn {
-                background-color: #27ae60;
+                border-radius: 6px;
+            }}
+            QPushButton#ConfirmBtn {{
+                background-color: #10b981;
                 color: white;
                 border: none;
-            }
-            QPushButton#ConfirmBtn:disabled {
-                background-color: #bdc3c7;
-                color: #ecf0f1;
-            }
+            }}
+            QPushButton#ConfirmBtn:hover {{
+                background-color: #059669;
+            }}
+            QPushButton#ConfirmBtn:disabled {{
+                background-color: #e2e8f0;
+                color: #94a3b8;
+            }}
         """)
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -203,73 +208,42 @@ class CalibrationWindow(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
     @staticmethod
     def _app_stylesheet() -> str:
-        return """
-            QMainWindow { background-color: #ffffff; }
-            QScrollArea { background: transparent; border: none; }
-            QGroupBox {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-                font-size: 12px; font-weight: 600; color: #2c3e50;
-                border: 1px solid #e2e8f0; border-radius: 8px;
-                margin-top: 20px; padding: 16px; background-color: #ffffff;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #475569;
-            }
-            QLabel {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-                font-size: 13px; color: #1e293b;
-            }
-            QPushButton {
-                font-weight: 500; border-radius: 6px; padding: 8px 16px;
-                background-color: #ffffff; border: 1px solid #cbd5e1; color: #334155;
-            }
-            QPushButton:hover { background-color: #f8fafc; border-color: #94a3b8; }
-            QPushButton:pressed { background-color: #f1f5f9; }
-
-            QPushButton#RunButton {
+        return BASE_STYLESHEET + f"""
+            QPushButton#RunButton {{
                 background-color: #2563eb; color: white; border: none; font-weight: 600;
-            }
-            QPushButton#RunButton:hover { background-color: #1d4ed8; }
-            QPushButton#RunButton:pressed { background-color: #1e40af; }
+            }}
+            QPushButton#RunButton:hover {{ background-color: #1d4ed8; }}
+            QPushButton#RunButton:pressed {{ background-color: #1e40af; }}
 
-            QPushButton#ProceedButton {
+            QPushButton#ProceedButton {{
                 background-color: #10b981; color: white; border: none; font-weight: 600;
-            }
-            QPushButton#ProceedButton:disabled {
+            }}
+            QPushButton#ProceedButton:disabled {{
                 background-color: #e2e8f0; color: #94a3b8; border: none;
-            }
-            QPushButton#ProceedButton:hover:enabled { background-color: #059669; }
+            }}
+            QPushButton#ProceedButton:hover:enabled {{ background-color: #059669; }}
 
-            QPushButton#SkipButton {
+            QPushButton#SkipButton {{
                 background-color: #fef3c7; color: #92400e; border: none; font-weight: 600;
-            }
-            QPushButton#SkipButton:hover { background-color: #fde68a; }
+            }}
+            QPushButton#SkipButton:hover {{ background-color: #fde68a; }}
 
-            QPushButton#LogoutButton {
+            QPushButton#LogoutButton {{
                 background-color: #fee2e2; color: #ef4444; border: none; font-weight: 600;
-            }
-            QPushButton#LogoutButton:hover { background-color: #fca5a5; }
+            }}
+            QPushButton#LogoutButton:hover {{ background-color: #fca5a5; }}
 
-            QPushButton#UnlockButton {
+            QPushButton#UnlockButton {{
                 color: #2563eb; border: 1px solid #cce5ff; background: #eff6ff; padding: 4px; font-size: 11px;
-            }
-            QPushButton#UnlockButton:checked {
+            }}
+            QPushButton#UnlockButton:checked {{
                 background: #dbeafe; border: 1px solid #3b82f6;
-            }
+            }}
 
-            QComboBox, QDoubleSpinBox {
-                padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px;
-                background: #ffffff; font-size: 13px; color: #0f172a;
-            }
-            QComboBox:focus, QDoubleSpinBox:focus {
-                border: 1px solid #3b82f6; outline: none;
-            }
-            QComboBox::drop-down { border: none; width: 24px; }
-
-            QProgressBar {
+            QProgressBar {{
                 border: none; background: #f1f5f9; border-radius: 2px; height: 4px;
-            }
-            QProgressBar::chunk { background-color: #2563eb; border-radius: 2px; }
+            }}
+            QProgressBar::chunk {{ background-color: #2563eb; border-radius: 2px; }}
         """
 
     # -------------------------------------------------------------------------
@@ -484,38 +458,42 @@ class CalibrationWindow(QtWidgets.QMainWindow):
         return widget
 
     def _create_proceed_buttons(self):
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(widget)
+        group = QtWidgets.QGroupBox("Next Steps")
+        layout = QtWidgets.QVBoxLayout(group)
         layout.setSpacing(8)
 
-        self.proceed_button = QtWidgets.QPushButton("PROCEED TO MAIN ➡")
+        self.proceed_button = QtWidgets.QPushButton("Proceed to Main ➡")
         self.proceed_button.setObjectName("ProceedButton")
-        self.proceed_button.setMinimumHeight(48)
+        self.proceed_button.setMinimumHeight(40)
         self.proceed_button.setCursor(QtCore.Qt.PointingHandCursor)
         self.proceed_button.setEnabled(False)
         self.proceed_button.clicked.connect(self._on_proceed)
+        layout.addWidget(self.proceed_button)
 
-        self.skip_button = QtWidgets.QPushButton("SKIP TO MAIN (NOT RECOMMENDED)")
+        secondary_row = QtWidgets.QHBoxLayout()
+        secondary_row.setSpacing(8)
+
+        self.skip_button = QtWidgets.QPushButton("Skip (Not Recommended)")
         self.skip_button.setObjectName("SkipButton")
-        self.skip_button.setMinimumHeight(48)
+        self.skip_button.setMinimumHeight(34)
         self.skip_button.setCursor(QtCore.Qt.PointingHandCursor)
         self.skip_button.clicked.connect(self._on_skip)
+        secondary_row.addWidget(self.skip_button)
 
         self.logout_button = QtWidgets.QPushButton("Logout")
         self.logout_button.setObjectName("LogoutButton")
-        self.logout_button.setMinimumHeight(36)
+        self.logout_button.setMinimumHeight(34)
         self.logout_button.setCursor(QtCore.Qt.PointingHandCursor)
         self.logout_button.clicked.connect(self._on_logout)
+        secondary_row.addWidget(self.logout_button)
 
-        layout.addWidget(self.proceed_button)
-        layout.addWidget(self.skip_button)
-        layout.addWidget(self.logout_button)
+        layout.addLayout(secondary_row)
 
         warning_label = QtWidgets.QLabel("⚠️ Skipping calibration may affect measurement accuracy")
         warning_label.setStyleSheet("color: #92400e; font-size: 10px; font-style: italic;")
         warning_label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(warning_label)
-        return widget
+        return group
 
     def _create_plot_panel(self):
         container = QtWidgets.QWidget()
