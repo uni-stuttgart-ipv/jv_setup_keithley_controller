@@ -80,6 +80,16 @@ def init_db() -> None:
             )
             conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (1)")
 
+        # Version 1 → 2: add email_verified column (existing users grandfathered)
+        if current_version < 2:
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT 1"
+                )
+            except Exception:
+                pass  # column already exists
+            conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (2)")
+
         conn.commit()
     finally:
         conn.close()
@@ -222,5 +232,34 @@ def reset_password(username: str, email: str, new_password: str) -> None:
             (password_hash, row[0])
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Lookup helpers (used by registration validation)
+# ---------------------------------------------------------------------------
+
+
+def username_exists(username: str) -> bool:
+    """Return True if the username is already registered."""
+    if not username.strip():
+        return False
+    conn = _connect()
+    try:
+        cur = conn.execute("SELECT COUNT(*) FROM users WHERE username = ?", (username.strip(),))
+        return cur.fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
+def email_exists(email: str) -> bool:
+    """Return True if the email is already registered."""
+    if not email.strip():
+        return False
+    conn = _connect()
+    try:
+        cur = conn.execute("SELECT COUNT(*) FROM users WHERE email = ?", (email.strip().lower(),))
+        return cur.fetchone()[0] > 0
     finally:
         conn.close()

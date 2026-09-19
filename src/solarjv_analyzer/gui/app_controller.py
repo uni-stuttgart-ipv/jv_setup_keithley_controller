@@ -10,7 +10,7 @@ import os
 import io
 import tempfile
 from datetime import datetime
-from PyQt5 import QtCore
+from PyQt5 import QtCore, QtWidgets
 
 import numpy as np
 import pandas as pd
@@ -65,7 +65,7 @@ class AppController:
 
         # Initialize PyMeasure Manager with display widgets
         self.manager = Manager(
-            [self.view.plot_widget, self.view.log_widget, self.view.analysis_panel],
+            [self.view.plot_widget, self.view.analysis_panel],
             self.view.browser_widget.browser,
             log_level=logging.INFO,
             parent=self.view
@@ -94,6 +94,16 @@ class AppController:
         self._spo_times = []
         self._spo_currents = []
         self._spo_voltages = []
+
+        # ---------------------------------------------------------------
+        # Combined JV + SPO state
+        # ---------------------------------------------------------------
+        self._combined_mode = False
+        self._combined_jv_finished = False
+        self._combined_best_channel = None
+        self._combined_best_vmpp = 0.0
+        self._combined_spo_params = {}
+        self._combined_spo_powers = []
 
     # -------------------------------------------------------------------------
     # Signal Connections
@@ -125,8 +135,8 @@ class AppController:
 
         # Collect parameters from UI tabs
         params_dict = self.view.params_tab.get_parameters()
-        analysis_dict = self.view.analysis_settings_tab.get_parameters()
-        instr_dict = self.view.instr_tab.get_parameters()
+        analysis_dict = self.view.active_analysis_tab.get_parameters()
+        instr_dict = self.view.active_instr_tab.get_parameters()
 
         procedure_params = {
             'user_name': self.view.username,
@@ -168,6 +178,10 @@ class AppController:
 
         self.view.update_instrument_lights()
 
+        if not self._keithley_usable("JV queue"):
+            self.is_busy = False
+            return
+
         # Generate file paths with timestamp
         timestamp_str = datetime.now().strftime(TIMESTAMP_FORMAT)
         filename_timestamp = timestamp_str.replace(":", "-").replace(" ", "_")
@@ -208,6 +222,7 @@ class AppController:
         # Combine old and new channels
         all_channels = sorted(existing_channels.union(set(new_channels)))
         self.view.analysis_panel.reset_channels(all_channels, JVProcedure.ANALYSIS_LABELS_UNITS)
+        self._sync_channel_indicators(all_channels)
 
         # Restore data for channels not being measured
         for exp in existing_experiments:
@@ -444,6 +459,11 @@ class AppController:
         """
         logger.info(f"Loading {len(filenames)} file(s)")
 
+        # ---- purge all stale data before loading new files ----
+        self.clear_experiments()
+        self.view.analysis_panel.clear_all()
+        self.view.browser_widget.browser.clear()
+
         all_channels = []
         newly_loaded_items = []
 
@@ -489,6 +509,7 @@ class AppController:
             self.view.analysis_panel.reset_channels(
                 sorted(active_channels), JVProcedure.ANALYSIS_LABELS_UNITS
             )
+            self._sync_channel_indicators(sorted(active_channels))
 
         # ===== 2. Restore analysis data (now handles nested direction dicts) =====
         for i in range(root.childCount()):
@@ -519,6 +540,11 @@ class AppController:
         self.view.browser_widget.show_button.setEnabled(True)
         self.view.browser_widget.hide_button.setEnabled(True)
         self.view.browser_widget.clear_button.setEnabled(True)
+
+        # Re-strip BrowserWidget internal margins (layout may have been
+        # re-created during load, undoing the zero-margin fix from init).
+        if self.view.browser_widget.layout():
+            self.view.browser_widget.layout().setContentsMargins(0, 0, 0, 0)
 
         # Select the first loaded experiment
         if newly_loaded_items:
@@ -565,10 +591,13 @@ class AppController:
                     # Strip units from column headers
                     metric_units_map = {
                         "EFF (%)": "EFF", "FF (%)": "FF", "Voc (mV)": "Voc",
-                        "Jsc (mA/cm2)": "Jsc", "Vmax (mV)": "Vmax",
-                        "Jmax (mA/cm2)": "Jmax", "Isc (A)": "Isc",
+                        "Jsc (mA/cm2)": "Jsc",
+                        "Vmax (mV)": "Vmpp", "Vmpp (mV)": "Vmpp",
+                        "Jmax (mA/cm2)": "Jmpp", "Jmpp (mA/cm2)": "Jmpp",
+                        "Isc (A)": "Isc",
                         "Rsh (Ohm)": "Rsh", "Rs (Ohm)": "Rs",
                         "Area (cm2)": "A", "Incd. Pwr (mW/cm2)": "Incd. Pwr",
+                        "Pmpp (mW)": "Pmpp",
                     }
                     analysis_df.rename(columns=metric_units_map, inplace=True)
                     analysis_data = analysis_df.to_dict(orient='records')
@@ -665,6 +694,9 @@ class AppController:
                 procedure = JVProcedure()
                 procedure.active_channel = channel_num
                 procedure.sweep_direction = direction
+                procedure.architecture = params_dict.get(
+                    "Device Architecture", "n-i-p"
+                )
 
                 results = Results(procedure, temp_file.name)
 
@@ -761,41 +793,131 @@ class AppController:
         logger.info("Experiment finished")
 
         if not self.manager.experiments.has_next():
-            self.view.abort_button.setEnabled(False)
-            self.view.abort_button.setText("Abort")
-            self.view.browser_widget.clear_button.setEnabled(True)
-            self.view.browser_widget.show_button.setEnabled(True)
-            self.view.browser_widget.hide_button.setEnabled(True)
-
-            # Merge / process files when all sweeps are done
-            try:
-                if self.is_single_file_mode:
-                    self._merge_channel_files()
-                else:
-                    self._process_multi_files()
-            except Exception as e:
-                logger.error(f"File post-processing error: {e}")
-
-            self._disconnect_instruments()
-            self.view.queue_button.setEnabled(True)
-            self.is_busy = False
+            # All sweeps are done
+            if self._combined_mode and not self._combined_jv_finished:
+                # Combined mode: transition from JV phase to SPO phase.
+                # Skip file merge and disconnect — SPO needs instruments.
+                # _start_spo_phase() handles channel selection + SPO start.
+                self.view.combined_abort_button.setEnabled(True)
+                self._start_spo_phase()
+            else:
+                self._finalize_run()
+                self._return_to_idle()
         else:
             # More experiments in queue – keep instruments connected
             self.view.queue_button.setEnabled(False)
             self.is_busy = True
 
+    # -- run-control button -------------------------------------------------
+    # The one button is Abort while a sweep runs and Resume while the queue is
+    # paused, so its label and its `clicked` connection have to move together.
+    # They used to be set in five different places and drifted apart: after an
+    # abort that emptied the queue the label said "Abort" while the click still
+    # ran resume_experiment().
+    def _set_run_control(self, mode: str):
+        """`mode` is "abort", "resume", "aborting" or "idle"."""
+        button = self.view.abort_button
+        handler = self.resume_experiment if mode == "resume" else self.abort_experiment
+        text = {"abort": "Abort", "resume": "Resume",
+                "aborting": "Aborting...", "idle": "Abort"}[mode]
+        button.setText(text)
+        button.setEnabled(mode in ("abort", "resume"))
+        try:
+            button.clicked.disconnect()
+        except TypeError:
+            pass                                  # nothing connected yet
+        button.clicked.connect(handler)
+
+    def _rearm_manager(self):
+        """Let the manager start queued experiments again.
+
+        `Manager.abort()` clears `_start_on_add` and `_is_continuous`, and the
+        only thing in pymeasure that restores them is `Manager.resume()`. Any
+        abort the operator did not follow with a Resume therefore left the
+        manager unable to start anything for the rest of the session:
+        `Manager.queue()` appended the row and returned without calling
+        `next()`, so the browser filled with QUEUED sweeps and nothing ran.
+        Every path back to idle goes through here.
+        """
+        self.manager._start_on_add = True
+        self.manager._is_continuous = True
+
+    def _discard_aborted_sweep(self, experiment):
+        """Drop the partial file an aborted sweep left behind.
+
+        An aborted sweep is discarded, never re-run — the same thing that
+        happens to it when there are more sweeps behind it in the queue. Its
+        temp file holds a truncated J-V curve and no `[[ANALYSIS]]` block
+        (that is written only on completion), so leaving it in
+        `experiment_files` merged a half-measured curve into the report as if
+        it were a real measurement, silently and without metrics.
+        """
+        data_file = None
+        for attr in ("data_filename", "data_path", "filename"):
+            value = getattr(getattr(experiment, "results", None), attr, None)
+            if isinstance(value, str) and value:
+                data_file = os.path.normcase(os.path.abspath(value))
+                break
+        if data_file is None:
+            return
+        for key, path in list(self.experiment_files.items()):
+            if os.path.normcase(os.path.abspath(path)) != data_file:
+                continue
+            self.experiment_files.pop(key, None)
+            try:
+                os.remove(path)
+            except OSError as exc:
+                logger.warning(f"Could not remove the aborted sweep's "
+                               f"partial file {os.path.basename(path)}: {exc}")
+            logger.info(f"Discarded the aborted sweep's partial data ({key})")
+            return
+
+    def _finalize_run(self):
+        """Merge, publish and release the hardware at the end of a run.
+
+        Reachable from `on_finished()` AND from `on_abort_returned()`: aborting
+        the last sweep of a queue used to skip this entirely, so the sweeps
+        that had already completed were left on disk as `_temp` files that
+        nothing merged, nothing published, and the next run's
+        `queue_experiment()` forgot about.
+        """
+        try:
+            if self.is_single_file_mode:
+                self._merge_channel_files()
+            else:
+                self._process_multi_files()
+        except Exception as e:
+            logger.error(f"File post-processing error: {e}")
+
+        self._disconnect_instruments()
+
     def abort_experiment(self):
         """Abort the currently running experiment."""
+        if not self.manager.is_running():
+            # `Manager.abort()` raises when nothing is running, and an
+            # unhandled exception in a Qt slot is not survivable in general.
+            # Reaching here means the UI thought a sweep was running and none
+            # was, so put the window back into a state the operator can use.
+            logger.warning("Abort ignored: no experiment is running")
+            self._return_to_idle()
+            return
+
         logger.info("Abort requested")
         self.view.queue_button.setEnabled(False)
-        self.view.abort_button.setEnabled(False)
-        self.view.abort_button.setText("Aborting...")
-        self.view.abort_button.clicked.disconnect()
-        self.view.abort_button.clicked.connect(self.resume_experiment)
-        self.manager.abort()
+        self._set_run_control("aborting")
+        try:
+            self.manager.abort()
+        except Exception as exc:
+            logger.error(f"Abort failed: {exc}")
+            self._return_to_idle()
 
     def resume_experiment(self):
-        """Resume the experiment queue after an abort."""
+        """Continue the queue after an abort, with the NEXT sweep.
+
+        The aborted sweep is not re-run: `ExperimentQueue.next()` only returns
+        experiments still marked QUEUED, and this button means "carry on with
+        what is left".
+        """
         logger.info("Resuming experiment queue")
 
         # Ensure output is off before resuming
@@ -806,21 +928,74 @@ class AppController:
             pass
 
         self.view.queue_button.setEnabled(False)
-        self.view.abort_button.setText("Abort")
-        self.view.abort_button.clicked.disconnect()
-        self.view.abort_button.clicked.connect(self.abort_experiment)
+        self._set_run_control("abort")
 
         if self.manager.experiments.has_next():
             self.manager.resume()
         else:
-            self.view.abort_button.setEnabled(False)
-            self.view.queue_button.setEnabled(True)
-            self.is_busy = False
+            self._finalize_run()
+            self._return_to_idle()
+
+    def _return_to_idle(self):
+        """Nothing is running and nothing is queued: accept a new run."""
+        self._rearm_manager()
+        self._set_run_control("idle")
+        self.view.queue_button.setEnabled(True)
+        self.view.browser_widget.clear_button.setEnabled(True)
+        self.view.browser_widget.show_button.setEnabled(True)
+        self.view.browser_widget.hide_button.setEnabled(True)
+        self.is_busy = False
 
     def clear_experiments(self):
         """Clear all experiments from the manager."""
         self.manager.clear()
+        self._rearm_manager()      # clearing after an abort must not stay dead
         self.finished_experiment_count = 0
+        self._sync_channel_indicators([])
+
+    def _sync_channel_indicators(self, channels):
+        """Push the active channel list and architecture to the window badges."""
+        if hasattr(self.view, 'update_channel_indicators'):
+            self.view.update_channel_indicators(channels)
+        # Also push the architecture from the first browser experiment
+        arch = self._find_first_architecture()
+        if hasattr(self.view, 'update_architecture_badge'):
+            self.view.update_architecture_badge(arch)
+
+    def _find_first_architecture(self) -> str:
+        """Return the architecture string from the first browser experiment,
+        or empty string if none found."""
+        root = self.view.browser_widget.browser.invisibleRootItem()
+        for i in range(root.childCount()):
+            item = root.child(i)
+            exp = self.manager.experiments.with_browser_item(item)
+            if exp and hasattr(exp.procedure, 'architecture'):
+                return exp.procedure.architecture or ""
+        return ""
+
+    def _keithley_usable(self, context: str) -> bool:
+        """True when the Keithley's VISA session can actually be written to.
+
+        `connect_keithley()` returning without raising is not proof of a
+        usable instrument: a handle whose session was closed elsewhere used to
+        short-circuit the connect and then fail on the procedure's very first
+        :OUTP OFF, deep inside the worker thread, as a raw pyvisa traceback.
+        Checking here fails fast, with a message the operator can act on, and
+        before the MUX is told to select a channel for a run that cannot start.
+        """
+        if self.view.instrument_manager.is_keithley_alive():
+            return True
+        logger.error(
+            f"{context}: Keithley VISA session is closed — cannot start."
+        )
+        self.view.update_instrument_lights()
+        QtWidgets.QMessageBox.critical(
+            self.view, "Keithley Not Available",
+            "The Keithley 2400 connection is no longer usable (its VISA "
+            "session has been closed).\n\n"
+            "Reconnect the instrument, then try again."
+        )
+        return False
 
     def _disconnect_instruments(self):
         """Disconnect from hardware instruments."""
@@ -831,6 +1006,499 @@ class AppController:
             pass
         finally:
             self.view.update_instrument_lights()
+
+    # -------------------------------------------------------------------------
+    # Combined JV + SPO Workflow
+    # -------------------------------------------------------------------------
+
+    def start_combined_run(self):
+        """Run JV sweeps on selected channels, then auto-transition to SPO.
+
+        1. Collects JV + SPO params from the CombinedTab.
+        2. Queues JV sweeps normally (reusing existing queue_experiment logic).
+        3. When JV finishes (on_finished), _start_spo_phase() runs SPO on the
+           best channel using its Vmpp as the hold voltage.
+        """
+        if self.is_busy or self.spo_running:
+            logger.warning("Cannot start combined run: already busy.")
+            return
+
+        combined_tab = self.view.combined_tab
+
+        # ---- Collect parameters ------------------------------------------
+        params_dict = combined_tab.get_jv_parameters()
+        analysis_dict = self.view.active_analysis_tab.get_parameters()
+        instr_dict = self.view.active_instr_tab.get_parameters()
+        spo_params = combined_tab.get_spo_parameters()
+
+        selected_channels = combined_tab.get_selected_channels()
+        if not selected_channels:
+            logger.warning("No channels selected.")
+            return
+
+        self._combined_mode = True
+        self._combined_jv_finished = False
+        self._combined_best_channel = None
+        self._combined_best_vmpp = 0.0
+        self._show_combined_spo_setpoint()      # blank until the JV phase picks
+        self._combined_spo_params = spo_params
+        # Snapshot shared measurement settings NOW: the SPO phase must run
+        # with the parameters that were active when the user started the run,
+        # not whatever the (still editable) widgets contain later.
+        self._combined_spo_params['device_area'] = params_dict.get('device_area', 0.089)
+        self._combined_spo_params['compliance_current'] = params_dict.get('compliance_current', 0.18)
+        self._combined_spo_params['incident_power'] = analysis_dict.get('incident_power', 100.0)
+
+        # Build procedure params (same as queue_experiment)
+        procedure_params = {
+            'user_name': self.view.username,
+            **params_dict,
+            **instr_dict,
+            **analysis_dict,
+        }
+        self.current_notes_text = procedure_params.pop('notes_text', '')
+        self.current_save_notes = procedure_params.pop('save_notes', False)
+        file_params = self.view.file_panel.get_parameters()
+
+        # ---- Reset state for this run ------------------------------------
+        self.experiment_files = {}
+        self.processed_files = set()
+        self.is_single_file_mode = file_params['single_file']
+
+        # Preserve existing channel data
+        self._preserve_existing_channel_data(selected_channels)
+
+        # ---- Connect hardware --------------------------------------------
+        try:
+            self.view.instrument_manager.connect_keithley(simulation=False)
+            self.view.instrument_manager.connect_mux(simulation=False)
+        except Exception as e:
+            logger.error(f"Hardware connection failed: {e}")
+            self.view.update_instrument_lights()
+            self._combined_mode = False
+            return
+        self.view.update_instrument_lights()
+
+        if not self._keithley_usable("Combined JV+SPO run"):
+            self._combined_mode = False
+            return
+
+        # ---- Generate file paths -----------------------------------------
+        timestamp_str = datetime.now().strftime(TIMESTAMP_FORMAT)
+        filename_timestamp = timestamp_str.replace(":", "-").replace(" ", "_")
+        base, ext = os.path.splitext(file_params['filename'])
+        directory = file_params['directory']
+
+        # JV file path (same as single-file mode)
+        channel_list_str = "_".join(map(str, selected_channels))
+        self.merged_file_path = os.path.join(
+            directory, f"{base}_{filename_timestamp}_ch{channel_list_str}{ext}"
+        )
+        self.merged_data_written = False
+
+        # SPO file paths (SPO_ prefix, shared timestamp).
+        # Raw CSV and formatted report MUST use different filenames —
+        # SpoReport.finalize() opens with "w" and would overwrite the raw data.
+        #
+        # They go in the SPO folder, NOT alongside the JV report: `directory`
+        # is the file panel's path, which is always the "Main" mode folder, so
+        # a combined run used to file its SPO data under Main. A standalone SPO
+        # run resolves the SPO folder itself (see SpoProcedure), but in
+        # combined mode the controller passes an explicit csv_path, which
+        # bypasses that — hence resolving it here.
+        #
+        # DirectoryManager is a process-wide singleton: switch its mode, read
+        # the path, and ALWAYS restore it. An exception here (permissions, a
+        # missing network drive) must not strand the singleton in "SPO" mode
+        # for every subsequent JV run.
+        spo_directory = directory
+        dir_manager = getattr(self.view, 'dir_manager', None)
+        if dir_manager is not None:
+            previous_mode = dir_manager.mode
+            try:
+                dir_manager.set_mode("SPO")
+                spo_directory = dir_manager.get_current_directory(create=True)
+            except Exception as e:
+                logger.error(
+                    f"[Combined] Could not resolve the SPO output folder "
+                    f"({e}); falling back to {directory}"
+                )
+                spo_directory = directory
+            finally:
+                dir_manager.set_mode(previous_mode)
+
+        spo_filename = f"SPO_{base}_{filename_timestamp}.csv"
+        self._combined_spo_csv_path = os.path.join(spo_directory, spo_filename)
+        self._combined_spo_report_path = os.path.join(
+            spo_directory, f"SPO_report_{base}_{filename_timestamp}.csv"
+        )
+
+        # ---- Queue JV sweeps (reuse existing per-channel logic) ----------
+        for channel_num in selected_channels:
+            base_params = procedure_params.copy()
+            for i in range(1, 7):
+                base_params[f'channel{i}'] = (i == channel_num)
+
+            # Forward Sweep
+            fwd_params = base_params.copy()
+            fwd_params['single_sweep_mode'] = True
+            fwd_params['sweep_direction'] = 'Forward'
+
+            fwd_temp_path = os.path.join(
+                directory,
+                f"{base}_{filename_timestamp}_ch{channel_num}_forward_temp{ext}"
+            )
+            self.experiment_files[f"{channel_num}_forward"] = fwd_temp_path
+
+            proc_fwd = JVProcedure(
+                instrument=self.view.instrument_manager.keithley,
+                mux=self.view.instrument_manager.mux,
+                manager=self.view.instrument_manager,
+                simulation=False,
+                active_channel=channel_num,
+                check_errors_between_points=False,
+                **fwd_params
+            )
+            results_fwd = Results(proc_fwd, fwd_temp_path)
+            proc_fwd.results = results_fwd
+
+            display_name_fwd = (
+                f"Ch {channel_num} (Fwd) - {os.path.basename(self.merged_file_path)}"
+            )
+            exp_fwd = self._create_experiment(
+                results_fwd, display_name_fwd, channel=channel_num, is_reverse=False
+            )
+            self.manager.queue(exp_fwd)
+            logger.info(f"[Combined] Queued Ch {channel_num} (Forward)")
+
+            # Reverse Sweep (only in dual-sweep mode). The Single Sweep Mode
+            # checkbox lives in the ANALYSIS settings tab, not the parameter
+            # tab — reading it from params_dict silently always queued
+            # reverse sweeps.
+            if not analysis_dict.get('single_sweep_mode', False):
+                rev_params = base_params.copy()
+                rev_params['single_sweep_mode'] = True
+                rev_params['sweep_direction'] = 'Reverse'
+                rev_params['start_voltage'] = params_dict.get('stop_voltage', -0.2)
+                rev_params['stop_voltage'] = params_dict.get('start_voltage', 1.2)
+
+                rev_temp_path = os.path.join(
+                    directory,
+                    f"{base}_{filename_timestamp}_ch{channel_num}_reverse_temp{ext}"
+                )
+                self.experiment_files[f"{channel_num}_reverse"] = rev_temp_path
+
+                proc_rev = JVProcedure(
+                    instrument=self.view.instrument_manager.keithley,
+                    mux=self.view.instrument_manager.mux,
+                    manager=self.view.instrument_manager,
+                    simulation=False,
+                    active_channel=channel_num,
+                    check_errors_between_points=False,
+                    **rev_params
+                )
+                results_rev = Results(proc_rev, rev_temp_path)
+                proc_rev.results = results_rev
+
+                display_name_rev = (
+                    f"Ch {channel_num} (Rev) - {os.path.basename(self.merged_file_path)}"
+                )
+                exp_rev = self._create_experiment(
+                    results_rev, display_name_rev,
+                    channel=channel_num, is_reverse=True
+                )
+                self.manager.queue(exp_rev)
+                logger.info(f"[Combined] Queued Ch {channel_num} (Reverse)")
+
+        # Disable the combined run button, enable abort; lock the config
+        # inputs so mid-run edits cannot leak into the SPO phase.
+        self.view.combined_run_button.setEnabled(False)
+        self.view.combined_abort_button.setEnabled(True)
+        self._set_combined_config_enabled(False)
+        self.is_busy = True
+        logger.info("[Combined] JV sweeps queued; waiting for completion...")
+
+    def _set_combined_config_enabled(self, enabled: bool):
+        """Lock/unlock the combined tab's configuration inputs during a run."""
+        try:
+            self.view.combined_tab.set_config_enabled(enabled)
+        except Exception as e:
+            logger.debug(f"set_config_enabled({enabled}) unavailable: {e}")
+
+    def _start_spo_phase(self):
+        """Transition from JV phase to SPO phase within a combined run.
+
+        Selects the best channel from JV results, then starts SPO on that
+        channel using the auto-determined Vmpp as the hold voltage.
+        """
+        if not self._combined_mode:
+            return
+
+        # ---- Find the best channel from all finished experiments ----------
+        root = self.view.browser_widget.browser.invisibleRootItem()
+        experiments = []
+        for i in range(root.childCount()):
+            item = root.child(i)
+            exp = self.manager.experiments.with_browser_item(item)
+            if exp is not None:
+                experiments.append(exp)
+
+        try:
+            best_ch, best_vmpp = self._select_best_channel(experiments)
+        except ValueError:
+            logger.error("[Combined] No valid JV data — SPO aborted.")
+            QtWidgets.QMessageBox.warning(
+                self.view, "JV + SPO",
+                "No valid J‑V data — SPO aborted.\n\n"
+                "All channels failed to produce analysable results."
+            )
+            self._reset_combined_state()
+            self._disconnect_instruments()
+            self.view.combined_run_button.setEnabled(True)
+            self.view.combined_abort_button.setEnabled(False)
+            self._set_combined_config_enabled(True)
+            self.is_busy = False
+            return
+
+        self._combined_best_channel = best_ch
+        self._combined_best_vmpp = best_vmpp
+        self._combined_jv_finished = True
+
+        # Tell the operator what the SPO phase decided. Vmpp is SIGNED and is
+        # used directly as the hold voltage, so show the signed value — a
+        # p-i-n cell legitimately holds at a negative voltage and an
+        # unsigned display here would look like a bug.
+        self._show_combined_spo_setpoint(best_ch, best_vmpp)
+
+        logger.info(
+            f"[Combined] JV sweeps complete. Best channel: Ch {best_ch} "
+            f"(Vmpp = {best_vmpp * 1000:.1f} mV)"
+        )
+
+        # ---- Configure SPO parameters -------------------------------------
+        # Use the snapshot taken at run start — never re-read live widgets
+        # mid-run (the user could have edited them during the JV phase).
+        spo_params = self._combined_spo_params
+        device_area = spo_params.get('device_area', 0.089)
+        compliance_current = spo_params.get('compliance_current', 0.18)
+        incident_power = spo_params.get('incident_power', 100.0)
+
+        # ---- Build SpoProcedure with custom output paths ------------------
+        self._spo_times = []
+        self._spo_currents = []
+        self._spo_voltages = []
+        self._combined_spo_powers = []
+
+        # Clear the combined SPO plot for the new run
+        self.view.combined_spo_curve.setData([], [])
+        self.view.combined_spo_mean.setText("— mW")
+        self.view.combined_spo_drift.setText("— %")
+        self.view.combined_spo_elapsed.setText("— s")
+
+        self._spo_procedure = SpoProcedure(
+            instrument=self.view.instrument_manager.keithley,
+            mux=self.view.instrument_manager.mux,
+            manager=self.view.instrument_manager,
+            simulation=False,
+            active_channel=best_ch,
+            hold_voltage=best_vmpp,
+            hold_duration=spo_params['hold_duration'],
+            sampling_interval=spo_params['sampling_interval'],
+            preconditioning_time=spo_params['preconditioning_time'],
+            device_area=device_area,
+            incident_power=incident_power,
+            compliance_current=compliance_current,
+            nplc=1.0,
+            user_name=self.view.username,
+            username=self.view.username,
+            check_errors_between_points=False,
+            csv_path=self._combined_spo_csv_path,
+            report_path=self._combined_spo_report_path,
+        )
+
+        self._spo_worker = SpoWorker(self._spo_procedure)
+        self._spo_worker.results_ready.connect(self._on_spo_results)
+        self._spo_worker.status_changed.connect(self._on_combined_spo_status)
+        self._spo_worker.run_finished.connect(self._on_combined_spo_finished)
+        self._spo_worker.run_failed.connect(self._on_combined_spo_failed)
+
+        self.spo_running = True
+        self._spo_worker.start()
+        logger.info(
+            f"[Combined] SPO started on Ch {best_ch} "
+            f"(hold = {best_vmpp:.4f} V, duration = {spo_params['hold_duration']} s)"
+        )
+
+    def abort_combined(self):
+        """Abort the combined run — kills JV queue or SPO worker, whichever
+        is active, and returns the system to idle."""
+        logger.info("[Combined] Abort requested by user.")
+
+        if self.spo_running and self._spo_worker is not None:
+            # Abort the SPO phase. Do NOT reset combined state here — the
+            # worker's run_finished signal drives _on_combined_spo_finished,
+            # which saves the collected data and performs the cleanup. The
+            # bounded wait is safe: the hold loop checks the stop flag every
+            # 0.1 s (abort-aware sleep).
+            self._spo_worker.abort()
+            self._spo_worker.wait(15000)
+        elif self.is_busy:
+            # Abort the JV phase. Cleanup happens in on_abort_returned's
+            # combined branch, which needs _combined_mode still True —
+            # resetting state synchronously here made that branch
+            # unreachable and wedged the combined view.
+            try:
+                self.manager.abort()
+            except Exception as e:
+                logger.error(f"[Combined] JV abort failed: {e}")
+
+    def _select_best_channel(self, experiments: list) -> tuple:
+        """Select the best channel by Efficiency (primary), then Vmpp, then Jsc.
+
+        Args:
+            experiments: List of PyMeasure Experiment objects with completed JV sweeps.
+
+        Returns:
+            (channel_number, vmpp_volts) of the best cell.
+
+        Raises:
+            ValueError: If no valid analysis results are found.
+        """
+        candidates = []
+        for exp in experiments:
+            if not hasattr(exp.procedure, 'analysis_results'):
+                continue
+            results = exp.procedure.analysis_results
+            if not results:
+                continue
+
+            for ch, metrics in results.items():
+                try:
+                    ch = int(ch)
+                except (ValueError, TypeError):
+                    continue
+
+                if isinstance(metrics, dict):
+                    # Check if nested (has direction keys) or flat
+                    first_val = next(iter(metrics.values()), None)
+                    if isinstance(first_val, dict):
+                        # Nested: {"Forward": {...}, "Reverse": {...}}
+                        fwd = metrics.get("Forward", {})
+                    else:
+                        fwd = metrics
+
+                    eff = fwd.get("EFF", 0) or 0
+                    vmpp_mv = fwd.get("Vmpp", 0) or 0  # SIGNED: negative for p-i-n (Q2)
+                    jsc = fwd.get("Jsc", 0) or 0
+
+                    if eff <= 0 and abs(vmpp_mv) <= 0:
+                        continue  # skip dark/failed sweeps
+
+                    # Rank by |Vmpp| (magnitude) but keep the SIGNED value —
+                    # the SPO hold voltage must have the correct polarity.
+                    candidates.append((eff, abs(vmpp_mv), jsc, ch, vmpp_mv))
+
+        if not candidates:
+            raise ValueError("No valid JV analysis results found")
+
+        # Sort: Efficiency (desc), |Vmpp| (desc), Jsc (desc)
+        candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        best = candidates[0]
+        best_ch = best[3]
+        best_vmpp_v = best[4] / 1000.0  # signed mV → signed V
+        return best_ch, best_vmpp_v
+
+    def _on_combined_spo_status(self, status: str):
+        logger.info(f"[Combined] SPO status: {status}")
+
+    def _on_combined_spo_finished(self, proc):
+        """Handle SPO completion within a combined run."""
+        self.spo_running = False
+        self.is_busy = False
+
+        # Merge JV files (normal path)
+        try:
+            if self.is_single_file_mode:
+                self._merge_channel_files()
+            else:
+                self._process_multi_files()
+        except Exception as e:
+            logger.error(f"[Combined] JV file merge failed: {e}")
+
+        # Finalise SPO report with custom path
+        report_path = None
+        metrics = {}
+        try:
+            if self._spo_times:
+                metrics = compute_spo_metrics(
+                    self._spo_times, self._spo_currents, self._spo_voltages
+                )
+                report = proc.report if proc is not None else None
+                if report is not None:
+                    metrics_units = dict(SPO_METRICS_UNITS)
+                    report_path = report.finalize(
+                        metrics, metrics_units,
+                        output_path=self._combined_spo_report_path
+                    )
+                    # The raw journal is discarded by finalize() once the
+                    # report is verified, so it is not listed here — logging a
+                    # path that no longer exists sends people looking for it.
+                    logger.info(f"[Combined] SPO report saved: {report_path}")
+        except Exception as e:
+            logger.error(f"[Combined] SPO report finalization failed: {e}")
+
+        # Capture BEFORE resetting state — _reset_combined_state() nulls it.
+        best_channel = self._combined_best_channel
+
+        self._disconnect_instruments()
+        self._reset_combined_state()
+        self.view.combined_run_button.setEnabled(True)
+        self.view.combined_abort_button.setEnabled(False)
+        self._set_combined_config_enabled(True)
+        self._spo_worker = None
+        self._spo_procedure = None
+
+        QtWidgets.QMessageBox.information(
+            self.view, "JV + SPO Complete",
+            f"Combined run finished.\n\n"
+            f"Best channel: Ch {best_channel}\n"
+            f"JV file: {os.path.basename(getattr(self, 'merged_file_path', ''))}\n"
+            f"SPO file: {os.path.basename(report_path) if report_path else 'N/A'}"
+        )
+
+    def _on_combined_spo_failed(self, message: str):
+        logger.error(f"[Combined] SPO run failed: {message}")
+        # SPO failure still saves JV data — fall through to finished handler
+        # which is always emitted after failed.
+
+    def _show_combined_spo_setpoint(self, channel=None, hold_voltage=None):
+        """Display the SPO channel and hold voltage on the combined SPO panel.
+
+        Called with no arguments to blank the chips at the start of a run and
+        when combined state is reset.
+        """
+        channel_label = getattr(self.view, 'combined_spo_channel', None)
+        hold_label = getattr(self.view, 'combined_spo_hold', None)
+        if channel_label is None or hold_label is None:
+            return          # older layout without the chips — nothing to do
+        if channel is None:
+            channel_label.setText("—")
+            hold_label.setText("— mV")
+            return
+        channel_label.setText(f"Ch {int(channel)}")
+        hold_label.setText(f"{float(hold_voltage) * 1000.0:+.1f} mV")
+
+    def _reset_combined_state(self):
+        """Clear all combined-mode state flags."""
+        self._show_combined_spo_setpoint()
+        self._combined_mode = False
+        self._combined_jv_finished = False
+        self._combined_best_channel = None
+        self._combined_best_vmpp = 0.0
+        self._combined_spo_params = {}
+        self._combined_spo_csv_path = None
+        self._combined_spo_report_path = None
+        self._combined_spo_powers = []
 
     # -------------------------------------------------------------------------
     # SPO (Set-Point Operation) Lifecycle
@@ -847,7 +1515,7 @@ class AppController:
             return
 
         if not self.spo_widget.has_valid_hold_voltage():
-            logger.warning("Cannot start SPO: no valid Vmax has been set.")
+            logger.warning("Cannot start SPO: no valid Vmpp has been set.")
             return
 
         spo_params = self.spo_widget.get_parameters()
@@ -869,6 +1537,9 @@ class AppController:
             self.view.update_instrument_lights()
             return
         self.view.update_instrument_lights()
+
+        if not self._keithley_usable("SPO run"):
+            return
 
         self._spo_times = []
         self._spo_currents = []
@@ -922,14 +1593,37 @@ class AppController:
         self._spo_times.append(record["Time (s)"])
         self._spo_currents.append(record["Current (A)"])
         self._spo_voltages.append(record["Voltage (V)"])
-        self.spo_widget.update_plot(record["Time (s)"], record["Power (W)"])
 
-        # Throttle metric recomputation to avoid excessive numpy calls.
-        if len(self._spo_times) % 5 == 0:
-            metrics = compute_spo_metrics(
-                self._spo_times, self._spo_currents, self._spo_voltages
+        if self._combined_mode:
+            # Combined mode: feed data to the side-by-side SPO plot.
+            # Display GENERATED power (-V*I, positive while generating) to
+            # match the sign convention of the report metrics.
+            power_mw = -record["Power (W)"] * 1000.0
+            self._combined_spo_powers.append(power_mw)
+            self.view.combined_spo_curve.setData(
+                self._spo_times, self._combined_spo_powers
             )
-            self.spo_widget.update_metrics(metrics)
+            self.view.combined_spo_elapsed.setText(
+                f"{record['Time (s)']:.1f} s"
+            )
+            if len(self._spo_times) % 5 == 0:
+                metrics = compute_spo_metrics(
+                    self._spo_times, self._spo_currents, self._spo_voltages
+                )
+                self.view.combined_spo_mean.setText(
+                    f"{metrics.get('mean_power_mw', 0):.2f} mW"
+                )
+                self.view.combined_spo_drift.setText(
+                    f"{metrics.get('drift_percent', 0):.2f} %"
+                )
+        else:
+            # Plot generated power (-V*I): positive while the cell delivers.
+            self.spo_widget.update_plot(record["Time (s)"], -record["Power (W)"])
+            if len(self._spo_times) % 5 == 0:
+                metrics = compute_spo_metrics(
+                    self._spo_times, self._spo_currents, self._spo_voltages
+                )
+                self.spo_widget.update_metrics(metrics)
 
     def _on_spo_status(self, status: str):
         logger.info(f"SPO status: {status}")
@@ -956,13 +1650,16 @@ class AppController:
                 if report is not None:
                     metrics_units = dict(SPO_METRICS_UNITS)
                     report_path = report.finalize(metrics, metrics_units)
-                    logger.info(f"SPO raw CSV: {proc.csv_path}")
+                    logger.info(f"SPO report saved: {report_path}")
         except Exception as e:
             logger.error(f"Failed to finalize SPO report: {e}")
 
         self.spo_widget.on_spo_finished(metrics, report_path)
         self._disconnect_instruments()
-        self.view.spo_start_button.setEnabled(self.spo_widget.has_valid_hold_voltage())
+        # Route through the window's gating logic so the start button honours
+        # BOTH conditions (valid hold voltage AND valid filename) — setting
+        # enabled directly bypassed the filename gate.
+        self.view._on_spo_vmpp_ready(self.spo_widget.has_valid_hold_voltage())
 
         self._spo_worker = None
         self._spo_procedure = None
@@ -972,31 +1669,47 @@ class AppController:
         `_on_spo_run_finished`, which SpoWorker always emits afterward."""
         logger.error(f"SPO run failed: {message}")
 
-    def on_abort_returned(self):
-        """Handle post-abort state - instruments remain connected."""
-        # Note: Instruments remain connected to allow resume functionality
+    def on_abort_returned(self, experiment=None):
+        """Handle post-abort state.
+
+        `experiment` is what pymeasure's `abort_returned` signal carries — the
+        sweep that was cut short. Its partial file is discarded here so it can
+        never reach a report; the browser row stays, marked Aborted, so the
+        operator can still see what they stopped.
+        """
+        if experiment is not None:
+            self._discard_aborted_sweep(experiment)
+
+        # The manager disarms itself on abort. Re-arm on every path out of
+        # here, or the next run queues sweeps that never start.
+        self._rearm_manager()
+
+        if self._combined_mode:
+            # Combined mode: abort means stop everything, no resume. Whatever
+            # JV sweeps completed before the abort still get written out.
+            self._finalize_run()
+            self._reset_combined_state()
+            self.view.combined_run_button.setEnabled(True)
+            self.view.combined_abort_button.setEnabled(False)
+            self._set_combined_config_enabled(True)
+            self.is_busy = False
+            logger.info("[Combined] Aborted by user.")
+            return
+
         if self.manager.experiments.has_next():
-            self.view.abort_button.setText("Resume")
-            self.view.abort_button.setEnabled(True)
+            # Instruments stay connected: the operator can carry on with the
+            # rest of the queue.
+            self._set_run_control("resume")
             self.view.queue_button.setEnabled(False)
             self.is_busy = True
         else:
-            self.view.abort_button.setText("Abort")
-            self.view.abort_button.setEnabled(False)
-            self.view.queue_button.setEnabled(True)
-            self.view.browser_widget.clear_button.setEnabled(True)
-            self.is_busy = False
+            self._finalize_run()
+            self._return_to_idle()
 
     def on_queued(self):
         """Handle experiment queued state."""
         self.view.queue_button.setEnabled(False)
-        self.view.abort_button.setEnabled(True)
-        self.view.abort_button.setText("Abort")
-        try:
-            self.view.abort_button.clicked.disconnect()
-        except TypeError:
-            pass
-        self.view.abort_button.clicked.connect(self.abort_experiment)
+        self._set_run_control("abort")
         self.view.browser_widget.show_button.setEnabled(True)
         self.view.browser_widget.hide_button.setEnabled(True)
         self.view.browser_widget.clear_button.setEnabled(True)
@@ -1043,6 +1756,7 @@ class AppController:
                 self.view.analysis_panel.reset_channels(
                     sorted(all_channels), JVProcedure.ANALYSIS_LABELS_UNITS
                 )
+                self._sync_channel_indicators(sorted(all_channels))
 
             # Clear the 'analysis_shown' flag on all items so they will be re-populated
             # after the panel has been rebuilt. This handles transitions from single
@@ -1082,6 +1796,11 @@ class AppController:
                     item.analysis_shown = True
 
             self.finished_experiment_count = root.childCount()
+
+            # Auto-switch to the Channel Analysis view so the user sees results
+            if hasattr(self.view, 'bottom_stack'):
+                self.view.bottom_stack.setCurrentIndex(1)
+                self.view.bottom_tab_bar.setCurrentIndex(1)
 
         except Exception as e:
             logger.error(f"Analysis update error: {e}")
@@ -1238,31 +1957,34 @@ class AppController:
                     self.processed_files.add(forward_key)
                     self.processed_files.add(reverse_key)
                 
-                elif 'forward' in files:
-                    # Single sweep forward mode
-                    forward_path, forward_key = files['forward']
-                    
-                    forward_data, forward_analysis, forward_params = self._parse_temp_file(forward_path)
-                    if forward_analysis:
-                        forward_analysis['Channel'] = f"{channel}"
-                        analysis_summary.append(forward_analysis)
-                    if not experiment_params and forward_params:
-                        experiment_params = forward_params
-                    
-                    # Format with multi-index including Forward direction
-                    combined_df = self._format_channel_dataframe(channel, forward_data, forward_analysis)
-                    
-                    # Create a clean output file name (remove "_forward")
-                    base_dir = os.path.dirname(forward_path)
+                elif 'forward' in files or 'reverse' in files:
+                    # One direction only. Forward-only is Single-Sweep-Mode;
+                    # reverse-only is what aborting the forward sweep and
+                    # resuming leaves behind, and it used to match no branch
+                    # at all — the completed reverse sweep was dropped with a
+                    # "No data to write" warning.
+                    direction = 'forward' if 'forward' in files else 'reverse'
+                    single_path, single_key = files[direction]
+
+                    single_data, single_analysis, single_params = self._parse_temp_file(single_path)
+                    if single_analysis:
+                        single_analysis['Channel'] = f"{channel}"
+                        analysis_summary.append(single_analysis)
+                    if not experiment_params and single_params:
+                        experiment_params = single_params
+
+                    combined_df = self._format_channel_dataframe(channel, single_data, single_analysis)
+
+                    # Create a clean output file name (remove the direction)
+                    base_dir = os.path.dirname(single_path)
                     final_path = os.path.join(base_dir, f"Output_{timestamp}_ch{channel}.csv")
-                    
-                    # Delete the temp forward file
+
                     try:
-                        os.remove(forward_path)
+                        os.remove(single_path)
                     except OSError:
                         pass
-                    
-                    self.processed_files.add(forward_key)
+
+                    self.processed_files.add(single_key)
                 
                 # Write the formatted report
                 if final_path and combined_df is not None and not combined_df.empty:
@@ -1389,8 +2111,9 @@ class AppController:
                         "FF": "FF (%)",
                         "Voc": "Voc (mV)",
                         "Jsc": "Jsc (mA/cm2)",
-                        "Vmax": "Vmax (mV)",
-                        "Jmax": "Jmax (mA/cm2)",
+                        "Vmpp": "Vmpp (mV)",
+                        "Jmpp": "Jmpp (mA/cm2)",
+                        "Pmpp": "Pmpp (mW)",
                         "Isc": "Isc (A)",
                         "Rsh": "Rsh (Ohm)",
                         "Rs": "Rs (Ohm)",

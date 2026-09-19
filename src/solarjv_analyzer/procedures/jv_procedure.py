@@ -21,6 +21,7 @@ from pymeasure.experiment.parameters import (
 )
 
 from solarjv_analyzer.analysis.analysis import compute_jv_metrics, ANALYSIS_LABELS_UNITS
+from solarjv_analyzer.instruments.instrument_manager import visa_session_open
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -80,9 +81,20 @@ class JVProcedure(Procedure):
     device_area = FloatParameter("Device Area", units="cm2", default=0.089)
     incident_power = FloatParameter("Incident Power", units="mW/cm2", default=100)
     user_name = Parameter("User Name", default="")
+    architecture = Parameter("Device Architecture", default="n-i-p")
 
     # Advanced Timing
     auto_zero = BooleanParameter("Auto Zero", default=False)
+    # 50 Hz — European mains, which is where this rig runs. This is the SINGLE
+    # source of truth for the NPLC timing model on every path. A `:SYST:LFR?`
+    # query used to sit in startup()'s fallback-connect branch, which only runs
+    # when no instrument was handed in; in normal operation it never fired, so
+    # the value was 50 anyway — but on the rare fallback path the sweep silently
+    # used different timing. Deterministic beats occasionally-cleverer.
+    #
+    # On 60 Hz mains this must be changed: NPLC is computed as
+    # `time_per_point * line_frequency`, so a wrong value makes the sweep run
+    # at a different rate than the one recorded in the report.
     line_frequency = FloatParameter("Line Frequency", units="Hz", default=50.0)
 
     # Analysis (4-Probe)
@@ -191,6 +203,15 @@ class JVProcedure(Procedure):
         """Emergency abort: turn off output and return instrument to idle."""
         if self._sim or not self.instrument:
             return
+        if not visa_session_open(self.instrument):
+            # Nothing can be sent down a closed session. Say so once instead
+            # of raising "Invalid session handle" three more times, which
+            # buried the real first error in the log.
+            logger.warning(
+                "Safety abort skipped: the VISA session is closed "
+                "(the output could not be commanded off from here)."
+            )
+            return
         try:
             logger.warning("Safety abort initiated")
             self.instrument.write(":OUTP OFF")
@@ -223,7 +244,12 @@ class JVProcedure(Procedure):
         start = float(self.start_voltage)
         stop = float(self.stop_voltage)
         step = abs(float(self.step_size))
-        
+
+        if step <= 0:
+            raise ValueError(
+                f"Step size must be greater than zero (received {step})."
+            )
+
         # Generate sequence
         voltages = []
         current = start
@@ -253,7 +279,15 @@ class JVProcedure(Procedure):
         # Ensure stop voltage is included
         if voltages and abs(voltages[-1] - stop) > step * 0.1:
             voltages.append(stop)
-        
+
+        if len(voltages) < 2:
+            raise ValueError(
+                f"Sweep range produces only {len(voltages)} point(s). "
+                f"Check start voltage ({start}), stop voltage ({stop}), "
+                f"and step size ({step}). At least 2 points are required "
+                f"for a valid sweep."
+            )
+
         return voltages
 
     def _calculate_nplc(self) -> tuple:
@@ -315,6 +349,17 @@ class JVProcedure(Procedure):
         """
         if self._configured:
             return self._total_points
+
+        if not self._sim and self.instrument is not None \
+                and not visa_session_open(self.instrument):
+            # Fail with something the operator can act on. Previously the
+            # first :OUTP OFF raised a raw pyvisa InvalidSession from four
+            # frames down, with no hint that the instrument simply needed
+            # reconnecting.
+            raise RuntimeError(
+                "The Keithley's VISA session is closed — the instrument must "
+                "be reconnected before a sweep can run."
+            )
 
         self._ensure_idle()
 
@@ -457,6 +502,8 @@ class JVProcedure(Procedure):
         logger.debug(f"Received {len(values)} values")
 
         points_parsed = 0
+        compliance_a = abs(float(self.compliance_current))
+        n_clipped = 0
         for i in range(0, len(values) - 1, 2):
             try:
                 voltage = float(values[i])
@@ -466,16 +513,38 @@ class JVProcedure(Procedure):
                 measured_currents.append(current)
                 points_parsed += 1
 
-                self.emit('results', {
-                    "Channel": channel,
-                    "Voltage (V)": voltage,
-                    "Current (A)": current,
-                    "Time (s)": duration,
-                    "Status": "OK",
-                })
+                # A reading at (>=99% of) the compliance limit is the
+                # instrument's clamp, not the device's J-V curve. Such
+                # points are NOT emitted at all — they never appear on the
+                # plot or in the data file; only real measurements do. They
+                # are still appended to the internal arrays above so the
+                # sweep-completeness validation and the forward/reverse
+                # index split operate on the raw point count.
+                at_compliance = abs(current) >= 0.99 * compliance_a
+                if at_compliance:
+                    n_clipped += 1
+                else:
+                    self.emit('results', {
+                        "Channel": channel,
+                        "Voltage (V)": voltage,
+                        "Current (A)": current,
+                        "Time (s)": duration,
+                        "Status": "OK",
+                    })
 
             except (ValueError, IndexError) as e:
                 logger.warning(f"Failed to parse point {i//2}: {e}")
+
+        if n_clipped:
+            # Record immediately so the count is available even if the
+            # analysis stage never runs (e.g. an all-clamped sweep).
+            self.compliance_clipped_points = n_clipped
+            logger.warning(
+                f"{n_clipped} point(s) at the compliance limit "
+                f"({compliance_a} A) suppressed — clamped by the instrument, "
+                "not measurements of the cell. Reduce the start voltage or "
+                "raise compliance."
+            )
 
         self.emit("progress", 100)
         logger.info(f"Parsed {points_parsed}/{total_points} points")
@@ -575,16 +644,6 @@ class JVProcedure(Procedure):
                 self.instrument = get_keithley(address=self.gpib_address)
                 logger.info(f"Connected to Keithley at {self.gpib_address}")
 
-                # Query line frequency
-                try:
-                    resp = self.instrument.ask(":SYST:LFR?")
-                    resp = resp.strip().upper()
-                    if resp in ("50", "60"):
-                        self._line_freq = float(resp)
-                        logger.info(f"Line frequency: {self._line_freq} Hz")
-                except Exception as e:
-                    logger.warning(f"Could not query line frequency: {e}")
-
             self._configured = False
             self._last_metrics = None
             logger.info("Startup complete")
@@ -642,6 +701,34 @@ class JVProcedure(Procedure):
             logger.info("Sweep execution finished")
             logger.info("=" * 50)
 
+    @staticmethod
+    def filter_compliance_points(voltages, currents, compliance_a, threshold=0.99):
+        """Split off points clamped at the compliance limit.
+
+        A reading with |I| >= threshold x |compliance| is the SourceMeter's
+        programmed ceiling, not the device's J-V characteristic (verified:
+        a real clamped sweep read 0.09999789 A at a 0.1 A limit). Returns
+        (clean_v, clean_i, n_flagged).
+        """
+        v = np.asarray(voltages, dtype=float)
+        i = np.asarray(currents, dtype=float)
+        keep = np.abs(i) < threshold * abs(float(compliance_a))
+        return v[keep], i[keep], int(i.size - np.count_nonzero(keep))
+
+    def _analysis_kwargs(self) -> dict:
+        """Extra analysis parameters forwarded to compute_jv_metrics.
+
+        Wires the Analysis-Settings fields (architecture, contact threshold,
+        4-probe geometry) into the metric computation so they have a real
+        effect rather than remaining front-end decoration.
+        """
+        return {
+            "architecture": self.architecture,
+            "contact_threshold_a": float(self.contact_threshold),
+            "sample_thickness_um": float(self.sample_thickness),
+            "lateral_factor": float(self.lateral_factor),
+        }
+
     def _finalize_analysis(self, channel: int):
         """
         Compute J-V metrics, store results, and write to file.
@@ -657,6 +744,16 @@ class JVProcedure(Procedure):
             voltages = self._voltages[:min_len]
             currents = self._currents[:min_len]
 
+            # Compliance-clamped points are the instrument's current ceiling,
+            # not measurements of the device (a 0.7 V start at 0.1 A
+            # compliance produces a flat J = 0.0999... plateau). They are
+            # excluded from METRIC computation per branch below — AFTER the
+            # forward/reverse index split, which must operate on the raw
+            # point count. The raw data file keeps every point, tagged in
+            # its Status column.
+            compliance_a = float(self.compliance_current)
+            self.compliance_clipped_points = 0
+
             total_points = len(voltages)
 
             # Calculate points per direction
@@ -668,12 +765,25 @@ class JVProcedure(Procedure):
             if self.single_sweep_mode or total_points == points_per_direction:
                 # Single sweep mode — use the actual sweep direction
                 direction = self.sweep_direction  # "Forward" or "Reverse"
-                
+
+                v_clean, i_clean, n_clip = self.filter_compliance_points(
+                    voltages, currents, compliance_a
+                )
+                self.compliance_clipped_points = n_clip
+                if n_clip:
+                    logger.warning(
+                        f"Excluding {n_clip} compliance-clamped point(s) from analysis."
+                    )
+                if v_clean.size == 0:
+                    logger.error("All points at compliance — no valid data to analyse.")
+                    return
+
                 metrics = compute_jv_metrics(
-                    v_raw=voltages,
-                    i_raw=currents,
+                    v_raw=v_clean,
+                    i_raw=i_clean,
                     area_cm2=float(self.device_area),
                     incident_power_mw_per_cm2=float(self.incident_power),
+                    **self._analysis_kwargs(),
                 )
 
                 self.analysis_results[channel] = {direction: metrics}
@@ -689,25 +799,45 @@ class JVProcedure(Procedure):
                         f"Jsc={metrics.get('Jsc', 0):.3f}mA/cm²")
 
             else:
-                # Dual sweep mode — split into Forward and Reverse
+                # Dual sweep mode — split into Forward and Reverse FIRST
+                # (index-based split needs the raw point count), THEN drop
+                # compliance-clamped points per branch.
                 forward_v = voltages[:points_per_direction]
                 forward_i = currents[:points_per_direction]
 
                 reverse_v = list(reversed(voltages[points_per_direction - 1:]))
                 reverse_i = list(reversed(currents[points_per_direction - 1:]))
 
+                fwd_v, fwd_i, n_clip_f = self.filter_compliance_points(
+                    forward_v, forward_i, compliance_a
+                )
+                rev_v, rev_i, n_clip_r = self.filter_compliance_points(
+                    reverse_v, reverse_i, compliance_a
+                )
+                self.compliance_clipped_points = n_clip_f + n_clip_r
+                if self.compliance_clipped_points:
+                    logger.warning(
+                        f"Excluding {n_clip_f} forward / {n_clip_r} reverse "
+                        "compliance-clamped point(s) from analysis."
+                    )
+                if fwd_v.size == 0 or rev_v.size == 0:
+                    logger.error("A full branch was at compliance — no valid data.")
+                    return
+
                 forward_metrics = compute_jv_metrics(
-                    v_raw=forward_v,
-                    i_raw=forward_i,
+                    v_raw=fwd_v,
+                    i_raw=fwd_i,
                     area_cm2=float(self.device_area),
                     incident_power_mw_per_cm2=float(self.incident_power),
+                    **self._analysis_kwargs(),
                 )
 
                 reverse_metrics = compute_jv_metrics(
-                    v_raw=reverse_v,
-                    i_raw=reverse_i,
+                    v_raw=rev_v,
+                    i_raw=rev_i,
                     area_cm2=float(self.device_area),
                     incident_power_mw_per_cm2=float(self.incident_power),
+                    **self._analysis_kwargs(),
                 )
 
                 self.analysis_results[channel] = {

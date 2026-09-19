@@ -7,6 +7,7 @@ Flow:
 Logout from any window returns to the login screen.
 """
 
+import logging
 import sys
 import os
 
@@ -23,6 +24,8 @@ from solarjv_analyzer.auth.session import SessionManager, logout as auth_logout
 from solarjv_analyzer.windows.calibration_window import CalibrationWindow
 from solarjv_analyzer.gui.jv_analyzer_window import JVAnalyzerWindow
 from solarjv_analyzer.gui.style import DIALOG_STYLESHEET
+from solarjv_analyzer.instruments.instrument_manager import InstrumentManager
+from solarjv_analyzer import store
 
 
 def main():
@@ -31,14 +34,67 @@ def main():
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # Register the design-system fonts (Geist/Inter/JetBrains Mono, if
+    # bundled in resources/fonts/) and the shared pyqtgraph defaults BEFORE
+    # any window or plot is created, so every view renders identically.
+    from solarjv_analyzer.gui.theme import load_design_fonts, apply_global_plot_config
+    load_design_fonts()
+    apply_global_plot_config()
+
     # Apply a shared modern style to ALL popups/dialogs app-wide (QMessageBox,
     # QInputDialog, QDialog, ...) so they match the main/calibration window
     # look regardless of which window spawns them. Windows still set their
     # own full stylesheet on top of this for their own widgets.
     app.setStyleSheet(DIALOG_STYLESHEET)
 
-    # Instrument manager may be reused across sessions
-    instrument_manager = None
+    # Resolve which COM port each instrument is on, before anything tries to
+    # connect. config.py ships inside the packaged app, so a changed COM
+    # number would otherwise be unfixable without a rebuild. Never fatal: on
+    # failure the resolver falls back to the config values and the usual
+    # "Hardware Disconnected — Retry" path still applies.
+    try:
+        from solarjv_analyzer.instruments import port_resolver
+        port_resolver.resolve_at_startup()
+    except Exception as exc:
+        logging.getLogger(__name__).error(f"Port resolution failed: {exc}")
+
+    # ONE InstrumentManager for the whole process. Every window is handed
+    # this same object, so there is exactly one owner of the VISA session and
+    # the serial port. (Previously each window built its own manager and the
+    # instrument objects were copied between them; the calibration window's
+    # closeEvent then closed the very session the main window was still
+    # holding, and its connect_*() calls short-circuited on the dead handle.)
+    instrument_manager = InstrumentManager()
+
+    # Connect both instruments NOW, as the app opens. The rack is powered on
+    # before the app is launched, so there is nothing to wait for — and
+    # waiting was visible: the Keithley only connected when the calibration
+    # window was built, and the MUX not until the first run, which is why its
+    # status light sat red until someone pressed a button.
+    #
+    # On a background thread so the login dialog appears instantly, and joined
+    # before the calibration window is built so nothing races the manager.
+    import threading
+
+    def _preconnect(manager):
+        for name, connect in (("Keithley", manager.connect_keithley),
+                              ("MUX", manager.connect_mux)):
+            try:
+                connect(simulation=False)
+                logging.getLogger(__name__).info(f"{name} connected at startup")
+            except Exception as exc:
+                # Never fatal: the calibration window's "Hardware Disconnected
+                # — Retry" path and the run-start connect both still apply.
+                logging.getLogger(__name__).warning(
+                    f"{name} not connected at startup: {exc}")
+
+    preconnect = threading.Thread(
+        target=_preconnect, args=(instrument_manager,),
+        name="startup-connect", daemon=True,
+    )
+    preconnect.start()
+
     relogin = True
 
     while relogin:
@@ -49,15 +105,21 @@ def main():
         if username is None:
             sys.exit(0)      # user closed the dialog without logging in
 
-        # 3. Calibration window
-        calib_window = CalibrationWindow(username)
+        # Let the startup connection finish before any window touches the
+        # manager. By now the operator has typed a password, so this is
+        # normally instantaneous.
+        if preconnect.is_alive():
+            preconnect.join(timeout=20)
 
-        # Reuse instruments from previous session if available
-        if instrument_manager and calib_window.instrument_manager:
-            if instrument_manager.keithley:
-                calib_window.instrument_manager.keithley = instrument_manager.keithley
-            if instrument_manager.mux:
-                calib_window.instrument_manager.mux = instrument_manager.mux
+        # 3. Calibration window — shares the process-wide instrument manager,
+        #    so any connection still open from a previous session is reused
+        #    as-is rather than copied.
+        calib_window = CalibrationWindow(
+            username, instrument_manager=instrument_manager
+        )
+        # Redirect working files to local staging and start publishing finished
+        # reports to the protected store. A no-op when disabled; never raises.
+        store.attach(calib_window)
 
         main_window = None
 
@@ -69,7 +131,13 @@ def main():
             instr = data.get('instrument_manager') if isinstance(data, dict) else data
             out_dir = data.get('output_directory') if isinstance(data, dict) else None
 
-            main_window = JVAnalyzerWindow(username)
+            # Hand over the manager ITSELF (normally the same process-wide
+            # object the calibration window was given), never a copy of its
+            # instrument references — see InstrumentManager's module docstring.
+            main_window = JVAnalyzerWindow(
+                username,
+                instrument_manager=instr if instr is not None else instrument_manager,
+            )
 
             # Configure directory manager
             if hasattr(main_window, 'dir_manager'):
@@ -81,26 +149,29 @@ def main():
                     if saved:
                         main_window.dir_manager.set_base_directory(saved)
 
-            # Pass connected instruments to avoid reconnection
-            if hasattr(main_window, 'instrument_manager'):
-                if instr and instr.keithley:
-                    main_window.instrument_manager.keithley = instr.keithley
-                if instr and instr.mux:
-                    main_window.instrument_manager.mux = instr.mux
-                if hasattr(main_window, 'update_instrument_lights'):
-                    main_window.update_instrument_lights()
+            store.attach(main_window)
+
+            # Reflect the inherited connection state in the status lights.
+            if hasattr(main_window, 'update_instrument_lights'):
+                main_window.update_instrument_lights()
 
             # Connect logout signal from main window
             main_window.logged_out.connect(lambda: handle_logout(main_window))
 
-            main_window.show()
+            main_window.showMaximized()
+            # Start the live hardware monitor so both status lights are
+            # honest from the moment the window appears, and stay honest —
+            # the calibration gate is Keithley-only, so nothing has opened the
+            # MUX yet, and a cable pulled later must turn its light red.
+            if hasattr(main_window, 'start_hardware_monitor'):
+                main_window.start_hardware_monitor()
             calib_window.close()
 
         # Connect calibration window signals
         calib_window.calibration_passed.connect(launch_main_app)
         calib_window.logged_out.connect(lambda: handle_logout(calib_window))
 
-        calib_window.show()
+        calib_window.showMaximized()
         app.exec_()
 
         # After the event loop ends, check if we need to relogin

@@ -36,9 +36,20 @@ class FilePanel(QtWidgets.QGroupBox):
         """Build the file output form layout."""
         layout = QtWidgets.QFormLayout(self)
 
-        # Filename input
-        self.filename_input = QtWidgets.QLineEdit("Output.csv")
+        # Filename input — starts empty; user must enter a name before running
+        self.filename_input = QtWidgets.QLineEdit("")
+        self.filename_input.setPlaceholderText("Enter experiment filename…")
         layout.addRow("Filename Prefix:", self.filename_input)
+
+        # Validation hint (hidden once a valid filename is entered)
+        self.filename_hint = QtWidgets.QLabel(
+            "Please enter an experiment filename before running."
+        )
+        self.filename_hint.setStyleSheet(
+            "color: #ef4444; font-size: 11px; font-style: italic;"
+            " background: transparent; padding: 2px 0;"
+        )
+        layout.addRow("", self.filename_hint)
 
         # Directory selection with Browse and Open buttons
         self.directory_input = QtWidgets.QLineEdit()
@@ -123,6 +134,10 @@ class FilePanel(QtWidgets.QGroupBox):
     # -------------------------------------------------------------------------
     # Parameter Retrieval
     # -------------------------------------------------------------------------
+
+    def has_valid_filename(self) -> bool:
+        """Return True if the filename prefix is non-empty after trimming."""
+        return bool(self.filename_input.text().strip())
 
     def get_parameters(self) -> dict:
         """

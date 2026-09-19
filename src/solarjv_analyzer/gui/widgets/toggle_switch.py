@@ -5,7 +5,7 @@ A modern, animated iOS-style toggle switch used for the Channel Selection
 UI (and "Select All"). Behaves like a QCheckBox/QRadioButton (isChecked(),
 setChecked(), toggled signal) so it's a drop-in replacement wherever the
 app previously used checkboxes, but renders as a sliding pill switch with
-a green "on" accent matching the app's existing success color.
+a slate-teal "on" accent matching the design-system primary.
 """
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -19,7 +19,7 @@ class ToggleSwitch(QtWidgets.QAbstractButton):
         parent=None,
         width: int = 44,
         height: int = 24,
-        on_color: str = "#2ecc71",
+        on_color: str = "#053a46",
         off_color: str = "#cbd5e1",
         handle_color: str = "#ffffff",
     ):

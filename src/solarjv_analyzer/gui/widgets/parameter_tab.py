@@ -94,6 +94,37 @@ class ParameterTab(QtWidgets.QWidget):
         self.area_unit.addItems(["cm²", "mm²", "m²"])
         layout.addRow("Device Area:", self._row(self.device_area, self.area_unit))
 
+        # Device Architecture — ToggleSwitch between n-i-p and p-i-n
+        from .toggle_switch import ToggleSwitch
+        arch_widget = QtWidgets.QWidget()
+        arch_layout = QtWidgets.QHBoxLayout(arch_widget)
+        arch_layout.setContentsMargins(0, 0, 0, 0)
+        arch_layout.setSpacing(10)
+
+        # Both sides used to be teal (#053a46 off, #24515e on), which is two
+        # shades of the same colour — the operator could not tell at a glance
+        # which architecture was selected, and the architecture flips the sign
+        # convention of every metric. p-i-n is now a MUTED red: distinct from
+        # n-i-p, and deliberately not the functional red that means something
+        # has gone wrong.
+        from solarjv_analyzer.gui.theme import tokens as _t
+
+        self._arch_nip_label = QtWidgets.QLabel("n-i-p")
+        self._arch_pin_label = QtWidgets.QLabel("p-i-n")
+
+        self.architecture_toggle = ToggleSwitch(
+            on_color=_t.ARCH_PIN_RED, off_color=_t.ARCH_NIP_TEAL
+        )
+        self.architecture_toggle.setChecked(False)  # False = n-i-p, True = p-i-n
+        self.architecture_toggle.toggled.connect(self._update_architecture_labels)
+        self._update_architecture_labels(False)
+
+        arch_layout.addWidget(self._arch_nip_label)
+        arch_layout.addWidget(self.architecture_toggle)
+        arch_layout.addWidget(self._arch_pin_label)
+        arch_layout.addStretch()
+        layout.addRow("Device Architecture:", arch_widget)
+
         # Separator
         separator = QtWidgets.QFrame()
         separator.setFrameShape(QtWidgets.QFrame.HLine)
@@ -103,8 +134,15 @@ class ParameterTab(QtWidgets.QWidget):
         # Channel Selection
         self._create_channel_selector(layout)
 
-        # Notes section
+        # Notes section — with a styled heading matching CombinedTab
+        notes_heading = QtWidgets.QLabel("Notes")
+        notes_heading.setStyleSheet(
+            "font-weight: 600; font-size: 13px; color: #0f172a;"
+            " background: transparent; padding: 8px 0 4px 0;"
+        )
+
         self.notes_field = QtWidgets.QTextEdit()
+        self.notes_field.setObjectName("notes_field")
         self.notes_field.setPlaceholderText("Enter any notes or comments...")
         self.notes_field.setFixedHeight(80)
         self.save_notes_checkbox = QtWidgets.QCheckBox("Save in file")
@@ -115,6 +153,8 @@ class ParameterTab(QtWidgets.QWidget):
         notes_widget = QtWidgets.QWidget()
         notes_layout = QtWidgets.QVBoxLayout(notes_widget)
         notes_layout.setContentsMargins(0, 0, 0, 0)
+        notes_layout.setSpacing(4)
+        notes_layout.addWidget(notes_heading)
         notes_layout.addWidget(self.notes_field)
         notes_controls = QtWidgets.QHBoxLayout()
         notes_controls.addWidget(self.save_notes_checkbox)
@@ -122,11 +162,11 @@ class ParameterTab(QtWidgets.QWidget):
         notes_controls.addWidget(self.clear_notes_button)
         notes_layout.addLayout(notes_controls)
 
-        layout.addRow("Notes:", notes_widget)
+        layout.addRow(notes_widget)
 
         # Estimated Time Display
         self.estimated_time_label = QtWidgets.QLabel("Estimated sweep time: --")
-        self.estimated_time_label.setStyleSheet("color: blue; font-weight: bold;")
+        self.estimated_time_label.setStyleSheet("color: #053a46; font-weight: bold;")
         layout.addRow("", self.estimated_time_label)
 
         # Connect signals for real-time time estimation
@@ -222,7 +262,7 @@ class ParameterTab(QtWidgets.QWidget):
         label = self.channel_number_labels[index]
         if checked:
             label.setStyleSheet(
-                "background-color: #dcfce7; color: #16a34a; font-weight: 600;"
+                "background-color: #d1e3e9; color: #053a46; font-weight: 600;"
                 "border-radius: 14px;"
             )
         else:
@@ -298,6 +338,24 @@ class ParameterTab(QtWidgets.QWidget):
     # Parameter Retrieval
     # -------------------------------------------------------------------------
 
+    def _update_architecture_labels(self, is_pin: bool):
+        """Emphasise the selected side and mute the other.
+
+        The toggle track alone reads as one blob of colour at a glance; the
+        label is what the operator actually reads, so the active one carries
+        the colour and the weight.
+        """
+        from solarjv_analyzer.gui.theme import tokens as _t
+
+        active = ("font-weight: 700; font-size: 13px; color: {};"
+                  " background: transparent;")
+        muted = ("font-weight: 500; font-size: 13px; color: #94a3b8;"
+                 " background: transparent;")
+        self._arch_nip_label.setStyleSheet(
+            muted if is_pin else active.format(_t.PRIMARY))
+        self._arch_pin_label.setStyleSheet(
+            active.format(_t.ARCH_PIN_RED_TEXT) if is_pin else muted)
+
     def get_parameters(self) -> dict:
         """
         Retrieve sweep parameters converted to standard units.
@@ -358,6 +416,7 @@ class ParameterTab(QtWidgets.QWidget):
             'sweep_rate': sweep_rate,
             'compliance_current': compliance,
             'device_area': area,
+            'architecture': "p-i-n" if self.architecture_toggle.isChecked() else "n-i-p",
             'notes_text': notes_text if save_notes else '',
             'save_notes': save_notes,
         }

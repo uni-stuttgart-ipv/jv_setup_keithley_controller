@@ -2,7 +2,7 @@
 SPO (Set-Point Operation) Procedure
 
 Passive stability test: the Keithley 2400 is set to source a fixed
-"hold_voltage" (typically Vmax found from a quick J-V sweep) and the current
+"hold_voltage" (typically Vmpp found from a quick J-V sweep) and the current
 is sampled at a regular interval for "hold_duration" seconds. Every sample is
 written to disk and flushed immediately via SpoReport, so a crash never loses
 previously-recorded data.
@@ -44,11 +44,15 @@ class SpoProcedure(JVProcedure):
     preconditioning_time = FloatParameter("Pre-conditioning Time", units="s", default=5.0)
     active_channel = IntegerParameter("Active Channel", default=1)
 
-    def __init__(self, *args, manager=None, mux=None, instrument=None, username=None, **kwargs):
+    def __init__(self, *args, manager=None, mux=None, instrument=None,
+                 username=None, csv_path=None, report_path=None, **kwargs):
         super().__init__(*args, manager=manager, mux=mux, instrument=instrument, **kwargs)
         self.username = username
         self._report = None
         self._csv_path = None
+        # Optional overrides for combined-mode runs (skip auto path generation).
+        self._custom_csv_path = csv_path
+        self._custom_report_path = report_path
 
     # -------------------------------------------------------------------
     # Lifecycle
@@ -123,18 +127,27 @@ class SpoProcedure(JVProcedure):
                 return
 
             # --- Open the raw CSV immediately (crash-safe, flushed per row) ---
-            # DirectoryManager is a process-wide singleton (its __init__ only
-            # applies args on first construction), so update it via its
-            # setters and restore the previous mode afterward to avoid
-            # side-effects on the JV file panel's "Main" directory display.
-            dir_manager = DirectoryManager()
-            previous_mode = dir_manager.mode
-            dir_manager.set_username(self.username)
-            dir_manager.set_mode("SPO")
-            directory = dir_manager.get_current_directory(create=True)
-            dir_manager.set_mode(previous_mode)
-            timestamp = time.strftime("%Y-%m-%dT%H-%M-%S")
-            self._csv_path = os.path.join(directory, f"spo_ch{channel}_{timestamp}_raw.csv")
+            if self._custom_csv_path:
+                self._csv_path = self._custom_csv_path
+            else:
+                # DirectoryManager is a process-wide singleton — update it via
+                # its setters and restore the previous mode afterward to avoid
+                # side-effects on the JV file panel's "Main" directory display.
+                dir_manager = DirectoryManager()
+                previous_mode = dir_manager.mode
+                dir_manager.set_username(self.username)
+                try:
+                    dir_manager.set_mode("SPO")
+                    directory = dir_manager.get_current_directory(create=True)
+                finally:
+                    # ALWAYS restore — an exception here (permissions, missing
+                    # network drive) must not strand the process-wide singleton
+                    # in "SPO" mode for all subsequent JV runs.
+                    dir_manager.set_mode(previous_mode)
+                timestamp = time.strftime("%Y-%m-%dT%H-%M-%S")
+                self._csv_path = os.path.join(
+                    directory, f"spo_ch{channel}_{timestamp}_raw.csv"
+                )
 
             parameters = {
                 "Hold Voltage": (float(self.hold_voltage), "V"),
@@ -160,7 +173,14 @@ class SpoProcedure(JVProcedure):
                 if elapsed >= duration or self.should_stop():
                     break
 
-                voltage, current = self._measure_point()
+                # One bounded retry on a garbled/short instrument response —
+                # a single bad sample must not kill a multi-hour hold.
+                try:
+                    voltage, current = self._measure_point()
+                except (IndexError, ValueError) as e:
+                    logger.warning(f"SPO sample read failed ({e}); retrying once.")
+                    time.sleep(0.2)
+                    voltage, current = self._measure_point()
                 power = voltage * current
 
                 self.emit('results', {
@@ -176,9 +196,15 @@ class SpoProcedure(JVProcedure):
                 self.emit('progress', progress)
 
                 next_sample += interval
-                sleep_time = next_sample - time.time()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                # Abort-aware sleep: check should_stop() every 0.1 s so an
+                # abort takes effect immediately even with long sampling
+                # intervals (a single sleep(interval) would delay the abort —
+                # and the emergency :OUTP OFF — by up to a full interval).
+                while True:
+                    remaining = next_sample - time.time()
+                    if remaining <= 0 or self.should_stop():
+                        break
+                    time.sleep(min(0.1, remaining))
 
             self.emit('progress', 100.0)
             self.emit('status', 'Complete' if not self.should_stop() else 'Aborted')

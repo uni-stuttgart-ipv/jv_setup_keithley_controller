@@ -10,6 +10,28 @@ from pytest import approx
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
 
 
+@pytest.fixture(autouse=True)
+def _revive_pymeasure_blink_timer():
+    """Keep pymeasure's LogWidget constructible regardless of test order.
+
+    ``LogWidget._blink_qtimer`` is a *parentless, class-level*
+    ``QtCore.QTimer()`` created at class-definition time. SIP garbage-collects
+    the C++ object when the Python wrapper's refcount drops between tests, so
+    the next ``LogWidget`` construction (inside ``JVAnalyzerWindow``) fails
+    with "wrapped C/C++ object of type QTimer has been deleted". Recreate it
+    before every test so any GUI test can build windows in any order.
+    """
+    try:
+        from PyQt5.QtCore import QTimer
+        from pymeasure.display.widgets.log_widget import LogWidget
+    except Exception:
+        # PyQt5 / pymeasure unavailable — nothing to revive.
+        yield
+        return
+    LogWidget._blink_qtimer = QTimer()
+    yield
+
+
 @pytest.fixture
 def ideal_linear_cell_data() -> dict:
     """
@@ -19,7 +41,7 @@ def ideal_linear_cell_data() -> dict:
     Metrics are based on the equation: I_proc = 0.1 - 0.1*V
     - Voc: 1.0 V
     - Isc: 0.1 A
-    - Vmax: 0.5 V
+    - Vmpp: 0.5 V
     - Imax: 0.05 A
     - FF: 25.0
     - Eff: 25.0
@@ -41,8 +63,9 @@ def ideal_linear_cell_data() -> dict:
             "FF": 25.0,
             "Voc": 1000.0,
             "Jsc": 100.0,
-            "Vmax": 500.0,
-            "Jmax": 50.0,
+            "Vmpp": 500.0,
+            "Jmpp": 50.0,
+            "Pmpp": 25.0,   # 0.5V × 0.05A = 0.025W = 25mW
             "Isc": 0.1,
             "Rsh": 10.0,  
             "Rs": 10.0,   
@@ -59,25 +82,29 @@ def hysteresis_cell_data() -> dict:
     Uses np.arange().round() to ensure all key points are included.
     
     Forward Sweep: I_proc = 0.1 - 0.1*V (Linear)
-    - Fwd Voc: 1.0 V
-    - Fwd Isc: 0.1 A
-
     Reverse Sweep: I_proc = 0.12 - 0.1*V (Shifted)
-    - The code averages forward and reverse sweeps
+
+    The code averages exact-duplicate voltages, and ALL metrics must then
+    describe that single averaged curve (first-principles requirement:
+    FF = Pmax/(Voc*Isc) is only meaningful for one curve):
     - Averaged curve: I_avg = 0.11 - 0.1*V
-    - Vmax: 0.55 V (from averaged curve)
-    - Imax: 0.055 A (from averaged curve)
-    - Pmax: 0.03025 W
-    - FF: 30.25
-    - Eff: 30.25
+    - Voc: 1.1 V   (I_avg = 0 at V = 1.1)
+    - Isc: 0.11 A  (I_avg at V = 0)
+    - Vmpp: 0.55 V, Imax: 0.055 A  (linear cell: MPP at Voc/2)
+    - Pmax: 0.55 * 0.055 = 0.03025 W
+    - FF: 0.03025 / (1.1 * 0.11) = 25.0  (any linear cell has FF = 25%)
+    - Eff: 30.25 (Pmax / 100 mW incident)
     """
-    # Forward sweep (includes 0.0 and 1.0)
-    v_fwd = np.arange(-0.1, 1.11, 0.01).round(decimals=2)
+    # Build the grid from integers so forward and reverse cover EXACTLY the
+    # same voltages (float arange overshoots its endpoint: arange(-0.1, 1.11)
+    # includes 1.11 while the descending grid includes -0.11, leaving two
+    # unpaired points that corrupt the duplicate-averaging).
+    v_fwd = (np.arange(-10, 111) * 0.01).round(decimals=2)  # -0.10 .. 1.10
     i_fwd_proc = 0.1 - 0.1 * v_fwd
     i_fwd = -i_fwd_proc
-    
-    # Reverse sweep (includes 0.6)
-    v_rev = np.arange(1.1, -0.11, -0.01).round(decimals=2)
+
+    # Reverse sweep: identical grid, descending
+    v_rev = v_fwd[::-1]
     i_rev_proc = 0.12 - 0.1 * v_rev # Different Isc, Pmax
     i_rev = -i_rev_proc
     
@@ -90,13 +117,14 @@ def hysteresis_cell_data() -> dict:
         "area_cm2": 1.0,
         "incident_power_mw_per_cm2": 100.0,
         "expected_metrics": {
-            "EFF": 30.25,        
-            "FF": 30.25,         
-            "Voc": 1000.0,       # From fwd sweep
-            "Jsc": 100.0,        # From fwd sweep
-            "Vmax": 550.0,       
-            "Jmax": 55.0,        
-            "Isc": 0.1,          # From fwd sweep
+            "EFF": 30.25,
+            "FF": 25.0,          # Pmax/(Voc*Isc) of the SAME averaged curve
+            "Voc": 1100.0,       # From the averaged curve (mV)
+            "Jsc": 110.0,        # From the averaged curve
+            "Vmpp": 550.0,
+            "Jmpp": 55.0,
+            "Pmpp": 30.25,      # 0.55V × 0.055A = 0.03025W = 30.25mW
+            "Isc": 0.11,         # From the averaged curve
         }
     }
 
@@ -125,8 +153,9 @@ def noisy_cell_data() -> dict:
             "FF": approx(25.0, rel=0.15),
             "Voc": approx(1000.0, rel=0.05),
             "Jsc": approx(100.0, rel=0.05),
-            "Vmax": approx(500.0, rel=0.1),
-            "Jmax": approx(50.0, rel=0.2),
+            "Vmpp": approx(500.0, rel=0.1),
+            "Jmpp": approx(50.0, rel=0.2),
+            "Pmpp": approx(25.0, rel=0.15),
         }
     }
 
@@ -148,8 +177,9 @@ def dark_curve_data() -> dict:
         "expected_metrics": {
             "EFF": 0.0,
             "FF": 0.0,
-            "Vmax": 0.0,
-            "Jmax": 0.0,
+            "Vmpp": 0.0,
+            "Jmpp": 0.0,
+            "Pmpp": 0.0,
             # Voc and Isc may be non-zero but FF/EFF should be 0
         }
     }
@@ -185,7 +215,7 @@ def q2_cell_data() -> dict:
     Equation: I_proc = 0.1 + 0.1*V
     - Voc: -1.0 V (where I=0)
     - Isc: 0.1 A (where V=0) 
-    - Vmax: -0.5 V
+    - Vmpp: -0.5 V
     - Imax: 0.05 A
     - FF: 25.0
     - Eff: 25.0
@@ -207,8 +237,9 @@ def q2_cell_data() -> dict:
             "FF": 25.0,
             "Voc": 1000.0,  # Magnitude (reports as positive)
             "Jsc": 100.0,   # Magnitude
-            "Vmax": 500.0,  # Magnitude (will be negative in Q2, reports as positive)
-            "Jmax": 50.0,   # Magnitude
+            "Vmpp": 500.0,  # Magnitude (will be negative in Q2, reports as positive)
+            "Jmpp": 50.0,   # Magnitude
+            "Pmpp": 25.0,   # 0.5V × 0.05A = 0.025W = 25mW
             "Isc": 0.1,     # Magnitude
         }
     }
@@ -226,7 +257,7 @@ def high_rs_cell_data() -> dict:
     
     # Voc (I=0): 0.1 = 0.05*V -> V = 2.0V
     # Isc (V=0): I = 0.1A
-    # Pmax (V=1.0V): Vmax=1.0V, Imax=0.05A, Pmax=0.05W
+    # Pmax (V=1.0V): Vmpp=1.0V, Impp=0.05A, Pmax=0.05W
     # FF = 0.05 / (2.0 * 0.1) = 0.25
     # Eff = 0.05 / 0.1 = 0.5 (assuming Pin=100mW)
     
@@ -240,8 +271,9 @@ def high_rs_cell_data() -> dict:
             "FF": 25.0,
             "Voc": 2000.0,
             "Jsc": 100.0,
-            "Vmax": 1000.0,
-            "Jmax": 50.0,
+            "Vmpp": 1000.0,
+            "Jmpp": 50.0,
+            "Pmpp": 50.0,      # 1.0V × 0.05A = 0.05W = 50mW
             "Rs": approx(20.0, rel=0.05), # Key assertion
             "Rsh": approx(20.0, rel=0.05),
         }
@@ -252,10 +284,10 @@ def s_shaped_cell_data() -> dict:
     """
     Simulates an S-shaped J-V curve where 5th-order polyfit finds global Pmax.
     Based on actual test results:
-    - Vmax: ~900mV ✓ (polyfit correctly finds global Pmax!)
+    - Vmpp: ~900mV ✓ (polyfit correctly finds global Pmax!)
     - EFF: ~79.5% ✓
     - FF: ~79.5% ✓  
-    - Jmax: ~97.5 mA/cm² ✓
+    - Jmpp: ~97.5 mA/cm² ✓
     - Jsc: ~100 mA/cm² ✓
     - Voc: ~1000 mV ✓
     """
@@ -281,7 +313,8 @@ def s_shaped_cell_data() -> dict:
             "FF": approx(79.5, rel=0.1),    
             "Voc": approx(1000.0, rel=0.05), 
             "Jsc": approx(100.0, rel=0.05),  
-            "Vmax": approx(900.0, rel=0.1),  
-            "Jmax": approx(97.5, rel=0.1),   
+            "Vmpp": approx(900.0, rel=0.1),  
+            "Jmpp": approx(97.5, rel=0.1),
+            "Pmpp": approx(87.75, rel=0.1),  # ~0.9V × ~0.0975A ≈ 0.08775W = 87.75mW
         }
     }

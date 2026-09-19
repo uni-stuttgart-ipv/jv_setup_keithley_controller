@@ -1,15 +1,20 @@
-# Byte-compiled / optimized / DLL files
+# ---------------------------------------------------------------------------
+# NOTE: this file was once round-tripped through a Markdown renderer, which
+# backslash-escaped every pattern containing a special character (`\*.log`,
+# `\*.sqlite3`, `**pycache**/`). Escaped patterns match NOTHING, so logs,
+# databases and bytecode were all silently unignored. If you edit this file,
+# edit it as plain text — never paste it back from rendered Markdown.
+# ---------------------------------------------------------------------------
 
-**pycache**/
-\*.py\[cod]
-\*\$py.class
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
 
 # C extensions
-
-\*.so
+*.so
 
 # Distribution / packaging
-
 .Python
 build/
 develop-eggs/
@@ -17,100 +22,110 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
 parts/
 sdist/
 var/
-\*.egg-info/
+*.egg-info/
 .installed.cfg
-\*.egg
+*.egg
+
+# Briefcase
+*.app/
+*.dmg
+*.msi
 
 # Virtual environments
-
-venv/
+# Trailing-glob forms on purpose: a plain `.venv/` matches ONLY a directory
+# named exactly `.venv`, so a second interpreter's env (`.venv-3.9`, kept for
+# the Briefcase build, which needs Python 3.9) slipped past and staged 3000+
+# site-packages files.
+.venv*/
+venv*/
 ENV/
 env/
+.env
 .env/
-.venv/
 
 # PyBuilder
-
 target/
 
 # Hatch environments
-
 .hatch/
 
 # Jupyter Notebook checkpoints
-
-.ipynb\_checkpoints
+.ipynb_checkpoints
 
 # IPython
-
-profile\_default/
-ipython\_config.py
+profile_default/
+ipython_config.py
 
 # pyenv
-
 .python-version
 
 # pipenv
-
 Pipfile.lock
 
-# pytest
-
+# pytest / tooling caches
 .cache/
-.pytest\_cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# mypy
-
-.mypy\_cache/
+# Generated preview PNGs (tools/render_preview.py)
+tools/previews/
 
 # IDEs and editors
-
 .vscode/
 .idea/
-\*.sublime-workspace
-\*.sublime-project
+*.sublime-workspace
+*.sublime-project
+*.iml
 
-# Logs and SQLite databases
+# Logs and databases
+# `auth.db` lives in %LOCALAPPDATA%/~/.local/share and session logs go to the
+# results tree, so neither is normally inside the repo — but a stray copy must
+# never be committed. (See AUDIT.md C6: a plaintext users.db was.)
+*.log
+*.sqlite3
+*.db
 
-\*.log
-\*.sqlite3
-
-# Data and Results directories
-
+# Measurement data and results — lab output, not source
 data/
 Reports/
+reports/
 
 # Temporary files
-
-\*.tmp
-\*.temp
+*.tmp
+*.temp
+repo_sync.tar
 
 # OS-specific files
-
-.DS\_Store
+.DS_Store
 Thumbs.db
 
 # Coverage reports
-
 htmlcov/
 .coverage
 coverage.xml
 
-# Sphinx documentation
+# Sphinx documentation build output (docs/ itself IS tracked)
+docs/_build/
 
-docs/\_build/
-
-# PyCharm
-
-\*.iml
-
-# Docker files
-
+# Docker
 docker-compose.override.yml
 
-# End of .gitignore
+# ---------------------------------------------------------------------------
+# Project-specific
+# ---------------------------------------------------------------------------
+
+# Claude Code: share the project config (hooks + skills), keep personal
+# permissions local. settings.local.json holds machine-specific allow-lists
+# and has contained API keys in the past — it must never be committed.
+.claude/settings.local.json
+
+# Scratch output written by Claude sessions (preview PNGs, exports).
+Claude outputs/
+
+# LiteLLM/DeepSeek model config — AI tooling, unrelated to this application
+# and read by nothing in src/. Kept locally, not shipped.
+config.yaml

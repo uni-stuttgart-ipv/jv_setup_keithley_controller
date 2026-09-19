@@ -36,7 +36,7 @@ def test_interpolate_voltage_at_current_unsorted(ideal_linear_cell_data):
     v_at_isc = _interpolate_voltage_at_current_unsorted(v, i_proc, target_current=0.1)
     assert v_at_isc == approx(0.0)
     
-    # Test at Vmax (I=0.05)
+    # Test at Vmpp (I=0.05)
     v_at_pmax = _interpolate_voltage_at_current_unsorted(v, i_proc, target_current=0.05)
     assert v_at_pmax == approx(0.5)
 
@@ -56,7 +56,7 @@ def test_interpolate_current_at_voltage_unsorted(ideal_linear_cell_data):
     i_at_voc = _interpolate_current_at_voltage_unsorted(v, i_proc, target_voltage=1.0)
     assert i_at_voc == approx(0.0)
 
-    # Test at Vmax (V=0.5)
+    # Test at Vmpp (V=0.5)
     i_at_pmax = _interpolate_current_at_voltage_unsorted(v, i_proc, target_voltage=0.5)
     assert i_at_pmax == approx(0.05)
 
@@ -145,8 +145,9 @@ def test_compute_jv_metrics_ideal_linear_cell(ideal_linear_cell_data):
     assert metrics["FF"] == approx(expected["FF"])
     assert metrics["Voc"] == approx(expected["Voc"])
     assert metrics["Jsc"] == approx(expected["Jsc"])
-    assert metrics["Vmax"] == approx(expected["Vmax"])
-    assert metrics["Jmax"] == approx(expected["Jmax"])
+    assert metrics["Vmpp"] == approx(expected["Vmpp"])
+    assert metrics["Jmpp"] == approx(expected["Jmpp"])
+    assert metrics["Pmpp"] == approx(expected["Pmpp"])
     assert metrics["Isc"] == approx(expected["Isc"])
     assert metrics["Rsh"] == approx(expected["Rsh"])
     assert metrics["Rs"] == approx(expected["Rs"])
@@ -197,8 +198,9 @@ def test_compute_jv_metrics_hysteresis(hysteresis_cell_data):
     # Check the key metrics from the averaged curve
     assert metrics["Voc"] == approx(expected["Voc"])
     assert metrics["Jsc"] == approx(expected["Jsc"])
-    assert metrics["Vmax"] == approx(expected["Vmax"])
-    assert metrics["Jmax"] == approx(expected["Jmax"])
+    assert metrics["Vmpp"] == approx(expected["Vmpp"])
+    assert metrics["Jmpp"] == approx(expected["Jmpp"])
+    assert metrics["Pmpp"] == approx(expected["Pmpp"])
     assert metrics["FF"] == approx(expected["FF"])
     assert metrics["EFF"] == approx(expected["EFF"])
 
@@ -224,8 +226,9 @@ def test_compute_jv_metrics_noisy_data(noisy_cell_data):
     assert metrics["FF"] == expected["FF"]
     assert metrics["Voc"] == expected["Voc"]
     assert metrics["Jsc"] == expected["Jsc"]
-    assert metrics["Vmax"] == expected["Vmax"]
-    assert metrics["Jmax"] == expected["Jmax"]
+    assert metrics["Vmpp"] == expected["Vmpp"]
+    assert metrics["Jmpp"] == expected["Jmpp"]
+    assert metrics["Pmpp"] == expected["Pmpp"]
 
 
 def test_compute_jv_metrics_dark_curve(dark_curve_data):
@@ -247,8 +250,9 @@ def test_compute_jv_metrics_dark_curve(dark_curve_data):
     # Dark curves should have zero efficiency
     assert metrics["EFF"] == expected["EFF"]
     assert metrics["FF"] == expected["FF"]
-    assert metrics["Vmax"] == expected["Vmax"]
-    assert metrics["Jmax"] == expected["Jmax"]
+    assert metrics["Vmpp"] == expected["Vmpp"]
+    assert metrics["Jmpp"] == expected["Jmpp"]
+    assert metrics["Pmpp"] == expected["Pmpp"]
 
 
 def test_compute_jv_metrics_few_points(few_points_data):
@@ -274,7 +278,7 @@ def test_compute_jv_metrics_few_points(few_points_data):
 
 def test_compute_jv_metrics_vmax_clamp():
     """
-    Tests the sanity check: Vmax cannot be greater than Voc.
+    Tests the sanity check: Vmpp cannot be greater than Voc.
     Creates a curve where the polynomial fit finds Pmax at V > Voc.
     """
     # Create data where the true maximum power is actually at V > Voc
@@ -305,7 +309,7 @@ def test_compute_jv_metrics_vmax_clamp():
         # Find where the minimum power would be without clamping
         idx_min_power = int(np.nanargmin(power_gen))
         v_pmax_unclamped = float(v_gen[idx_min_power])
-        print(f"DEBUG - Unclamped Vmax would be: {v_pmax_unclamped*1000:.1f} mV")
+        print(f"DEBUG - Unclamped Vmpp would be: {v_pmax_unclamped*1000:.1f} mV")
     
     metrics = compute_jv_metrics(
         v_raw=v_raw,
@@ -314,20 +318,20 @@ def test_compute_jv_metrics_vmax_clamp():
         incident_power_mw_per_cm2=100.0,
     )
     
-    print(f"DEBUG - Voc: {metrics['Voc']} mV, Vmax: {metrics['Vmax']} mV")
-    print(f"DEBUG - Should clamp: {abs(metrics['Vmax']) > abs(metrics['Voc'])}")
-    
-    # The fundamental test: Vmax should never exceed Voc due to clamping
-    assert abs(metrics["Vmax"]) <= abs(metrics["Voc"]), "Vmax should be clamped to <= Voc"
+    print(f"DEBUG - Voc: {metrics['Voc']} mV, Vmpp: {metrics['Vmpp']} mV")
+    print(f"DEBUG - Should clamp: {abs(metrics['Vmpp']) > abs(metrics['Voc'])}")
+
+    # The fundamental test: Vmpp should never exceed Voc due to clamping
+    assert abs(metrics["Vmpp"]) <= abs(metrics["Voc"]), "Vmpp should be clamped to <= Voc"
     
     # Since we're creating an artificial scenario, we can't predict exact values
     # But we can verify the clamping logic works by checking consistency
     assert metrics["FF"] > 0, "FF should be positive"
     assert metrics["EFF"] > 0, "EFF should be positive"
     
-    # Verify that Vmax and Jmax are physically consistent
+    # Verify that Vmpp and Jmpp are physically consistent
     # (This tests that Pmax was recalculated after any clamping)
-    calculated_pmax = abs(metrics["Vmax"] * metrics["Jmax"] * 1e-3)  # mV * mA/cm² → mW
+    calculated_pmax = abs(metrics["Vmpp"] * metrics["Jmpp"] * 1e-3)  # mV * mA/cm² → mW
     reported_pmax = abs(metrics["Voc"] * metrics["Jsc"] * 1e-3 * metrics["FF"] / 100)  # Pmax = Voc*Jsc*FF
     assert calculated_pmax == approx(reported_pmax, rel=0.1), "Pmax should be consistent after clamping"
 
@@ -374,8 +378,9 @@ def test_compute_jv_metrics_high_series_resistance(high_rs_cell_data):
     assert metrics["FF"] == approx(expected["FF"])
     assert metrics["Voc"] == approx(expected["Voc"])
     assert metrics["Jsc"] == approx(expected["Jsc"])
-    assert metrics["Vmax"] == approx(expected["Vmax"])
-    assert metrics["Jmax"] == approx(expected["Jmax"])
+    assert metrics["Vmpp"] == approx(expected["Vmpp"])
+    assert metrics["Jmpp"] == approx(expected["Jmpp"])
+    assert metrics["Pmpp"] == approx(expected["Pmpp"])
     # Key assertion: Rs should be correctly calculated
     assert metrics["Rs"] == expected["Rs"]
 
@@ -399,11 +404,72 @@ def test_compute_jv_metrics_s_shaped_curve(s_shaped_cell_data):
     
     # The key test: polyfit should find the global Pmax, not the local one
     # This proves why 5th-order polyfit is superior to simple argmin
-    assert metrics["Vmax"] == expected["Vmax"]  # Should be ~900mV, not ~500mV
+    assert metrics["Vmpp"] == expected["Vmpp"]  # Should be ~900mV, not ~500mV
     assert metrics["EFF"] == expected["EFF"]    # Should be ~79%, not lower
     assert metrics["FF"] == expected["FF"]      # Should be ~72%, not lower
     
     # Additional consistency checks
     assert metrics["Voc"] == expected["Voc"]
     assert metrics["Jsc"] == expected["Jsc"]
-    assert metrics["Jmax"] == expected["Jmax"]
+    assert metrics["Jmpp"] == expected["Jmpp"]
+    assert metrics["Pmpp"] == expected["Pmpp"]
+
+
+# --- Architecture Polarity: n-i-p (Q4) vs p-i-n (Q2) ---
+
+class TestArchitecturePolarity:
+    """Verify that compute_jv_metrics extracts positive magnitudes from both
+    quadrants — the function MUST be architecture-agnostic."""
+
+    def test_nip_quadrant4_positive_magnitudes(self):
+        """n-i-p: V > 0, I < 0 (Q4). All output metrics must be ≥ 0."""
+        v_raw = np.linspace(0.0, 1.0, 51)
+        i_raw = -(0.1 - 0.1 * v_raw)
+        metrics = compute_jv_metrics(v_raw, i_raw, area_cm2=1.0,
+                                     incident_power_mw_per_cm2=100.0)
+        assert metrics["Voc"] >= 0
+        assert metrics["Jsc"] >= 0
+        assert metrics["FF"] >= 0
+        assert metrics["EFF"] >= 0
+        assert metrics["Vmpp"] >= 0
+        assert metrics["Jmpp"] >= 0
+        assert metrics["Pmpp"] >= 0
+        assert metrics["Isc"] >= 0
+
+    def test_pin_quadrant2_positive_magnitudes(self):
+        """p-i-n: V < 0, I > 0 (Q2). Output metrics are magnitudes except
+        Vmpp, which preserves its sign (negative in Q2) so the SPO hold
+        voltage has the correct polarity."""
+        v_raw = np.linspace(-1.1, 0.1, 51)
+        i_raw = 0.1 + 0.1 * v_raw  # Q2: positive current, negative voltage
+        metrics = compute_jv_metrics(v_raw, i_raw, area_cm2=1.0,
+                                     incident_power_mw_per_cm2=100.0)
+        assert metrics["Voc"] >= 0
+        assert metrics["Jsc"] >= 0
+        assert metrics["FF"] >= 0
+        assert metrics["EFF"] >= 0
+        assert metrics["Vmpp"] <= 0  # Q2: MPP is at negative voltage
+        assert metrics["Jmpp"] >= 0
+        assert metrics["Pmpp"] >= 0
+        assert metrics["Isc"] >= 0
+
+    def test_pin_identical_to_nip_for_same_curve(self):
+        """Flipped signs (Q2 vs Q4) of the same linear relationship
+        should produce identical magnitude outputs."""
+        # n-i-p curve: V > 0, I < 0, I_abs = 0.1 - 0.1*V
+        v_nip = np.linspace(0.0, 1.0, 51)
+        i_nip = -(0.1 - 0.1 * v_nip)
+        m_nip = compute_jv_metrics(v_nip, i_nip, area_cm2=1.0,
+                                   incident_power_mw_per_cm2=100.0)
+
+        # p-i-n curve: V < 0, I > 0, same slope magnitude
+        v_pin = np.linspace(-1.0, 0.0, 51)
+        i_pin = 0.1 + 0.1 * v_pin
+        m_pin = compute_jv_metrics(v_pin, i_pin, area_cm2=1.0,
+                                   incident_power_mw_per_cm2=100.0)
+
+        # Magnitudes should match within tolerance
+        assert m_nip["EFF"] == pytest.approx(m_pin["EFF"], rel=0.01)
+        assert m_nip["FF"] == pytest.approx(m_pin["FF"], rel=0.01)
+        assert m_nip["Isc"] == pytest.approx(m_pin["Isc"], rel=0.01)
+        assert m_nip["Voc"] == pytest.approx(m_pin["Voc"], rel=0.01)

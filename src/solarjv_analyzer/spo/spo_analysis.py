@@ -72,6 +72,11 @@ def compute_spo_metrics(
     if v.size == 1 and t.size > 1:
         v = np.full_like(t, float(v))
 
+    if not (t.size == i.size == v.size):
+        raise ValueError(
+            f"time/current/voltage length mismatch: {t.size}/{i.size}/{v.size}"
+        )
+
     valid_mask = ~np.isnan(t) & ~np.isnan(i) & ~np.isnan(v)
     t, i, v = t[valid_mask], i[valid_mask], v[valid_mask]
 
@@ -80,7 +85,19 @@ def compute_spo_metrics(
         logger.warning("compute_spo_metrics: all samples were NaN.")
         return _empty_metrics()
 
-    power_w = v * i
+    # Guard against out-of-order samples: a trapezoidal integral over
+    # non-monotonic time silently produces partially-cancelling segments.
+    if n > 1 and np.any(np.diff(t) < 0):
+        logger.warning("SPO samples not in time order; sorting by time.")
+        order = np.argsort(t, kind="stable")
+        t, i, v = t[order], i[order], v[order]
+
+    # GENERATED power convention: P_gen = -(V*I) is POSITIVE whenever the
+    # cell delivers power (Q4: V>0, I<0 — and Q2: V<0, I>0). All power
+    # metrics below use P_gen so that a degrading cell shows NEGATIVE drift,
+    # "max power" is the best sample, and energy is net generated energy.
+    # (Raw signed V*I made a 9->6 mW decay report as +33% "drift".)
+    power_w = -(v * i)
     power_mw = power_w * 1000.0
 
     mean_current_a = float(np.mean(i))
@@ -94,16 +111,19 @@ def compute_spo_metrics(
     initial_power_mw = float(np.mean(power_mw[:edge]))
     final_power_mw = float(np.mean(power_mw[-edge:]))
 
-    if abs(initial_power_mw) > 1e-12:
+    if abs(initial_power_mw) > 1e-6:  # > 1 nW: a measurable baseline
         drift_percent = float(
             (final_power_mw - initial_power_mw) / abs(initial_power_mw) * 100.0
         )
     else:
-        drift_percent = 0.0
-        logger.debug("Initial power near zero; drift_percent set to 0.0")
+        # Drift from a zero baseline is undefined; NaN is honest, 0 is not.
+        drift_percent = float("nan")
+        logger.warning("Initial power ~0; drift_percent is undefined (NaN).")
 
     if n > 1:
-        total_energy_j = float(trapezoid(np.abs(power_w), t))
+        # Net generated energy: signed integral of P_gen. Intervals where the
+        # cell consumes power subtract from the total, as physics requires.
+        total_energy_j = float(trapezoid(power_w, t))
     else:
         total_energy_j = 0.0
 

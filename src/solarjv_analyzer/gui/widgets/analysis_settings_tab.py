@@ -55,6 +55,15 @@ class AnalysisSettingsTab(QtWidgets.QWidget):
         self.probe_spacing = QtWidgets.QLineEdit("2290")
         self.spacing_unit = QtWidgets.QComboBox()
         self.spacing_unit.addItems(["μm", "mm", "cm"])
+        # Provenance only. Rsq is derived from the J-V curve
+        # (rho = Rsh*A/t, Rsq = rho/t * lateral_factor) — there is no
+        # 4-point-probe measurement here, so spacing has no slot in the math.
+        # It IS written to the report's EXPERIMENTAL PARAMETERS block by
+        # pymeasure, which is what it is for: recording the rig geometry
+        # alongside the measurement.
+        self.probe_spacing.setToolTip(
+            "Recorded in the report for provenance.\n"
+            "Not used in any computed metric — Rsq comes from the J-V curve.")
         layout.addRow("4-Probe Spacing:", self._row(self.probe_spacing, self.spacing_unit))
 
         # Sample Thickness
