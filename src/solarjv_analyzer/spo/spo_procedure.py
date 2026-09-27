@@ -74,6 +74,18 @@ class SpoProcedure(JVProcedure):
         self._write(":SOUR:VOLT:MODE FIX", "Fixed voltage mode")
         self._write(f":SOUR:VOLT {float(self.hold_voltage)}", "Hold voltage")
         self._write(":SENS:FUNC 'CURR'", "Measure current")
+
+        # Sense mode, which `*RST` above has just reset to 2-wire. Without
+        # this the SPO hold ran 2-wire no matter what the operator selected,
+        # while the J-V sweep that CHOSE the hold voltage ran 4-wire — so the
+        # voltage was determined with the leads compensated and then applied
+        # with them in circuit. In 2-wire the cell sees the commanded voltage
+        # minus I·R_lead, so the hold sits off the maximum power point by an
+        # amount that grows with current, and the recorded power is wrong in
+        # the same direction for the whole measurement.
+        sense_cmd = ":SYST:RSEN ON" if self.sense_mode == "4-wire" else ":SYST:RSEN OFF"
+        self._write(sense_cmd, f"Sense mode: {self.sense_mode}")
+
         self._write(f":SENS:CURR:PROT {self.compliance_current}", "Compliance")
         self._write(f":SENS:CURR:NPLC {float(self.nplc):.3f}", "NPLC")
         self._write(":SENS:CURR:RANG:AUTO ON", "Auto range")
@@ -132,7 +144,7 @@ class SpoProcedure(JVProcedure):
             else:
                 # DirectoryManager is a process-wide singleton — update it via
                 # its setters and restore the previous mode afterward to avoid
-                # side-effects on the JV file panel's "Main" directory display.
+                # side-effects on the JV file panel's "JV" directory display.
                 dir_manager = DirectoryManager()
                 previous_mode = dir_manager.mode
                 dir_manager.set_username(self.username)

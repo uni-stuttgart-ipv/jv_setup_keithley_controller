@@ -21,7 +21,31 @@ ANALYSIS_LABELS_UNITS = [
     ("Rsq","Ohm/sq"),
     ("A","cm2"),
     ("Incd. Pwr","mW/cm2"),
+    # The quadrant the cell actually generated in, as MEASURED. Reported as a
+    # fact rather than judged against the declared architecture: which quadrant
+    # a p-i-n device lands in depends on how it is contacted, and this lab
+    # currently swaps the wires by hand, so no fixed expectation is safe to
+    # hardcode. Shown on the row and in the report so a miswired cell is
+    # visible at a glance instead of only in a log line.
+    ("Quadrant",""),
 ]
+
+
+def _quadrant_label(v_pmax, architecture, polarity_ok) -> str:
+    """The measured generating quadrant, marked when it contradicts the label.
+
+    Shown as a metric so a mis-declared or miswired cell is visible on its own
+    row and in the report — a warning in the log is missed by exactly the
+    person who needs it. `Q4 != p-i-n` reads as "this cell generated in Q4 but
+    you told me it was p-i-n": the numbers are still valid for whatever was
+    actually on the stage, but one of the two statements is wrong.
+    """
+    if not np.isfinite(v_pmax) or v_pmax == 0:
+        return "--"
+    quadrant = "Q4" if v_pmax > 0 else "Q2"
+    if architecture in ("p-i-n", "n-i-p") and not polarity_ok:
+        return f"{quadrant} != {architecture}"
+    return quadrant
 
 
 def compute_jv_metrics(
@@ -371,6 +395,7 @@ def compute_jv_metrics(
         "Incd. Pwr": float(pin_mw_cm2),
         "contact_ok": contact_ok,
         "polarity_ok": polarity_ok,
+        "Quadrant": _quadrant_label(v_pmax, architecture, polarity_ok),
     }
 
     # A failed contact invalidates every derived metric — report them as NaN

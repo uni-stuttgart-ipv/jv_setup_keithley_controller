@@ -26,6 +26,9 @@ _INDICATOR_HEIGHT = 14
 _INDICATOR_WIDTH = 5
 
 
+from solarjv_analyzer.gui.theme import tokens as _t
+
+
 class AnalysisPanel(QtWidgets.QWidget):
     """
     Horizontal matrix panel displaying analysis metrics for all measured channels.
@@ -34,15 +37,11 @@ class AnalysisPanel(QtWidgets.QWidget):
         row_selected(int, str): channel number and direction when a row is clicked.
     """
 
-    # Vibrant channel accent colours — kept in sync with AppController.CHANNEL_COLORS.
-    CHANNEL_COLORS = {
-        1: COLOR_ACCENT_BLUE,   # "#053a46"
-        2: COLOR_ACCENT_GREEN,  # "#10b981"
-        3: COLOR_ACCENT_RED,    # "#ef4444"
-        4: "#8b5cf6",           # Violet
-        5: "#f59e0b",           # Amber
-        6: "#ec4899",           # Pink
-    }
+    # The plot palette itself, not a copy of it. A row's colour chip has one
+    # job — telling the operator which curve this row describes — so it reads
+    # from the same definition the pens are built from.
+    CHANNEL_COLORS = dict(_t.CHANNEL_COLORS)
+    CHANNEL_COLOR_FALLBACK = _t.CHANNEL_COLOR_FALLBACK
 
     DEFAULT_LABELS_UNITS = [
         ("EFF", "%"),
@@ -69,6 +68,14 @@ class AnalysisPanel(QtWidgets.QWidget):
     row_selected = QtCore.pyqtSignal(int, str)
     """Emitted when the user clicks any cell in a row: (channel, direction)."""
 
+    curve_visibility_changed = QtCore.pyqtSignal(int, str, bool)
+    """Emitted when a row's checkbox is toggled: (channel, direction, visible).
+
+    The panel does not touch the plot itself — it owns a table, not a canvas.
+    The window listens and shows or hides the matching curve, which keeps the
+    single source of truth for what is plotted in one place.
+    """
+
     # -------------------------------------------------------------------
     # Construction
     # -------------------------------------------------------------------
@@ -89,6 +96,10 @@ class AnalysisPanel(QtWidgets.QWidget):
         self._labels_units: List[Tuple[str, str]] = []
         self._col_map: Dict[str, int] = {}  # label → column index
         self._row_map: Dict[Tuple[int, str], int] = {}  # (ch, dir) → row index
+        # (ch, dir) → is its curve shown. Survives reset_channels(), so a
+        # channel the operator hid stays hidden when a later run rebuilds the
+        # table rather than silently reappearing.
+        self._visible: Dict[Tuple[int, str], bool] = {}
         self._single_sweep_mode = False
 
         # --- Placeholder (page 0 of stack) ----------------------------------
@@ -140,6 +151,11 @@ class AnalysisPanel(QtWidgets.QWidget):
 
         self._table.cellClicked.connect(self._on_cell_clicked)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
+        # itemChanged also fires while rows are being built, which would emit
+        # a visibility change for every channel on every rebuild. _populating
+        # suppresses that.
+        self._populating = False
+        self._table.itemChanged.connect(self._on_item_changed)
 
         # --- QStackedWidget switches between placeholder and table ----------
         self._stack = QtWidgets.QStackedWidget()
@@ -170,6 +186,7 @@ class AnalysisPanel(QtWidgets.QWidget):
         metric column definitions.
         """
         self._labels_units = labels_units or self.DEFAULT_LABELS_UNITS
+        self._populating = True
 
         # ---- column map ----------------------------------------------------
         self._col_map.clear()
@@ -203,8 +220,16 @@ class AnalysisPanel(QtWidgets.QWidget):
             label_item = QtWidgets.QTableWidgetItem(label_text)
             label_item.setFlags(
                 QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable
+                | QtCore.Qt.ItemIsUserCheckable
             )
             label_item.setData(QtCore.Qt.UserRole, (ch, direction))
+            # Checked by default: a freshly loaded or measured curve is
+            # visible, and unchecking is the deliberate act.
+            label_item.setCheckState(
+                QtCore.Qt.Checked
+                if self._visible.get((ch, direction), True)
+                else QtCore.Qt.Unchecked
+            )
 
             hex_colour = self.CHANNEL_COLORS.get(ch)
             if hex_colour:
@@ -249,6 +274,7 @@ class AnalysisPanel(QtWidgets.QWidget):
         if self._table.columnWidth(0) < min_label:
             self._table.setColumnWidth(0, min_label)
 
+        self._populating = False
         self._update_stack_page()
 
     def analysis(self, data: Dict) -> None:
@@ -341,6 +367,46 @@ class AnalysisPanel(QtWidgets.QWidget):
         ch, direction = item.data(QtCore.Qt.UserRole)
         self.row_selected.emit(ch, direction)
 
+    def _on_item_changed(self, item) -> None:
+        """Turn a checkbox toggle into ``curve_visibility_changed``."""
+        if self._populating or item.column() != 0:
+            return
+        key = item.data(QtCore.Qt.UserRole)
+        if not key:
+            return
+        ch, direction = key
+        visible = item.checkState() == QtCore.Qt.Checked
+        if self._visible.get((ch, direction), True) == visible:
+            return                      # nothing actually changed
+        self._visible[(ch, direction)] = visible
+        self.curve_visibility_changed.emit(ch, direction, visible)
+
+    def is_curve_visible(self, channel: int, direction: str) -> bool:
+        """Whether the row for *channel* / *direction* is currently ticked."""
+        return self._visible.get((channel, direction), True)
+
+    def set_curve_visible(
+        self, channel: int, direction: str, visible: bool
+    ) -> None:
+        """Tick or untick a row without re-emitting the change.
+
+        For keeping this panel in step with the experiment browser's own
+        checkbox, so toggling either one does not fight the other.
+        """
+        row = self._row_map.get((channel, direction))
+        if row is None:
+            return
+        item = self._table.item(row, 0)
+        if item is None:
+            return
+        self._visible[(channel, direction)] = visible
+        previous, self._populating = self._populating, True
+        try:
+            item.setCheckState(
+                QtCore.Qt.Checked if visible else QtCore.Qt.Unchecked)
+        finally:
+            self._populating = previous
+
     def _on_selection_changed(self) -> None:
         """Dynamically colour the selection highlight to match the channel."""
         rows = self._table.selectionModel().selectedRows()
@@ -353,7 +419,7 @@ class AnalysisPanel(QtWidgets.QWidget):
             self._table.setStyleSheet(self._base_stylesheet)
             return
         ch, _direction = item.data(QtCore.Qt.UserRole)
-        hex_colour = self.CHANNEL_COLORS.get(ch, "#053a46")
+        hex_colour = self.CHANNEL_COLORS.get(ch, self.CHANNEL_COLOR_FALLBACK)
         self._table.setStyleSheet(
             self._base_stylesheet
             + f" QTableWidget::item:selected {{"

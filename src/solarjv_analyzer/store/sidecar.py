@@ -24,12 +24,13 @@ off" and never to a broken application: every step is guarded and logged.
 
 import logging
 import os
+import time
 
 from PyQt5 import QtCore, QtWidgets
 
 from solarjv_analyzer import config
 from . import paths, sweeper
-from .identity import windows_user
+from .identity import active_user
 
 logger = logging.getLogger(__name__)
 
@@ -215,9 +216,9 @@ class StoreSidecar(QtCore.QObject):
         if self._status_label is None:
             return
         try:
-            user = windows_user()
+            user = active_user()
         except RuntimeError:
-            user = "?"
+            user = "?"          # shown until the operator signs in
         destination = paths.destination_dir(user, paths.store_date(), "…")
         text = f"Saved to  {destination}"
         second = sweeper.extra_target()
@@ -235,6 +236,108 @@ class StoreSidecar(QtCore.QObject):
             self._timer.stop()
         if self._thread is not None and self._thread.isRunning():
             self._thread.wait(5000)
+
+
+def outstanding_count(staging: str = None) -> int:
+    """Everything still in staging, settled or not.
+
+    `pending_count()` deliberately counts only files that have been quiet for
+    `STORE_QUIET_SECONDS`, because that is what the sweeper is willing to
+    publish on this tick. For "is it safe to close?" that is the wrong
+    question: a file written one second ago is not pending yet but is very
+    much outstanding. Passing `quiet_seconds=0` counts it.
+    """
+    try:
+        return len(sweeper.find_finished(staging, quiet_seconds=0))
+    except Exception as exc:                          # noqa: BLE001
+        logger.debug(f"Could not count staged files: {exc}")
+        return 0
+
+
+def flush_before_exit(parent=None, timeout_s: float = 60.0) -> bool:
+    """Publish everything staged before this session ends.
+
+    The store folder is named after the SIGNED-IN OPERATOR, so a file left in
+    staging when they log out or close the app would be published later under
+    whoever signs in next — their work, someone else's folder, on a share that
+    refuses deletions. Rather than documenting that as a limitation, hold the
+    exit until staging is empty.
+
+    Waits for files that are still being written, since the sweeper will not
+    touch a file until it has been quiet for `STORE_QUIET_SECONDS`; the
+    timeout is therefore comfortably longer than that.
+
+    Returns:
+        bool: True when it is safe to proceed — either everything published,
+            or the operator explicitly chose to leave files behind.
+    """
+    if not is_enabled():
+        return True
+    outstanding = outstanding_count()
+    if not outstanding:
+        return True
+
+    logger.info(f"Publishing {outstanding} staged file(s) before exit…")
+    progress = QtWidgets.QProgressDialog(
+        f"Saving {outstanding} file(s) to the store…\n\n"
+        "This finishes writing your results to S: so they are filed under "
+        "your name.",
+        "Leave them for later", 0, 0, parent)
+    progress.setWindowTitle("Finishing up")
+    progress.setWindowModality(QtCore.Qt.ApplicationModal)
+    progress.setMinimumDuration(0)
+    progress.show()
+    QtWidgets.QApplication.processEvents()
+
+    deadline = time.monotonic() + max(1.0, float(timeout_s))
+    try:
+        while time.monotonic() < deadline:
+            if progress.wasCanceled():
+                return _confirm_leaving_files(parent, outstanding_count())
+            try:
+                sweeper.sweep()
+            except Exception as exc:                  # noqa: BLE001
+                logger.warning(f"Publish attempt failed: {exc}")
+            remaining = outstanding_count()
+            if not remaining:
+                logger.info("Store is in sync; safe to exit.")
+                return True
+            progress.setLabelText(
+                f"Saving {remaining} file(s) to the store…\n\n"
+                "Waiting for files still being written.")
+            QtWidgets.QApplication.processEvents()
+            time.sleep(0.5)
+    finally:
+        progress.close()
+
+    # Timed out — almost always the share being unreachable. Never trap the
+    # operator in a dialog they cannot satisfy; tell them what is at stake and
+    # let them decide.
+    return _confirm_leaving_files(parent, outstanding_count(), timed_out=True)
+
+
+def _confirm_leaving_files(parent, remaining: int, timed_out: bool = False) -> bool:
+    """Ask whether to exit with files still unpublished."""
+    if not remaining:
+        return True
+    reason = ("The store could not be reached in time."
+              if timed_out else "Publishing was cancelled.")
+    answer = QtWidgets.QMessageBox.warning(
+        parent, "Files not yet saved to the store",
+        f"{reason}\n\n"
+        f"{remaining} file(s) are still waiting to be copied to S:.\n\n"
+        "They are safe on this computer and will be published later — but "
+        "they will then be filed under whoever is signed in at that time, "
+        "not under your name.\n\n"
+        "Leave them and continue?",
+        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        QtWidgets.QMessageBox.No,
+    )
+    proceed = answer == QtWidgets.QMessageBox.Yes
+    logger.warning(
+        "Exiting with %d unpublished file(s): operator chose %s.",
+        remaining, "to continue" if proceed else "to stay")
+    return proceed
 
 
 def attach(window) -> bool:

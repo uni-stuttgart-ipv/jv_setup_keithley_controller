@@ -99,37 +99,55 @@ class FilePanel(QtWidgets.QGroupBox):
 
     def _on_browse_clicked(self):
         """Open folder dialog to select output directory."""
-        start_dir = self.directory_input.text().strip() or os.getcwd()
+        # Start where the reports are, not in the staging path shown in the
+        # field (and never in os.getcwd(), which for an installed app is
+        # wherever the shortcut happened to point).
+        start_dir = ""
+        getter = self.dialog_start_dir_getter
+        if callable(getter):
+            try:
+                start_dir = getter() or ""
+            except Exception:
+                start_dir = ""
+        if not start_dir:
+            start_dir = self.directory_input.text().strip() or os.path.expanduser("~")
         selected = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Select Output Folder", start_dir
         )
         if selected:
             self.directory_input.setText(selected)
 
-    def _on_open_clicked(self):
-        """Open the selected directory in file explorer."""
-        directory = self.directory_input.text().strip()
+    # Set by the window to `DirectoryManager.store_destination`. The field
+    # above shows the STAGING path — where files are written before the
+    # publisher moves them — so opening it sent the operator to a folder that
+    # empties itself. This asks where the finished reports actually are.
+    store_destination_getter = None
 
+    # Set by the window to `DirectoryManager.dialog_start_dir`, so Browse
+    # opens where the reports are rather than in the staging folder.
+    dialog_start_dir_getter = None
+
+    def _on_open_clicked(self):
+        """Open the folder the finished reports are in."""
+        from solarjv_analyzer.utils.directory_manager import open_folder
+
+        getter = self.store_destination_getter
+        if callable(getter):
+            try:
+                destination = getter()
+            except Exception:
+                destination = ""
+            if destination:
+                open_folder(destination, self)
+                return
+
+        directory = self.directory_input.text().strip()
         if not directory:
             QtWidgets.QMessageBox.warning(
                 self, "No Directory", "Please select a directory first."
             )
             return
-
-        if not os.path.exists(directory):
-            QtWidgets.QMessageBox.warning(
-                self, "Directory Not Found",
-                f"The directory does not exist:\n{directory}"
-            )
-            return
-
-        # Open directory in system file explorer
-        if sys.platform == "win32":
-            os.startfile(directory)
-        elif sys.platform == "darwin":  # macOS
-            subprocess.run(["open", directory])
-        else:  # Linux
-            subprocess.run(["xdg-open", directory])
+        open_folder(directory, self)
 
     # -------------------------------------------------------------------------
     # Parameter Retrieval

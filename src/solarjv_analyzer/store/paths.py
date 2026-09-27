@@ -22,7 +22,13 @@ from datetime import datetime
 
 from solarjv_analyzer import config
 
-MODES = ("Calibration", "Main", "SPO")
+MODES = ("Calibration", "JV", "SPO")
+
+# The J-V mode folder used to be called "Main". Files staged by an older build
+# — or sitting in staging across an upgrade — must still publish somewhere
+# sensible, so the old name is recognised on READ and mapped to the new one.
+# Nothing writes "Main" any more; folders already on the store keep their name.
+LEGACY_MODES = {"Main": "JV"}
 LOGS_MODE = "Logs"           # session logs have no measurement mode of their own
 
 STORE_DATE_FMT = "%Y-%m-%d"
@@ -89,7 +95,7 @@ def classify_staged(path: str, root: str = None) -> tuple:
     """Work out where a staged file belongs in the store.
 
     Returns (date_str, mode). Falls back to the file's own modification date
-    and `Main` when the staging path does not have the expected shape, so an
+    and `JV` when the staging path does not have the expected shape, so an
     unexpected layout still publishes to a sane place rather than being
     skipped.
     """
@@ -100,7 +106,11 @@ def classify_staged(path: str, root: str = None) -> tuple:
         rel = os.path.basename(path)
     parts = [p for p in rel.replace("\\", "/").split("/") if p][:-1]  # drop filename
 
-    mode = next((p for p in reversed(parts) if p in MODES), "Main")
+    mode = next(
+        (LEGACY_MODES.get(p, p) for p in reversed(parts)
+         if p in MODES or p in LEGACY_MODES),
+        "JV",
+    )
 
     date_str = ""
     for part in parts:

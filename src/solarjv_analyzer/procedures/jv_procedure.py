@@ -390,10 +390,13 @@ class JVProcedure(Procedure):
         step_v = self._expected_voltages[1] - self._expected_voltages[0]
 
         self._write(":SOUR:FUNC VOLT", "Source function")
-        self._write(":SOUR:VOLT:MODE SWE", "Sweep mode")
+        # Manual Table 10-4, footnote 1: the sweep MODE command "should
+        # normally be sent after START, STOP, and STEP to avoid delays caused
+        # by rebuilding sweep when each command is sent."
         self._write(f":SOUR:VOLT:STAR {start_v}", "Start voltage")
         self._write(f":SOUR:VOLT:STOP {stop_v}", "Stop voltage")
         self._write(f":SOUR:VOLT:STEP {step_v}", "Step size")
+        self._write(":SOUR:VOLT:MODE SWE", "Sweep mode")
         self._check_errors("After source config")
 
         # Configure measurement

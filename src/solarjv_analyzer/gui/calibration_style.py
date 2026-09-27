@@ -121,7 +121,10 @@ def calibration_stylesheet() -> str:
     }}
     QLabel#MiniLabel {{
         font-family: '{mono}';
-        font-size: 10px;
+        /* The MAX / MIN / Target readouts under the measurement card are the
+           numbers the operator compares against while standing at the rig,
+           not fine print — 10px was unreadable at arm's length. */
+        font-size: 13px;
         font-weight: 600;
         color: {SECONDARY};
     }}

@@ -2,16 +2,78 @@
 Directory Manager for Output File Storage
 
 Manages user preferences for output directory location across the application.
-Structure: Base/Username/Date/Calibration/ and Base/Username/Date/Main/
+Structure: Base/Username/Date/{Calibration,JV,SPO}/
 """
 
 import json
+import logging
 import os
 import subprocess
 import sys
 from datetime import datetime
 
 from PyQt5 import QtWidgets, QtCore
+
+logger = logging.getLogger(__name__)
+
+
+MODE_FOLDERS = ("Calibration", "JV", "SPO")
+
+
+def ensure_day_folders(username: str = None) -> list:
+    """Create today's Calibration / JV / SPO folders once, at startup.
+
+    Called when the application opens so the day's folders exist before anyone
+    goes looking for them: Open Folder then always lands somewhere real, and
+    the operator can browse to the right place from Explorer without having to
+    run a measurement first to bring the folder into being.
+
+    Idempotent by construction — `exist_ok=True` means an existing folder is
+    left completely untouched, so nothing is overwritten and a second launch
+    on the same day does nothing at all.
+
+    Creates them on the store (the folders people actually browse) when
+    publishing is enabled, and locally otherwise. Never raises: a disconnected
+    share must not stop the application from starting.
+
+    Returns:
+        list: the folders that were created or already present.
+    """
+    created = []
+    try:
+        from solarjv_analyzer import store
+        if store.is_enabled():
+            user, date_str = store.active_user(), store.store_date()
+            for mode in MODE_FOLDERS:
+                path = store.destination_dir(user, date_str, mode)
+                try:
+                    os.makedirs(path, exist_ok=True)
+                    created.append(path)
+                except OSError as exc:
+                    logger.warning(f"Could not create {path}: {exc}")
+            if created:
+                logger.info(
+                    f"Store folders ready for {date_str}: "
+                    f"{', '.join(MODE_FOLDERS)}")
+            return created
+    except Exception as exc:
+        logger.debug(f"Store folder preparation skipped: {exc}")
+
+    if not username:
+        return created
+    try:
+        from solarjv_analyzer.config import RESULTS_ROOT
+        date_str = datetime.now().strftime("%d-%m-%Y")
+        for mode in MODE_FOLDERS:
+            path = os.path.join(RESULTS_ROOT, username, date_str, mode)
+            try:
+                os.makedirs(path, exist_ok=True)
+                created.append(path)
+            except OSError as exc:
+                logger.warning(f"Could not create {path}: {exc}")
+    except Exception as exc:
+        logger.debug(f"Local folder preparation skipped: {exc}")
+    return created
 
 
 class DirectoryManager:
@@ -22,7 +84,7 @@ class DirectoryManager:
     - Directory selection widget for UI integration
     - Save/load directory preference to config file
     - Open folder in file explorer
-    - User-based folder structure: base_dir/username/date/{Calibration|Main}/
+    - User-based folder structure: base_dir/username/date/{Calibration|JV|SPO}/
     """
 
     _instance = None
@@ -33,14 +95,14 @@ class DirectoryManager:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, username=None, parent=None, mode="Main"):
+    def __init__(self, username=None, parent=None, mode="JV"):
         """
         Initialize the directory manager.
 
         Args:
             username: Logged-in username
             parent: Parent widget
-            mode: 'Calibration' or 'Main' - determines which subfolder to use
+            mode: 'Calibration', 'JV' or 'SPO' - which subfolder to use
         """
         if hasattr(self, '_initialized'):
             return
@@ -48,7 +110,7 @@ class DirectoryManager:
 
         self.parent = parent
         self.username = username
-        self.mode = mode  # 'Calibration' or 'Main'
+        self.mode = mode  # 'Calibration', 'JV' or 'SPO'
         self.directory_input = None
         self.browse_button = None
         self.open_button = None
@@ -56,7 +118,7 @@ class DirectoryManager:
         self._base_root = None
 
     def set_mode(self, mode):
-        """Set the mode ('Calibration' or 'Main')."""
+        """Set the mode ('Calibration', 'JV' or 'SPO')."""
         self.mode = mode
         self._update_display_directory()
 
@@ -119,7 +181,7 @@ class DirectoryManager:
 
     def get_main_dir(self, create=False):
         """Get directory for main measurement data."""
-        return self._get_dated_dir(create) if self.mode == "Main" else None
+        return self._get_dated_dir(create) if self.mode == "JV" else None
 
     def get_timestamp_filename(self, prefix="measurement", extension=".csv"):
         """Generate ISO timestamp filename."""
@@ -170,6 +232,10 @@ class DirectoryManager:
         Get the directory to display in the input field.
         This is the full path including username and mode.
         """
+        destination = self.store_destination()
+        if destination:
+            return destination
+
         base = self.get_user_selected_base()
         if not base:
             base = self.get_base_root()
@@ -236,7 +302,11 @@ class DirectoryManager:
             base = self.get_user_selected_base()
             if not base:
                 base = self.get_base_root()
-            hint = f"Files will be saved in: {base}/{self.username}/[Date]/{self.mode}/"
+            destination = self.store_destination()
+            if destination:
+                hint = f"Reports are saved to: {destination}"
+            else:
+                hint = f"Files will be saved in: {base}/{self.username}/[Date]/{self.mode}/"
             self.hint_label.setText(hint)
 
     def get_display_directory(self):
@@ -253,18 +323,72 @@ class DirectoryManager:
             self.save_preference(base_directory)
             self._update_display_directory()
 
+    def store_destination(self) -> str:
+        """Where finished reports actually end up, or "" when publishing is off.
+
+        The local directory is STAGING: `store.attach()` repoints the base root
+        at it, and the publisher then copies each finished report to the
+        protected store and removes the local copy. So the path the operator
+        needs — the one that still has their file in it an hour later — is the
+        store path, not the working directory. Opening staging sent people to
+        a folder that empties itself.
+
+        Resolved fresh each call: the date rolls over at midnight, and a
+        session left open overnight must not keep pointing at yesterday.
+        """
+        try:
+            from solarjv_analyzer import store
+            if not store.is_enabled():
+                return ""
+            return store.destination_dir(
+                store.active_user(), store.store_date(), self.mode)
+        except Exception:
+            # Never let the store break plain local operation.
+            return ""
+
+    def dialog_start_dir(self, mode: str = None) -> str:
+        """Where a file dialog should open: the store, else the local folder.
+
+        Every open/save/browse dialog in the application starts here, so the
+        operator always lands where the reports actually are rather than in
+        the staging folder they pass through — or, worse, in whatever
+        directory Qt happened to remember.
+
+        Falls back through local -> home so a dialog always opens somewhere
+        real, even with the share disconnected.
+        """
+        previous = self.mode
+        try:
+            if mode:
+                self.mode = mode
+            for candidate in (self.store_destination(),
+                              self.get_current_directory(create=False),
+                              self.get_base_root()):
+                if candidate and os.path.isdir(candidate):
+                    return candidate
+        except Exception as exc:                      # noqa: BLE001
+            logger.debug(f"Could not resolve a dialog start directory: {exc}")
+        finally:
+            self.mode = previous
+        return os.path.expanduser("~")
+
     def _on_browse(self):
         """Open folder dialog to select base output directory."""
-        current_base = self.get_user_selected_base() or self.get_base_root()
         selected = QtWidgets.QFileDialog.getExistingDirectory(
-            self.parent, "Select Base Output Directory", current_base
+            self.parent, "Select Base Output Directory",
+            self.dialog_start_dir()
         )
         if selected:
             self.save_preference(selected)
             self._update_display_directory()
 
     def _on_open(self):
-        """Open the current full directory in file explorer."""
+        """Open the folder the finished reports are in."""
+        destination = self.store_destination()
+        if destination:
+            self._open_path(destination)
+            return
+
         directory = self.get_current_directory(create=False)
         if not directory or not os.path.exists(directory):
             # Try to create it
@@ -277,9 +401,54 @@ class DirectoryManager:
             )
             return
 
+        self._open_path(directory)
+
+    def _open_path(self, path: str):
+        """Instance shim for the module-level :func:`open_folder`."""
+        open_folder(path, self.parent)
+
+
+def open_folder(path: str, parent=None):
+    """Open `path`, creating it or falling back to its nearest existing parent.
+
+    The dated store folder does not exist until the day's first report is
+    published, and the share allows creation — so make it rather than
+    refusing. If even that fails (share offline) walk up to something that
+    does exist, which is more use to the operator than an error box.
+
+    `parent` is the Qt widget to parent the warning dialog to.
+    """
+    if not path:
+        return
+    if not os.path.isdir(path):
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            pass
+
+    target = path
+    while target and not os.path.isdir(target):
+        # NB: not `parent` — that name is the Qt widget argument.
+        above = os.path.dirname(target)
+        if above == target:
+            target = ""
+            break
+        target = above
+
+    if not target:
+        QtWidgets.QMessageBox.warning(
+            parent, "Folder Unavailable",
+            f"Cannot open {path}.\n\nThe share may be disconnected. "
+            "Reports are still saved and will be published when it returns."
+        )
+        return
+
+    try:
         if sys.platform == "win32":
-            os.startfile(directory)
+            os.startfile(target)
         elif sys.platform == "darwin":
-            subprocess.run(["open", directory])
+            subprocess.run(["open", target])
         else:
-            subprocess.run(["xdg-open", directory])
+            subprocess.run(["xdg-open", target])
+    except Exception as exc:
+        logger.warning(f"Could not open {target}: {exc}")

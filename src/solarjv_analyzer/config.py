@@ -30,7 +30,7 @@ class _Config:
 
     # ---- Protected store (S drive) ------------------------------------
     # Finished reports are copied here, laid out as
-    #   <STORE_ROOT>\<windows user>\<yyyy-mm-dd>\<Calibration|Main|SPO>\
+    #   <STORE_ROOT>\<windows user>\<yyyy-mm-dd>\<Calibration|JV|SPO>\
     # The share allows create and read but refuses delete, so the app never
     # writes working files here — see STAGING_ROOT. Override at runtime with
     # SOLARJV_STORE_ROOT (used for rehearsals and by the test suite).

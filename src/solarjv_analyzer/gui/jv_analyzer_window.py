@@ -405,8 +405,8 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         )
 
         # Initialize directory manager FIRST (before UI)
-        self.dir_manager = DirectoryManager(username=self.username, parent=self, mode="Main")
-        self.dir_manager.set_mode("Main") 
+        self.dir_manager = DirectoryManager(username=self.username, parent=self, mode="JV")
+        self.dir_manager.set_mode("JV")
 
         self.setWindowTitle("Custom JV Analyzer")
         self.resize(1200, 720)
@@ -1242,6 +1242,8 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
             self.browser_widget.layout().setContentsMargins(0, 0, 0, 0)
 
         self.analysis_panel = AnalysisPanel(self)
+        self.analysis_panel.curve_visibility_changed.connect(
+            self.on_analysis_visibility_changed)
 
         # ---- Pill Tab Bar (centred via stylesheet) ---------------------------
         self.bottom_tab_bar = QtWidgets.QTabBar()
@@ -1334,10 +1336,10 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         """Create the file output panel with directory from manager."""
         self.file_panel = FilePanel()
 
-        self.dir_manager.set_mode("Main")
+        self.dir_manager.set_mode("JV")
         self.dir_manager.set_username(self.username)
 
-        # Set the directory to the full Main path
+        # Set the directory to the full JV path
         main_dir = self.dir_manager.get_current_directory(create=True)
         self.file_panel.set_directory(main_dir)
         return self.file_panel
@@ -1400,6 +1402,19 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         measurement, turn off Keithley output, and disconnect instruments
         before the process exits."""
         logger.info("Window close requested — performing safety shutdown.")
+
+        # Get this operator's results onto the store BEFORE anything is torn
+        # down. The store folder is named after the signed-in user, so a file
+        # left in staging would later be filed under whoever signs in next.
+        # The operator can decline, in which case the close is cancelled.
+        try:
+            from solarjv_analyzer import store
+            if not store.flush_before_exit(self):
+                logger.info("Close cancelled — files still to be published.")
+                event.ignore()
+                return
+        except Exception as exc:                      # noqa: BLE001
+            logger.warning(f"Could not flush the store before closing: {exc}")
 
         # Stop feeding the log page first. A worker thread that logs during the
         # shutdown below would otherwise emit into a half-destroyed widget
@@ -1603,6 +1618,10 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         # Force the entire sidebar to recalculate heights based on the
         # newly visible page. Without this, Qt keeps the old page's geometry.
         self._relayout_sidebar()
+        # The visible run control just changed — repaint it so a
+        # paused queue still shows Resume after switching view.
+        if getattr(self, 'controller', None) is not None:
+            self.controller._apply_run_control()
 
     def _relayout_sidebar(self):
         """Force the entire sidebar layout chain to recalculate heights
@@ -1643,10 +1662,21 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         return True
 
     def _jv_is_busy(self) -> bool:
-        """True if a JV experiment is currently queued or running."""
-        return bool(getattr(self.controller, 'is_busy', False)) and not getattr(
-            self.controller, 'spo_running', False
-        )
+        """True while a J-V sweep is actually RUNNING.
+
+        Deliberately not "is_busy": a PAUSED queue also sets that flag, and
+        blocking the mode toggle on it trapped the operator on whichever tab
+        they aborted from — the very moment they most want to go somewhere
+        else. Nothing is driving the instruments while paused, so switching
+        view is safe; the run control repaints itself for the new view.
+        """
+        if getattr(self.controller, 'spo_running', False):
+            return False
+        manager = getattr(self.controller, 'manager', None)
+        try:
+            return bool(manager is not None and manager.is_running())
+        except Exception:                         # noqa: BLE001
+            return bool(getattr(self.controller, 'is_busy', False))
 
     def _on_mode_button_clicked(self, button):
         """Handle JV Sweep / SPO mode toggle button clicks.
@@ -1703,6 +1733,10 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.spo_widget.set_mode_spo()
         self.spo_widget.set_filename(self.file_panel.filename_input.text())
         self._relayout_sidebar()
+        # The visible run control just changed — repaint it so a
+        # paused queue still shows Resume after switching view.
+        if getattr(self, 'controller', None) is not None:
+            self.controller._apply_run_control()
 
     def _show_jv_mode(self):
         """Show the JV plot/browser/analysis views and hide the SPO view."""
@@ -1718,6 +1752,10 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self._update_save_directory()
         self._on_filename_changed(self.file_panel.filename_input.text())
         self._relayout_sidebar()
+        # The visible run control just changed — repaint it so a
+        # paused queue still shows Resume after switching view.
+        if getattr(self, 'controller', None) is not None:
+            self.controller._apply_run_control()
 
     def _set_file_panel_spo_mode(self, spo_mode: bool):
         """Adapt the File Panel for SPO mode: only the single-file checkbox
@@ -1912,10 +1950,14 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         """Update save directory using directory manager."""
         main_dir = self.dir_manager.get_current_directory(create=True)
         self.file_panel.set_directory(main_dir)
+        # Open Folder follows the dir_manager's CURRENT mode, so it lands in
+        # JV or SPO on the store to match whichever view is active.
+        self.file_panel.store_destination_getter = self.dir_manager.store_destination
+        self.file_panel.dialog_start_dir_getter = self.dir_manager.dialog_start_dir
 
     def _update_spo_save_directory(self):
         """Show the SPO output directory in the file panel while SPO mode
-        is active. The directory manager mode is restored to "Main"
+        is active. The directory manager mode is restored to "JV"
         immediately afterward by the shared singleton's own bookkeeping in
         SpoProcedure, so we just need to reflect the right path here."""
         previous_mode = self.dir_manager.mode
@@ -1927,6 +1969,20 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
             # directory lookup raises (e.g. unreachable network base dir).
             self.dir_manager.set_mode(previous_mode)
         self.file_panel.set_directory(spo_dir)
+        # Open Folder must follow the view, not the singleton's restored mode:
+        # the mode is put back to JV above, so a plain `store_destination`
+        # reference would send the operator to the JV folder while they are
+        # looking at SPO.
+        self.file_panel.store_destination_getter = self._spo_store_destination
+
+    def _spo_store_destination(self) -> str:
+        """The SPO folder on the store, regardless of the singleton's mode."""
+        previous_mode = self.dir_manager.mode
+        try:
+            self.dir_manager.set_mode("SPO")
+            return self.dir_manager.store_destination()
+        finally:
+            self.dir_manager.set_mode(previous_mode)
 
     # -------------------------------------------------------------------------
     # Instrument Status
@@ -1944,7 +2000,8 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
 
         # Create fresh badges for each loaded channel
         for ch in sorted(channels):
-            hex_colour = AnalysisPanel.CHANNEL_COLORS.get(ch, "#64748b")
+            hex_colour = AnalysisPanel.CHANNEL_COLORS.get(
+                ch, AnalysisPanel.CHANNEL_COLOR_FALLBACK)
             lbl = QtWidgets.QLabel(f" Ch {ch} ")
             lbl.setStyleSheet(
                 f"background-color: {hex_colour};"
@@ -1968,22 +2025,33 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
     def update_instrument_lights(self, status: dict = None):
         """Update status indicator colors based on connection state.
 
-        Reports LIVENESS, not `is not None`: a closed VISA session leaves the
-        attribute set, which used to show a green "connected" dot for an
-        instrument that could no longer be written to.
+        Reports whether the INSTRUMENT IS THERE — that is, whether its USB
+        adapter is still enumerated by Windows — not whether the application
+        currently holds a session open on it.
 
-        When the monitor supplies a `status`, that is used — it also knows
-        whether the USB adapter is still plugged in, which no handle can tell
-        us. Without one this falls back to the handle check alone, so a direct
-        call (e.g. right after a connect) still repaints sensibly.
+        The distinction matters at the end of a run. `_finalize_run()` closes
+        the VISA session to free the port, so a light driven by session
+        liveness went dark the moment a sweep finished, with the cable still
+        plugged in and the instrument still perfectly reachable. To the
+        operator that reads as "the Keithley just disconnected", which is both
+        alarming and false. Whether a session happens to be open is the
+        application's own bookkeeping and no business of the status light.
+
+        `keithley_present` / `mux_present` come from enumerating the serial
+        ports — a pure read, safe mid-sweep. The liveness check remains only
+        as a fallback for a direct call made before the monitor has ever run.
         """
         if status is None:
             status = getattr(self, '_hardware_status', None)
         if status:
-            k_connected = status.get('keithley_connected',
-                                     self.instrument_manager.is_keithley_alive())
-            m_connected = status.get('mux_connected',
-                                     self.instrument_manager.is_mux_alive())
+            k_connected = status.get(
+                'keithley_present',
+                status.get('keithley_connected',
+                           self.instrument_manager.is_keithley_alive()))
+            m_connected = status.get(
+                'mux_present',
+                status.get('mux_connected',
+                           self.instrument_manager.is_mux_alive()))
         else:
             k_connected = self.instrument_manager.is_keithley_alive()
             m_connected = self.instrument_manager.is_mux_alive()
@@ -2099,18 +2167,34 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
 
     def show_experiments(self):
-        """Show all experiment curves in the plot."""
-        root = self.browser_widget.browser.invisibleRootItem()
-        for i in range(root.childCount()):
-            root.child(i).setCheckState(0, QtCore.Qt.Checked)
-        self.analysis_panel.show()
+        """Tick every curve on, leaving the Channel Analysis table in place."""
+        self._set_all_experiments_visible(True)
 
     def hide_experiments(self):
-        """Hide all experiment curves in the plot."""
+        """Untick every curve, leaving the Channel Analysis table in place.
+
+        These buttons are about what is PLOTTED, not about the table. Hiding
+        the analysis panel outright took the metrics away too, so the operator
+        lost the numbers they were reading and had no checkbox left to switch
+        a single channel back on. Clearing the ticks is what "hide all" should
+        mean, and it leaves the way back visible.
+        """
+        self._set_all_experiments_visible(False)
+
+    def _set_all_experiments_visible(self, visible: bool) -> None:
+        """Set every browser tick, which cascades to the curves and the table.
+
+        `browser_item_changed` is connected to the browser's itemChanged, so
+        each write here toggles that experiment's curves and mirrors the state
+        onto the matching Channel Analysis row — one path, no second
+        implementation to drift.
+        """
+        state = QtCore.Qt.Checked if visible else QtCore.Qt.Unchecked
         root = self.browser_widget.browser.invisibleRootItem()
-        for i in range(root.childCount()):
-            root.child(i).setCheckState(0, QtCore.Qt.Unchecked)
-        self.analysis_panel.hide()
+        for index in range(root.childCount()):
+            root.child(index).setCheckState(0, state)
+        # The table itself always stays on screen.
+        self.analysis_panel.show()
 
     def clear_experiments(self):
         """Clear all experiments from the browser and analysis panel."""
@@ -2119,9 +2203,7 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
 
     def open_experiment(self):
         """Open saved result files."""
-        main_dir = self.dir_manager.get_current_directory(create=False)
-        if not main_dir or not os.path.exists(main_dir):
-            main_dir = os.path.expanduser("~")
+        main_dir = self.dir_manager.dialog_start_dir()
 
         dialog = QtWidgets.QFileDialog(self, "Open Results File", main_dir)
         dialog.setFileMode(QtWidgets.QFileDialog.ExistingFiles)
@@ -2135,12 +2217,145 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         if column == 0:
             experiment = self.controller.manager.experiments.with_browser_item(item)
             if experiment:
-                if item.checkState(0) == QtCore.Qt.Unchecked:
-                    for curve in experiment.curve_list:
-                        curve.wdg.remove(curve)
+                visible = item.checkState(0) != QtCore.Qt.Unchecked
+                self._set_experiment_curves_visible(experiment, visible)
+                # Keep the analysis panel's tick in step, so the two controls
+                # never disagree about what is on screen.
+                procedure = getattr(experiment, "procedure", None)
+                panel = getattr(self, "analysis_panel", None)
+                if procedure is not None and panel is not None:
+                    try:
+                        panel.set_curve_visible(
+                            int(procedure.active_channel),
+                            getattr(procedure, "sweep_direction", "Forward"),
+                            visible,
+                        )
+                    except (TypeError, ValueError):
+                        pass
+
+    @staticmethod
+    def _set_experiment_curves_visible(experiment, visible: bool) -> None:
+        """Add or remove every curve of `experiment` from its plot widget."""
+        for curve in experiment.curve_list:
+            try:
+                if visible:
+                    curve.wdg.load(curve)
                 else:
-                    for curve in experiment.curve_list:
-                        curve.wdg.load(curve)
+                    curve.wdg.remove(curve)
+            except Exception as exc:                  # noqa: BLE001
+                logger.debug(f"Could not toggle a curve: {exc}")
+
+    def active_run_controls(self):
+        """The start/run button pair that is ACTUALLY ON SCREEN right now.
+
+        Three views, three pairs, one button stack. `_set_run_control()` used
+        to write to `self.abort_button` unconditionally — but that widget lives
+        on the Advanced page, so in the JV+SPO view the controller was
+        relabelling a button nobody could see. That is why aborting mid-queue
+        from the combined tab never showed Resume: the state was right, the
+        paint went to the wrong widget.
+
+        Returns:
+            (start_button, run_button) — either may be None if the view has no
+            such control.
+        """
+        if self.in_combined_view():
+            return self.combined_run_button, self.combined_abort_button
+        # Advanced: the JV pair and the SPO pair swap by visibility.
+        if self.spo_mode_button.isChecked():
+            return self.spo_start_button, self.spo_abort_button
+        return self.queue_button, self.abort_button
+
+    def in_combined_view(self) -> bool:
+        """True when the JV+SPO (side-by-side) tab is the one on screen."""
+        try:
+            return self.sidebar_mode_tabs.currentIndex() == 0
+        except Exception:
+            return False
+
+    def load_spo_report_into_combined(self, path: str) -> bool:
+        """Draw a saved SPO report on the JV+SPO tab's own SPO panel.
+
+        The combined tab has its own Power-vs-Time canvas and its own metric
+        chips, separate from the Advanced SPO view. Opening a file from here
+        should fill THAT panel — throwing the operator over to Advanced would
+        move them away from the tab they were working in.
+
+        Note the units: this canvas is labelled mW and is fed mW during a live
+        run, while the Advanced SPO widget works in W. `parse_report` returns
+        W (already sign-corrected), so it is scaled here.
+        """
+        from solarjv_analyzer.spo.spo_widget import SpoWidget
+
+        try:
+            times, powers_w, metrics = SpoWidget.parse_report(path)
+        except (OSError, ValueError) as exc:
+            logger.debug(f"Not a loadable SPO report ({path}): {exc}")
+            return False
+
+        powers_mw = [p * 1000.0 for p in powers_w]
+        self.combined_spo_curve.setData(times, powers_mw)
+        self.combined_spo_plot.autoRange()
+
+        channel = metrics.get("channel")
+        self.combined_spo_channel.setText(
+            str(int(channel)) if isinstance(channel, (int, float)) else "—")
+        hold_v = metrics.get("hold_voltage_v")
+        self.combined_spo_hold.setText(
+            f"{hold_v * 1000.0:.0f} mV" if isinstance(hold_v, (int, float)) else "— mV")
+        self.combined_spo_mean.setText(
+            f"{metrics.get('mean_power_mw', 0.0):.2f} mW")
+        self.combined_spo_drift.setText(
+            f"{metrics.get('drift_percent', 0.0):.2f} %")
+        self.combined_spo_elapsed.setText(f"{times[-1]:.1f} s")
+
+        logger.info(
+            f"Loaded SPO report into the JV+SPO view: {path} "
+            f"({len(times)} points)")
+        return True
+
+    def on_analysis_visibility_changed(
+        self, channel: int, direction: str, visible: bool
+    ) -> None:
+        """Show or hide one channel's curve from the Channel Analysis table.
+
+        Matches on the experiment's own procedure rather than on row order:
+        the table is rebuilt whenever channels change, so an index would go
+        stale the moment a second run is queued.
+
+        Walks the browser's own items and resolves each to its experiment —
+        the pattern used everywhere else in this window — rather than
+        iterating the manager's queue directly.
+        """
+        browser = self.browser_widget.browser
+        root = browser.invisibleRootItem()
+        for index in range(root.childCount()):
+            item = root.child(index)
+            experiment = self.controller.manager.experiments.with_browser_item(item)
+            if experiment is None:
+                continue
+            procedure = getattr(experiment, "procedure", None)
+            if procedure is None:
+                continue
+            try:
+                same_channel = int(procedure.active_channel) == int(channel)
+            except (TypeError, ValueError):
+                continue
+            same_direction = getattr(
+                procedure, "sweep_direction", "Forward") == direction
+            if not (same_channel and same_direction):
+                continue
+
+            self._set_experiment_curves_visible(experiment, visible)
+
+            # Mirror it onto the browser checkbox without re-entering this
+            # handler through browser_item_changed.
+            try:
+                browser.blockSignals(True)
+                item.setCheckState(
+                    0, QtCore.Qt.Checked if visible else QtCore.Qt.Unchecked)
+            finally:
+                browser.blockSignals(False)
 
     # -------------------------------------------------------------------------
     # Plot Export
@@ -2150,8 +2365,11 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         """Export the current JV plot as a PNG image (legacy view)."""
         try:
             exporter = ImageExporter(self.plot_widget.plot)
+            prefix = self.file_panel.filename_input.text().strip()
+            start = self.dir_manager.dialog_start_dir()
+            suggestion = os.path.join(start, prefix) if prefix else start
             filename, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Save Plot", "", "PNG Image (*.png)"
+                self, "Save Plot", suggestion, "PNG Image (*.png)"
             )
             if filename:
                 if not filename.lower().endswith(".png"):
@@ -2163,32 +2381,59 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
             )
 
     def _save_combined_plots(self):
-        """Export BOTH the JV and SPO plots as separate PNG images."""
+        """Export BOTH plots, as `<name>_JV.png` and `<name>_SPO.png`."""
+        # Offer the experiment filename the operator already typed, in the
+        # folder their reports go to, so the PNGs sit beside the data and
+        # nobody has to retype the name.
+        suggestion = ""
+        try:
+            prefix = self.file_panel.filename_input.text().strip()
+            folder = self.dir_manager.dialog_start_dir()
+            if prefix:
+                suggestion = os.path.join(folder, prefix) if folder else prefix
+        except Exception as exc:                      # noqa: BLE001
+            logger.debug(f"Could not suggest a plot filename: {exc}")
+
         base, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Both Plots (base name)", "", "PNG Image (*.png)"
+            self, "Save Both Plots (base name)", suggestion, "PNG Image (*.png)"
         )
         if not base:
             return
         if base.lower().endswith(".png"):
             base = base[:-4]
+        # Strip a _JV / _SPO carried over from a previous save, so "1Exp_JV"
+        # does not become "1Exp_JV_JV.png".
+        for suffix in ("_JV", "_SPO"):
+            if base.endswith(suffix):
+                base = base[:-len(suffix)]
+                break
 
         errors = []
-        # JV plot
-        try:
-            jv_path = f"{base}_JV.png"
-            ImageExporter(self.plot_widget.plot).export(jv_path)
-        except Exception as e:
-            errors.append(f"JV plot: {e}")
+        saved = []
+        # ImageExporter needs the PlotItem, NOT the widget containing it:
+        # handed a PlotWidget it raises `AttributeError: views` while building
+        # its parameters, which is why the SPO half always failed and only the
+        # J-V PNG appeared. `plot_widget.plot` is already a PlotItem (pymeasure
+        # exposes it that way); the combined SPO canvas is a bare
+        # pg.PlotWidget, so it needs getPlotItem().
+        for label, item in (
+            ("JV", self.plot_widget.plot),
+            ("SPO", self.combined_spo_plot.getPlotItem()),
+        ):
+            path = f"{base}_{label}.png"
+            try:
+                ImageExporter(item).export(path)
+                saved.append(path)
+            except Exception as exc:                  # noqa: BLE001
+                errors.append(f"{label} plot: {exc}")
 
-        # SPO plot
-        try:
-            spo_path = f"{base}_SPO.png"
-            ImageExporter(self.combined_spo_plot).export(spo_path)
-        except Exception as e:
-            errors.append(f"SPO plot: {e}")
-
+        if saved:
+            logger.info(
+                "Saved plots: %s",
+                ", ".join(os.path.basename(p) for p in saved))
         if errors:
             QtWidgets.QMessageBox.warning(
                 self, "Export Error",
-                f"Failed to save some plots:\n" + "\n".join(errors)
+                "Failed to save some plots:\n" + "\n".join(errors)
             )
+

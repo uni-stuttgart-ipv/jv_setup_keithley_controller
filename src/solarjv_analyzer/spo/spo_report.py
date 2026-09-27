@@ -32,6 +32,19 @@ import os
 logger = logging.getLogger(__name__)
 
 
+def _header(name: str, unit: str) -> str:
+    """`Mean Power (mW)` — the J-V report's header convention."""
+    name = str(name).replace(",", " ")
+    unit = str(unit or "").strip()
+    return f"{name} ({unit})" if unit else name
+
+
+def _cell(value) -> str:
+    """One CSV cell: never emit a stray comma into a column-wise row."""
+    text = "" if value is None else str(value)
+    return text.replace(",", " ")
+
+
 def _same_path(a: str, b: str) -> bool:
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
@@ -100,7 +113,8 @@ class SpoReport:
                 self._file = None
 
     def finalize(self, metrics: dict, metrics_units: dict = None,
-                 output_path: str = None, discard_raw: bool = True) -> str:
+                 output_path: str = None, discard_raw: bool = True,
+                 notes_text: str = "", save_notes: bool = False) -> str:
         """
         Write the final formatted report (parameters + metrics + full time
         series), then discard the raw journal. Safe to call after an abort,
@@ -113,6 +127,12 @@ class SpoReport:
                 `<raw_basename>_report.csv` next to the raw file.
             discard_raw: Delete the raw CSV once the report is verified to
                 contain every measured row. Pass False to keep both.
+            notes_text: Operator notes, written verbatim in a `[[ NOTES ]]`
+                section placed exactly where the J-V report puts it — between
+                the metrics and the measurement data — so a combined JV+SPO
+                run produces two reports carrying the same notes in the same
+                place.
+            save_notes: Whether the operator asked for the notes to be saved.
 
         Returns:
             str: Path to the written formatted report.
@@ -123,18 +143,36 @@ class SpoReport:
 
         try:
             with open(target, "w", newline="", encoding="utf-8") as f:
+                # COLUMN-WISE, to match the J-V report exactly: one header
+                # row of names (units folded into the header) and one row of
+                # values. The old row-wise "Parameter,Value,Unit" layout meant
+                # the two report types could not be opened, diffed or
+                # concatenated the same way, and a spreadsheet had to be
+                # transposed by hand before anything could be plotted.
                 f.write("[[ EXPERIMENTAL PARAMETERS ]]\n")
-                f.write("Parameter,Value,Unit\n")
+                names, values = [], []
                 for name, (value, unit) in self.parameters.items():
-                    f.write(f"{name},{value},{unit}\n")
+                    names.append(_header(name, unit))
+                    values.append(_cell(value))
+                f.write(",".join(names) + "\n")
+                f.write(",".join(values) + "\n")
                 f.write("\n")
 
-                f.write("[[ SPO METRICS ]]\n")
-                f.write("Metric,Value,Unit\n")
-                for label, value in metrics.items():
-                    unit = metrics_units.get(label, "")
-                    f.write(f"{label},{value},{unit}\n")
+                # Same shape as the J-V "[[ ANALYSIS SUMMARY ]]" block, down to
+                # the leading Channel column, so both reports' analysis rows
+                # line up when stacked.
+                f.write("[[ ANALYSIS SUMMARY ]]\n")
+                labels = [_header(k, metrics_units.get(k, "")) for k in metrics]
+                f.write("Channel," + ",".join(labels) + "\n")
+                channel = self.parameters.get("Channel", ("", ""))[0]
+                f.write(f"{_cell(channel)}," +
+                        ",".join(_cell(v) for v in metrics.values()) + "\n")
                 f.write("\n")
+
+                if save_notes and notes_text.strip():
+                    f.write("[[ NOTES ]]\n")
+                    f.write(notes_text.strip())
+                    f.write("\n\n")
 
                 f.write("[[ TIME SERIES DATA ]]\n")
                 f.write("Time (s),Voltage (V),Current (A),Power (mW)\n")
@@ -167,11 +205,15 @@ class SpoReport:
             logger.error(f"Could not read back the SPO report {path}: {exc}")
             return False
 
-        try:
-            marker = lines.index("[[ TIME SERIES DATA ]]")
-        except ValueError:
+        # Search from the END. Operator notes are written verbatim into a
+        # section above this one, so a note that happens to contain the marker
+        # text would otherwise be mistaken for the start of the data. Measured
+        # rows are numeric and can never collide with it.
+        label = "[[ TIME SERIES DATA ]]"
+        if label not in lines:
             logger.error(f"The SPO report {path} has no time-series section.")
             return False
+        marker = len(lines) - 1 - lines[::-1].index(label)
 
         # marker + 1 is the column header; the data starts after it.
         written = [line for line in lines[marker + 2:] if line.strip()]

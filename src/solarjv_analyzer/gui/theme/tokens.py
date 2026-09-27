@@ -72,3 +72,29 @@ SPACING_XL = 24
 PLOT_AXIS_WIDTH = 60             # fixed left-axis width so side-by-side
                                  # canvases align regardless of tick labels
 PLOT_GRID_ALPHA = 0.12
+
+# ---------------------------------------------------------------------------
+# Measurement channel colours — ONE definition, used everywhere
+# ---------------------------------------------------------------------------
+# The plot curve, the experiment browser swatch, the Channel Analysis row and
+# the channel badges in the action bar must all show the SAME colour for a
+# given channel, or the operator cannot tell which trace belongs to which row.
+#
+# These used to be declared twice — once in AppController (for the pens) and
+# once in AnalysisPanel (for the table) — with a comment claiming they were
+# "kept in sync". They were not: every channel differed, and channel 1 was a
+# bright blue on the plot against a near-black teal in the table. A comment
+# cannot keep two lists in step, so there is now only one list.
+#
+# Values are the PLOT palette, because that is what the operator reads first.
+CHANNEL_COLORS = {
+    1: "#0984e3",   # Blue
+    2: "#00b894",   # Green
+    3: "#e17055",   # Orange
+    4: "#a29bfe",   # Purple
+    5: "#fdcb6e",   # Yellow
+    6: "#e84393",   # Pink
+}
+
+# Shown for a channel outside 1-6 (should not happen; grey rather than crash).
+CHANNEL_COLOR_FALLBACK = "#64748b"

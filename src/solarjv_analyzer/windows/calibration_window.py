@@ -173,7 +173,9 @@ class CalibrationWindow(QtWidgets.QMainWindow):
 
     DEFAULT_TARGET_ISC = 0.0596
     DEFAULT_TARGET_JSC = 14.9
-    DEFAULT_TOLERANCE = 5.0
+    # 1% — the reference cell is a calibrated standard, so a wider band
+    # passes drifts that should be investigated rather than accepted.
+    DEFAULT_TOLERANCE = 1.0
     DEFAULT_AREA = 4.0
     DEFAULT_START_V = 0.7
     DEFAULT_STOP_V = -0.2
@@ -1009,6 +1011,19 @@ class CalibrationWindow(QtWidgets.QMainWindow):
 
         logger.info("Calibration window close requested — performing safety shutdown.")
 
+        # Publish this operator's calibration report before tearing down. Not
+        # on the hand-off path above: that close is the app moving to the main
+        # window, not the session ending, and the main window's own close
+        # handles it. Only a real exit needs to flush.
+        try:
+            from solarjv_analyzer import store
+            if not store.flush_before_exit(self):
+                logger.info("Close cancelled — files still to be published.")
+                event.ignore()
+                return
+        except Exception as exc:                      # noqa: BLE001
+            logger.warning(f"Could not flush the store before closing: {exc}")
+
         # 2. Turn off the output and put the Keithley in an idle state.
         try:
             if self.instrument_manager.is_keithley_alive():
@@ -1079,7 +1094,9 @@ class CalibrationWindow(QtWidgets.QMainWindow):
             step_size=step_v,
             device_area=area,
             incident_power=100.0,
-            compliance_current=0.1,
+            # The reference cell delivers ~57 mA; 180 mA leaves ample
+            # headroom so the sweep never starts inside the clamp.
+            compliance_current=0.180,
             pre_sweep_delay=0.5,
             simulation=False,
             channel1=(channel_id == 1), channel2=(channel_id == 2),
@@ -1094,7 +1111,12 @@ class CalibrationWindow(QtWidgets.QMainWindow):
         results = Results(procedure, file_path)
         self._current_results = results
 
-        curve = self.plot_widget.new_curve(results, color=pg.mkColor('#0984e3'), width=2)
+        # Channel 1's colour from the shared palette — calibration always
+        # runs on one channel, and it should look like channel 1 does
+        # everywhere else rather than being its own hardcoded blue.
+        from solarjv_analyzer.gui.theme import tokens as _tokens
+        curve = self.plot_widget.new_curve(
+            results, color=pg.mkColor(_tokens.CHANNEL_COLORS[1]), width=2)
 
         browser_item = SignalBrowserItem(
             results, pg.intColor(0),
@@ -1224,18 +1246,19 @@ class CalibrationWindow(QtWidgets.QMainWindow):
         # report showed J pinned at 0.0999... for the first 4 points of a
         # 0.7 V start with 0.1 A compliance). They are tagged COMPLIANCE in
         # the raw data and excluded from the analysed metrics.
+        # Logged, not shown as a modal. The operator runs calibration many
+        # times in a row and a dialog after every sweep is noise; the points
+        # are already tagged COMPLIANCE in the raw data and excluded from the
+        # metrics, so nothing is silently wrong. The Log tab carries the
+        # detail for anyone who needs it.
         n_clipped = getattr(experiment.procedure, 'compliance_clipped_points', 0)
         if n_clipped:
-            QtWidgets.QMessageBox.warning(
-                self, "Compliance Limit Reached",
-                f"{n_clipped} measurement point(s) were clamped at the "
-                f"compliance limit "
-                f"({float(experiment.procedure.compliance_current)} A) at "
-                "the start of the sweep.\n\n"
-                "These points are NOT valid measurements of the cell and "
-                "were excluded from the analysis.\n\n"
-                "Fix: lower the Start Voltage (the reference cell's Voc is "
-                "well below it) or raise the Compliance Current."
+            logger.warning(
+                "%d calibration point(s) were clamped at the compliance limit "
+                "(%s A) at the start of the sweep and were excluded from the "
+                "analysis. Lower the Start Voltage or raise the Compliance "
+                "Current if this persists.",
+                n_clipped, float(experiment.procedure.compliance_current),
             )
 
         try:

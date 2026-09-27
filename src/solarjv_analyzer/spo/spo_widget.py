@@ -88,6 +88,54 @@ class _TightStackedWidget(QtWidgets.QStackedWidget):
             self.updateGeometry()
 
 
+def _strip_unit(header: str) -> str:
+    """`mean_power_mw (mW)` -> `mean_power_mw`."""
+    name = header.strip()
+    if name.endswith(")") and "(" in name:
+        name = name[:name.rindex("(")].strip()
+    return name
+
+
+def _parse_metrics_block(lines: list) -> dict:
+    """Read the metrics from either report layout.
+
+    Current reports use the column-wise `[[ ANALYSIS SUMMARY ]]` block that
+    matches the J-V report. Reports written before that change used a
+    row-wise `[[ SPO METRICS ]]` block. Both are read here so a file saved
+    last week still opens.
+    """
+    def as_number(text):
+        try:
+            return float(text)
+        except ValueError:
+            return text.strip()
+
+    if "[[ ANALYSIS SUMMARY ]]" in lines:
+        start = lines.index("[[ ANALYSIS SUMMARY ]]")
+        if len(lines) > start + 2:
+            headers = [h.strip() for h in lines[start + 1].split(",")]
+            values = [v.strip() for v in lines[start + 2].split(",")]
+            metrics = {}
+            for header, value in zip(headers, values):
+                if header.lower() == "channel":
+                    continue
+                metrics[_strip_unit(header)] = as_number(value)
+            return metrics
+
+    if "[[ SPO METRICS ]]" in lines:
+        start = lines.index("[[ SPO METRICS ]]") + 2      # skip column header
+        metrics = {}
+        for row in lines[start:]:
+            if not row.strip() or row.startswith("[["):
+                break
+            parts = row.split(",")
+            if len(parts) >= 2:
+                metrics[parts[0].strip()] = as_number(parts[1])
+        return metrics
+
+    return {}
+
+
 class SpoParameterTab(QtWidgets.QWidget):
     """
     SPO configuration fields, designed to occupy the sidebar's
@@ -869,7 +917,47 @@ class SpoWidget(QtWidgets.QWidget):
         self.curve = self.plot_widget.plot([], [], pen=pg.mkPen(color='#053a46', width=2))
 
         layout.addWidget(self.plot_widget)
+
+        # Open a saved SPO report without leaving this view. The J-V side has
+        # its own Open in the experiment browser, which is not reachable from
+        # here — so SPO needs its own way in.
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.addStretch(1)
+        self.open_report_button = QtWidgets.QPushButton("Open SPO Report…")
+        self.open_report_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.open_report_button.setToolTip(
+            "Load a previously saved SPO report into this view.")
+        self.open_report_button.clicked.connect(self._on_open_report_clicked)
+        button_row.addWidget(self.open_report_button)
+        layout.addLayout(button_row)
         return container
+
+    def _on_open_report_clicked(self):
+        """Pick a saved SPO report and show it here.
+
+        Starts in the SPO folder on the store — where finished reports
+        actually live — rather than in the staging directory they pass
+        through on the way.
+        """
+        start_dir = os.path.expanduser("~")
+        manager = getattr(self.main_window, "dir_manager", None)
+        if manager is not None:
+            start_dir = manager.dialog_start_dir("SPO")
+
+        path, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open SPO Report", start_dir,
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not path:
+            return
+        if not self.load_report(path):
+            QtWidgets.QMessageBox.warning(
+                self, "Not an SPO Report",
+                f"{os.path.basename(path)} does not contain an SPO time "
+                "series.\n\nOpen J-V reports from the experiment browser "
+                "instead."
+            )
 
     def _build_metrics_card(self):
         group = QtWidgets.QGroupBox("Live Metrics")
@@ -958,6 +1046,85 @@ class SpoWidget(QtWidgets.QWidget):
         """Refresh the live metrics labels from a partial or final metrics dict."""
         self.mean_power_label.setText(f"{metrics.get('mean_power_mw', 0.0):.3f} mW")
         self.drift_label.setText(f"{metrics.get('drift_percent', 0.0):.2f} %")
+
+    # -------------------------------------------------------------------
+    # Loading a finished report back in
+    # -------------------------------------------------------------------
+    @staticmethod
+    def parse_report(path: str) -> tuple:
+        """Read a finalised SPO report into (times_s, powers_w, metrics).
+
+        Reads the `[[ TIME SERIES DATA ]]` and `[[ SPO METRICS ]]` sections
+        written by `SpoReport.finalize()`. The report stores power in mW
+        because that is what people read; the live plot works in W, so the
+        series is converted here and the widget stays unit-consistent whether
+        a curve came from a live run or from disk.
+
+        Raises:
+            ValueError: if the file has no time-series section, i.e. it is
+                not an SPO report.
+        """
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+
+        label = "[[ TIME SERIES DATA ]]"
+        if label not in lines:
+            raise ValueError("no [[ TIME SERIES DATA ]] section")
+        # Last occurrence: operator notes are written verbatim above it and
+        # could contain the marker text. Data rows are numeric and cannot.
+        start = len(lines) - 1 - lines[::-1].index(label)
+
+        times, powers = [], []
+        for row in lines[start + 2:]:          # +1 marker, +1 column header
+            if not row.strip():
+                continue
+            parts = row.split(",")
+            if len(parts) < 4:
+                continue
+            try:
+                times.append(float(parts[0]))
+                # mW -> W, and negated to match the LIVE plot. A live run
+                # is fed `-record["Power (W)"]` by the controller, so the
+                # curve is drawn positive; the report stores the raw
+                # (negative) instrument value. Without this a loaded curve
+                # is mirrored about zero and sits off the bottom of an axis
+                # scaled for positive power.
+                powers.append(-float(parts[3]) / 1000.0)
+            except ValueError:
+                continue                        # a stray non-numeric row
+
+        metrics = _parse_metrics_block(lines)
+
+        if not times:
+            raise ValueError("no time-series rows")
+        return times, powers, metrics
+
+    def load_report(self, path: str) -> bool:
+        """Show a saved SPO report: its curve, its metrics and its filename.
+
+        Returns True when the file was an SPO report and has been displayed.
+        Never raises — a malformed file is reported to the caller as False so
+        it can fall back to the J-V loader.
+        """
+        try:
+            times, powers, metrics = self.parse_report(path)
+        except (OSError, ValueError) as exc:
+            logger.debug(f"Not a loadable SPO report ({path}): {exc}")
+            return False
+
+        self._times = list(times)
+        self._powers = list(powers)
+        self.curve.setData(self._times, self._powers)
+        # autoRange() rescales now; enableAutoRange() only arms it for the
+        # next update, which never comes for a static loaded curve.
+        self.plot_widget.autoRange()
+
+        self.update_metrics(metrics)
+        self.elapsed_label.setText(f"{times[-1]:.1f} s")
+        self.status_label.setText(f"Loaded — {os.path.basename(path)}")
+        self._report_path = path
+        logger.info(f"Loaded SPO report: {path} ({len(times)} points)")
+        return True
 
     def on_spo_finished(self, metrics: dict, report_path: str = None):
         """Called once the run (completed or aborted) has fully stopped and

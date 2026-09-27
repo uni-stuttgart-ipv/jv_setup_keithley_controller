@@ -21,7 +21,7 @@ import time
 
 from solarjv_analyzer import config
 from . import paths
-from .identity import windows_user
+from .identity import active_user
 from .journal import open_journal
 from .publisher import PublishError, publish_file, sha256_of
 
@@ -175,10 +175,16 @@ def sweep(staging: str = None, store: str = None, include_logs: bool = True) -> 
     summary = {"published": 0, "pending": 0, "failed": 0, "errors": []}
 
     try:
-        user = windows_user()
-    except RuntimeError as exc:
-        summary["errors"].append(str(exc))
-        summary["failed"] += 1
+        user = active_user()
+    except RuntimeError:
+        # Nobody is signed in yet. This is the normal state between process
+        # start and the login dialog being answered, so it is a quiet HOLD,
+        # not a failure: finished files and session logs stay in staging and
+        # publish on a later tick once they can be attributed to someone.
+        # Counting it as an error here would fill the log with one entry
+        # every sweep interval before anyone had even logged in.
+        summary["pending"] += 1
+        logger.debug("Store sweep held: no user signed in yet.")
         return summary
 
     journal = open_journal(staging)

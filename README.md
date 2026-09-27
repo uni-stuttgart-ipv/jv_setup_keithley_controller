@@ -81,7 +81,7 @@ Designed and maintained at the **Institute for Photovoltaics (ipv), University o
 | **File Loading & Restoration** | Previously saved measurement files are fully restored — plot curves, browser tree, analysis matrix, and channel data |
 | **Crash-Safe SPO Logging** | Every SPO sample is flushed to disk immediately with `fsync` — a crash never loses previously recorded data |
 | **User Authentication** | SQLite-backed login system with Argon2id password hashing, registration, password reset, and timestamped session logs |
-| **Directory Management** | Automatic `Base/Username/Date/{Calibration\|Main\|SPO}/` folder structure |
+| **Directory Management** | Automatic `Base/Username/Date/{Calibration\|JV\|SPO}/` folder structure, where `Username` is the **application login** — see [Data storage and attribution](#data-storage-and-attribution) |
 | **Filename Validation** | Execution buttons are gated on a non-empty filename prefix — prevents orphaned data files |
 
 ### Modern UI
@@ -97,6 +97,54 @@ Designed and maintained at the **Institute for Photovoltaics (ipv), University o
 | **Dynamic Selection Highlight** | Row selection in the analysis matrix highlights in the selected channel's exact plot colour |
 
 ---
+
+
+## Data storage and attribution
+
+Every measurement is filed under the name the operator **signed into the
+application** with:
+
+```
+S:\Data\JV\<app login>\<yyyy-mm-dd>\<Calibration|JV|SPO>\
+```
+
+The same name is used for the local working folders, so a given person's data
+appears under one name everywhere.
+
+### Why the application login, and not the Windows account
+
+The folder name used to come from the Windows process token, which nobody can
+spoof. Every lab machine now runs under a **single shared Windows account**, so
+that name is identical for everyone and would file all operators' data into one
+folder with no attribution at all. The application login is what distinguishes
+people, so it is what names the folder.
+
+Two consequences follow from that choice:
+
+* **Nothing publishes before login.** The store holds finished files and
+  session logs in staging until somebody signs in — an unattributed folder is
+  worse than a delayed one. This is normal at startup, not an error.
+* **The identity is not cached.** One process can serve several operators via
+  the re-login loop, so the name is set at login and cleared at logout. Logging
+  out triggers a final publish first, so a departing operator's files never
+  land in the next person's folder.
+
+### What this does and does not guarantee
+
+Attribution is now only as strong as the password protecting an account.
+Account creation is self-service from the login screen and only checks that the
+username is non-empty and unique, so the store records *who signed in*, not a
+fact verified by the operating system. That is appropriate for a shared lab
+instrument; it is not an audit trail.
+
+### Known limitation
+
+The publisher only takes files that have been quiet for
+`STORE_QUIET_SECONDS`. A file still being written at the moment of logout stays
+in staging and is published on a later tick — under whoever is signed in then.
+In practice a run is finished long before anyone logs out, but if you abort a
+measurement and immediately log out, check that the file landed in the right
+folder.
 
 ## System Architecture
 

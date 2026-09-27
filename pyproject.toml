@@ -62,6 +62,10 @@ dependencies = [
   "PyQt5",
   "pyqtgraph",
   "pyvisa",
+  # PyVISA is only an API: it needs a backend. Without NI-VISA installed
+  # system-wide it finds nothing and every VISAAdapter open fails, which
+  # a packaged app hits even though raw pyserial port detection works.
+  "pyvisa-py",
   "pyserial",
   "numpy",
   "scipy",
@@ -93,6 +97,10 @@ dependencies = [
   "PyQt5",
   "pyqtgraph",
   "pyvisa",
+  # PyVISA is only an API: it needs a backend. Without NI-VISA installed
+  # system-wide it finds nothing and every VISAAdapter open fails, which
+  # a packaged app hits even though raw pyserial port detection works.
+  "pyvisa-py",
   "pyserial",
   "numpy",
   "scipy",
@@ -130,6 +138,10 @@ requires = [
   "PyQt5",
   "pyqtgraph",
   "pyvisa",
+  # PyVISA is only an API: it needs a backend. Without NI-VISA installed
+  # system-wide it finds nothing and every VISAAdapter open fails, which
+  # a packaged app hits even though raw pyserial port detection works.
+  "pyvisa-py",
   "pyserial",
   "numpy",
   "scipy",
@@ -137,6 +149,20 @@ requires = [
   "matplotlib",
   "reportlab",
   "argon2-cffi",
-  "std-nslog",
 ]
 license.file = "LICENSE.txt"
+
+# --- Platform-specific extras -------------------------------------------------
+# std-nslog is a macOS-only shim over Apple's NSLog API. It ships a C extension
+# and has no Windows wheel, so it must never appear in the cross-platform
+# `requires` list above.
+[tool.briefcase.app.solarjv_analyzer.macOS]
+requires = [
+  "std-nslog",
+]
+
+[tool.briefcase.app.solarjv_analyzer.windows]
+requires = []
+
+[tool.briefcase.app.solarjv_analyzer.linux]
+requires = []

@@ -117,6 +117,7 @@ class ParameterTab(QtWidgets.QWidget):
         )
         self.architecture_toggle.setChecked(False)  # False = n-i-p, True = p-i-n
         self.architecture_toggle.toggled.connect(self._update_architecture_labels)
+        self.architecture_toggle.toggled.connect(self._offer_architecture_range)
         self._update_architecture_labels(False)
 
         arch_layout.addWidget(self._arch_nip_label)
@@ -337,6 +338,90 @@ class ParameterTab(QtWidgets.QWidget):
     # -------------------------------------------------------------------------
     # Parameter Retrieval
     # -------------------------------------------------------------------------
+
+    # Recommended sweep window per architecture, as (start V, stop V, step mV).
+    # An n-i-p cell generates in Q4 and is swept from above Voc down through
+    # zero; a p-i-n cell contacted the same way generates in Q2, so the whole
+    # window mirrors about the origin and the step changes sign with it. These
+    # are the values the toggle offers — the operator can still type anything.
+    ARCHITECTURE_RANGES = {
+        False: (1.2, -0.2, -10.0),      # n-i-p  -> Q4
+        True:  (-1.2, 0.2, 10.0),       # p-i-n  -> Q2
+    }
+
+    def recommended_range(self, is_pin: bool) -> tuple:
+        """The (start, stop, step) this architecture should be swept over."""
+        return self.ARCHITECTURE_RANGES[bool(is_pin)]
+
+    def _current_range(self) -> tuple:
+        """What the fields hold now, in (V, V, mV), or None if unparsable."""
+        try:
+            start = float(self.start_voltage.text())
+            stop = float(self.stop_voltage.text())
+            step = float(self.step_size.text())
+        except ValueError:
+            return None
+        if self.start_unit.currentText() == "mV":
+            start /= 1000.0
+        if self.stop_unit.currentText() == "mV":
+            stop /= 1000.0
+        if self.step_unit.currentText() == "V":
+            step *= 1000.0
+        return start, stop, step
+
+    def apply_architecture_range(self, is_pin: bool) -> None:
+        """Write the recommended window into the fields."""
+        start, stop, step = self.recommended_range(is_pin)
+        self.start_unit.setCurrentText("V")
+        self.stop_unit.setCurrentText("V")
+        self.step_unit.setCurrentText("mV")
+        self.start_voltage.setText(f"{start:g}")
+        self.stop_voltage.setText(f"{stop:g}")
+        self.step_size.setText(f"{step:g}")
+
+    def _offer_architecture_range(self, is_pin: bool) -> None:
+        """Offer the mirrored sweep window when the architecture changes.
+
+        This is what makes the toggle do something rather than label something.
+        A p-i-n cell contacted like an n-i-p one generates in the SECOND
+        quadrant, so the n-i-p window (1.2 V -> -0.2 V) never reaches its
+        operating point: the sweep would return no maximum power point and the
+        metrics would come back NaN.
+
+        It ASKS rather than overwrites. Silently discarding a deliberately
+        typed sweep window is its own data-quality bug, and some cells are
+        measured over a deliberately unusual range.
+        """
+        recommended = self.recommended_range(is_pin)
+        current = self._current_range()
+        if current is not None and all(
+                abs(a - b) < 1e-9 for a, b in zip(current, recommended)):
+            return                                    # already correct
+
+        other = self.recommended_range(not is_pin)
+        looks_default = current is not None and all(
+            abs(a - b) < 1e-9 for a, b in zip(current, other))
+
+        name = "p-i-n" if is_pin else "n-i-p"
+        start, stop, step = recommended
+        if looks_default:
+            # Untouched values from the other architecture: just mirror them.
+            self.apply_architecture_range(is_pin)
+            return
+
+        answer = QtWidgets.QMessageBox.question(
+            self, "Apply recommended sweep range?",
+            f"A {name} cell generates in "
+            f"{'the second' if is_pin else 'the fourth'} quadrant.\n\n"
+            f"Apply the recommended range for {name}?\n"
+            f"    Start {start:g} V\n    Stop {stop:g} V\n    Step {step:g} mV\n\n"
+            "Choosing No keeps your current values, which may not reach this "
+            "device's operating point.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes,
+        )
+        if answer == QtWidgets.QMessageBox.Yes:
+            self.apply_architecture_range(is_pin)
 
     def _update_architecture_labels(self, is_pin: bool):
         """Emphasise the selected side and mute the other.

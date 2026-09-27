@@ -35,6 +35,28 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
+    # Window/taskbar icon. Qt does not pick up the icon Briefcase embeds in the
+    # .exe, so every window would otherwise show the default Qt icon in its
+    # title bar. Setting it on the QApplication makes it the default for every
+    # top-level window and dialog in the process. Shipped inside the package so
+    # it survives Briefcase packaging (only `sources` is bundled); the repo-root
+    # copy is the development fallback.
+    _icon_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "resources", "app_icon.ico"
+    )
+    if not os.path.exists(_icon_path):
+        _icon_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "app_icon.ico",
+        )
+    if os.path.exists(_icon_path):
+        from PyQt5.QtGui import QIcon
+        app.setWindowIcon(QIcon(_icon_path))
+    else:
+        logging.getLogger(__name__).warning(
+            "Application icon not found; windows will use the default Qt icon."
+        )
+
     # Register the design-system fonts (Geist/Inter/JetBrains Mono, if
     # bundled in resources/fonts/) and the shared pyqtgraph defaults BEFORE
     # any window or plot is created, so every view renders identically.
@@ -104,6 +126,22 @@ def main():
         username = show_login_dialog()
         if username is None:
             sys.exit(0)      # user closed the dialog without logging in
+
+        # The store folder name comes from THIS login, not from the Windows
+        # account — every machine runs under one shared Windows user, so the
+        # OS name is the same for everybody. Set before anything can publish,
+        # and cleared on logout, so a second operator in the same process
+        # never writes into the first one's folder.
+        store.set_app_user(username)
+
+        # Today's folders, created once so they exist before anyone goes
+        # looking for them. Existing folders are left untouched.
+        try:
+            from solarjv_analyzer.utils.directory_manager import ensure_day_folders
+            ensure_day_folders(username)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                f"Could not prepare today's folders: {exc}")
 
         # Let the startup connection finish before any window touches the
         # manager. By now the operator has typed a password, so this is
@@ -194,6 +232,23 @@ def handle_logout(window):
     4. Return to login loop
     """
     auth_logout(window.instrument_manager if hasattr(window, 'instrument_manager') else None)
+    # Publish everything this operator produced BEFORE dropping their name,
+    # and WAIT for it. The store folder comes from the login, so a file left
+    # in staging would be published later under whoever signs in next — their
+    # work, someone else's folder, on a share that refuses deletions. This
+    # blocks (with a dialog) until staging is empty, including files still
+    # being written.
+    try:
+        store.flush_before_exit(window)
+    except Exception as exc:                          # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            f"Final publish before logout failed: {exc}")
+
+    try:
+        store.set_app_user("")
+    except Exception as exc:                          # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            f"Could not clear the store identity: {exc}")
     window.close()
     # Flag for main loop: no current user → relogin
     SessionManager.current_user = None

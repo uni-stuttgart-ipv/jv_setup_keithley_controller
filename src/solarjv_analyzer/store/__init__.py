@@ -11,14 +11,15 @@ involved: `attach(window)` redirects `DirectoryManager`'s base root to staging
 and runs a sweeper on a timer. See `docs/plans/s-drive-publishing.md`.
 """
 
-from .identity import windows_user
+from .identity import active_user, app_user, set_app_user, windows_user
 from .paths import destination_dir, staging_root, store_date, store_root
 from .publisher import PublishError, publish_file, sha256_of
-from .sidecar import attach, detach, is_enabled
+from .sidecar import attach, detach, flush_before_exit, is_enabled
 from .sweeper import extra_target, find_finished, pending_count, set_extra_target, sweep
 
 __all__ = [
     "attach",
+    "flush_before_exit",
     "detach",
     "is_enabled",
     "sweep",
@@ -29,6 +30,9 @@ __all__ = [
     "publish_file",
     "sha256_of",
     "PublishError",
+    "active_user",
+    "app_user",
+    "set_app_user",
     "windows_user",
     "store_root",
     "staging_root",

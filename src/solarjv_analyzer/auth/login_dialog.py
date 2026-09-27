@@ -16,11 +16,17 @@ from .session import SessionManager
 # ---------------------------------------------------------------------------
 # Image path
 # ---------------------------------------------------------------------------
+# Shipped inside the package under solarjv_analyzer/resources/ so it survives
+# Briefcase packaging, which only bundles what lives under `sources`
+# (src/solarjv_analyzer). A repo-root copy is kept as a development fallback.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
-_IMAGE_PATH = os.path.join(_PROJECT_ROOT, "Login.png")
+_PACKAGE_ROOT = os.path.dirname(_THIS_DIR)
+_IMAGE_PATH = os.path.join(_PACKAGE_ROOT, "resources", "Login.png")
 if not os.path.exists(_IMAGE_PATH):
-    _IMAGE_PATH = os.path.join(os.path.dirname(_PROJECT_ROOT), "Login.png")
+    # Development checkout: fall back to the repo-root copy.
+    _IMAGE_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(_PACKAGE_ROOT)), "Login.png"
+    )
 
 # ---------------------------------------------------------------------------
 # Design tokens  —  dark professional palette
