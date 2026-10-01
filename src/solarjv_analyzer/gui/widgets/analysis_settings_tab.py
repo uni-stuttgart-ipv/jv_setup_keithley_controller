@@ -2,7 +2,7 @@
 Analysis Settings Tab for JV Measurement
 
 Provides configuration options for analysis parameters including incident power,
-contact threshold, 4-probe settings, and debug options.
+contact threshold, 4-probe settings, sweep mode, and debug options.
 """
 
 from PyQt5 import QtWidgets, QtCore
@@ -18,6 +18,7 @@ class AnalysisSettingsTab(QtWidgets.QWidget):
     - Probe spacing (μm, mm, cm)
     - Sample thickness (nm, μm, mm)
     - 4-probe lateral factor (unitless)
+    - Sweep mode (Single vs Dual)
     """
 
     def __init__(self, parent=None):
@@ -54,6 +55,15 @@ class AnalysisSettingsTab(QtWidgets.QWidget):
         self.probe_spacing = QtWidgets.QLineEdit("2290")
         self.spacing_unit = QtWidgets.QComboBox()
         self.spacing_unit.addItems(["μm", "mm", "cm"])
+        # Provenance only. Rsq is derived from the J-V curve
+        # (rho = Rsh*A/t, Rsq = rho/t * lateral_factor) — there is no
+        # 4-point-probe measurement here, so spacing has no slot in the math.
+        # It IS written to the report's EXPERIMENTAL PARAMETERS block by
+        # pymeasure, which is what it is for: recording the rig geometry
+        # alongside the measurement.
+        self.probe_spacing.setToolTip(
+            "Recorded in the report for provenance.\n"
+            "Not used in any computed metric — Rsq comes from the J-V curve.")
         layout.addRow("4-Probe Spacing:", self._row(self.probe_spacing, self.spacing_unit))
 
         # Sample Thickness
@@ -62,6 +72,15 @@ class AnalysisSettingsTab(QtWidgets.QWidget):
         self.thickness_unit.addItems(["nm", "μm", "mm"])
         self.thickness_unit.setCurrentText("μm")
         layout.addRow("Sample Thickness:", self._row(self.sample_thickness, self.thickness_unit))
+
+        # Single Sweep Mode
+        self.single_sweep_mode = QtWidgets.QCheckBox("Single Sweep Mode (Forward only)")
+        self.single_sweep_mode.setChecked(False)
+        layout.addRow("Sweep Mode:", self.single_sweep_mode)
+
+        helper_sweep = QtWidgets.QLabel("(Default: Forward + Reverse sweeps. Check for single forward sweep only)")
+        helper_sweep.setStyleSheet("color: gray; font-size: 8pt;")
+        layout.addRow("", helper_sweep)
 
         # Separator
         separator = QtWidgets.QFrame()
@@ -124,6 +143,7 @@ class AnalysisSettingsTab(QtWidgets.QWidget):
         - Probe spacing: μm
         - Sample thickness: μm
         - Lateral factor: unitless
+        - Single sweep mode: bool
 
         Returns:
             Dictionary of parameter names and values
@@ -171,4 +191,5 @@ class AnalysisSettingsTab(QtWidgets.QWidget):
             'probe_spacing': spacing_val,
             'sample_thickness': thickness_val,
             'enable_validation': self.enable_validation.isChecked(),
+            'single_sweep_mode': self.single_sweep_mode.isChecked(),
         }

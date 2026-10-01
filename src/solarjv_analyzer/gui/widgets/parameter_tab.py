@@ -9,6 +9,9 @@ from typing import List
 
 from PyQt5 import QtWidgets, QtCore
 
+from .toggle_switch import ToggleSwitch
+from .channel_pinout import build_pinout_label
+
 
 class ParameterTab(QtWidgets.QWidget):
     """
@@ -26,6 +29,15 @@ class ParameterTab(QtWidgets.QWidget):
         super().__init__(parent)
         self._layout()
         self._connect_signals()
+
+        # Set all channels selected by default
+        for channel in self.channels:
+            channel.setChecked(True)
+        self.select_all_channels.setChecked(True)
+
+        # Initialize number chips to the "selected" style (all selected)
+        for i in range(len(self.channel_number_labels)):
+            self._update_channel_number_chip(i, True)
 
         # Update time estimate after UI is ready
         QtCore.QTimer.singleShot(100, self._update_time_estimate)
@@ -59,9 +71,10 @@ class ParameterTab(QtWidgets.QWidget):
         layout.addRow("Step Size:", self._row(self.step_size, self.step_unit))
 
         # Sweep Rate
-        self.sweep_rate = QtWidgets.QLineEdit("0.1")
+        self.sweep_rate = QtWidgets.QLineEdit("100")  # 100 mV/s instead of 0.1 V/s
         self.sweep_rate_unit = QtWidgets.QComboBox()
         self.sweep_rate_unit.addItems(["V/s", "mV/s"])
+        self.sweep_rate_unit.setCurrentText("mV/s")  # Set mV/s as default
         layout.addRow("Sweep Rate:", self._row(self.sweep_rate, self.sweep_rate_unit))
 
         helper_text = QtWidgets.QLabel("(Determines measurement speed and NPLC)")
@@ -81,6 +94,38 @@ class ParameterTab(QtWidgets.QWidget):
         self.area_unit.addItems(["cm²", "mm²", "m²"])
         layout.addRow("Device Area:", self._row(self.device_area, self.area_unit))
 
+        # Device Architecture — ToggleSwitch between n-i-p and p-i-n
+        from .toggle_switch import ToggleSwitch
+        arch_widget = QtWidgets.QWidget()
+        arch_layout = QtWidgets.QHBoxLayout(arch_widget)
+        arch_layout.setContentsMargins(0, 0, 0, 0)
+        arch_layout.setSpacing(10)
+
+        # Both sides used to be teal (#053a46 off, #24515e on), which is two
+        # shades of the same colour — the operator could not tell at a glance
+        # which architecture was selected, and the architecture flips the sign
+        # convention of every metric. p-i-n is now a MUTED red: distinct from
+        # n-i-p, and deliberately not the functional red that means something
+        # has gone wrong.
+        from solarjv_analyzer.gui.theme import tokens as _t
+
+        self._arch_nip_label = QtWidgets.QLabel("n-i-p")
+        self._arch_pin_label = QtWidgets.QLabel("p-i-n")
+
+        self.architecture_toggle = ToggleSwitch(
+            on_color=_t.ARCH_PIN_RED, off_color=_t.ARCH_NIP_TEAL
+        )
+        self.architecture_toggle.setChecked(False)  # False = n-i-p, True = p-i-n
+        self.architecture_toggle.toggled.connect(self._update_architecture_labels)
+        self.architecture_toggle.toggled.connect(self._offer_architecture_range)
+        self._update_architecture_labels(False)
+
+        arch_layout.addWidget(self._arch_nip_label)
+        arch_layout.addWidget(self.architecture_toggle)
+        arch_layout.addWidget(self._arch_pin_label)
+        arch_layout.addStretch()
+        layout.addRow("Device Architecture:", arch_widget)
+
         # Separator
         separator = QtWidgets.QFrame()
         separator.setFrameShape(QtWidgets.QFrame.HLine)
@@ -90,9 +135,39 @@ class ParameterTab(QtWidgets.QWidget):
         # Channel Selection
         self._create_channel_selector(layout)
 
+        # Notes section — with a styled heading matching CombinedTab
+        notes_heading = QtWidgets.QLabel("Notes")
+        notes_heading.setStyleSheet(
+            "font-weight: 600; font-size: 13px; color: #0f172a;"
+            " background: transparent; padding: 8px 0 4px 0;"
+        )
+
+        self.notes_field = QtWidgets.QTextEdit()
+        self.notes_field.setObjectName("notes_field")
+        self.notes_field.setPlaceholderText("Enter any notes or comments...")
+        self.notes_field.setFixedHeight(80)
+        self.save_notes_checkbox = QtWidgets.QCheckBox("Save in file")
+        self.save_notes_checkbox.setChecked(True)
+        self.clear_notes_button = QtWidgets.QPushButton("Clear")
+        self.clear_notes_button.clicked.connect(self._clear_notes)
+
+        notes_widget = QtWidgets.QWidget()
+        notes_layout = QtWidgets.QVBoxLayout(notes_widget)
+        notes_layout.setContentsMargins(0, 0, 0, 0)
+        notes_layout.setSpacing(4)
+        notes_layout.addWidget(notes_heading)
+        notes_layout.addWidget(self.notes_field)
+        notes_controls = QtWidgets.QHBoxLayout()
+        notes_controls.addWidget(self.save_notes_checkbox)
+        notes_controls.addStretch(1)
+        notes_controls.addWidget(self.clear_notes_button)
+        notes_layout.addLayout(notes_controls)
+
+        layout.addRow(notes_widget)
+
         # Estimated Time Display
         self.estimated_time_label = QtWidgets.QLabel("Estimated sweep time: --")
-        self.estimated_time_label.setStyleSheet("color: blue; font-weight: bold;")
+        self.estimated_time_label.setStyleSheet("color: #053a46; font-weight: bold;")
         layout.addRow("", self.estimated_time_label)
 
         # Connect signals for real-time time estimation
@@ -105,27 +180,96 @@ class ParameterTab(QtWidgets.QWidget):
 
     def _create_channel_selector(self, parent_layout):
         """
-        Create the channel selection checkboxes.
-
-        Args:
-            parent_layout: QFormLayout to add the channel selector to
+        Create the "Channel Selection" card: a reference pinout image on
+        the left, and a grid of numbered toggle switches on the right,
+        plus a "Select All" toggle in the header. Row order follows the
+        physical pinout layout (channel_pinout.png):
+            Ch3   Ch4
+            Ch2   Ch5
+            Ch1   Ch6
         """
-        self.channels: List[QtWidgets.QCheckBox] = [
-            QtWidgets.QCheckBox(f"Channel {i+1}") for i in range(6)
-        ]
-        self.select_all_channels = QtWidgets.QCheckBox("Select All Channels")
+        self.channels: List[ToggleSwitch] = []
+        self.channel_number_labels: List[QtWidgets.QLabel] = []
 
-        channel_widget = QtWidgets.QWidget()
-        channel_layout = QtWidgets.QVBoxLayout(channel_widget)
-        channel_layout.setAlignment(QtCore.Qt.AlignRight)
-        channel_layout.setSpacing(2)
-        channel_layout.setContentsMargins(0, 0, 0, 0)
+        card = QtWidgets.QGroupBox("Channel Selection")
+        card_layout = QtWidgets.QVBoxLayout(card)
+        card_layout.setSpacing(10)
 
-        for channel in self.channels:
-            channel_layout.addWidget(channel)
-        channel_layout.addWidget(self.select_all_channels)
+        # ----- Header row: title (from QGroupBox) ... Select All toggle -----
+        header_layout = QtWidgets.QHBoxLayout()
+        header_layout.addStretch(1)
+        select_all_label = QtWidgets.QLabel("Select All")
+        select_all_label.setStyleSheet("font-weight: 600;")
+        self.select_all_channels = ToggleSwitch()
+        header_layout.addWidget(select_all_label)
+        header_layout.addWidget(self.select_all_channels)
+        card_layout.addLayout(header_layout)
 
-        parent_layout.addRow("Channels:", channel_widget)
+        # ----- Body: pinout image | vertical divider | toggle grid -----
+        body_layout = QtWidgets.QHBoxLayout()
+        body_layout.setSpacing(16)
+
+        pinout_column = QtWidgets.QVBoxLayout()
+        pinout_column.addWidget(build_pinout_label())
+        caption = QtWidgets.QLabel("Reference Pinout")
+        caption.setAlignment(QtCore.Qt.AlignCenter)
+        caption.setStyleSheet("color: #64748b; font-size: 8pt;")
+        pinout_column.addWidget(caption)
+        body_layout.addLayout(pinout_column)
+
+        divider = QtWidgets.QFrame()
+        divider.setFrameShape(QtWidgets.QFrame.VLine)
+        divider.setFrameShadow(QtWidgets.QFrame.Sunken)
+        body_layout.addWidget(divider)
+
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+
+        # Mapping: channel number -> (row, col) matching the physical pinout.
+        mapping = {
+            3: (0, 0), 4: (0, 1),
+            2: (1, 0), 5: (1, 1),
+            1: (2, 0), 6: (2, 1),
+        }
+
+        for i in range(1, 7):
+            number_label = QtWidgets.QLabel(str(i))
+            number_label.setFixedSize(28, 28)
+            number_label.setAlignment(QtCore.Qt.AlignCenter)
+            self.channel_number_labels.append(number_label)
+
+            toggle = ToggleSwitch()
+            self.channels.append(toggle)
+
+        for ch_num, (row, col) in mapping.items():
+            idx = ch_num - 1
+            pair_layout = QtWidgets.QHBoxLayout()
+            pair_layout.setSpacing(8)
+            pair_layout.addWidget(self.channel_number_labels[idx])
+            pair_layout.addWidget(self.channels[idx])
+            grid.addLayout(pair_layout, row, col)
+
+        body_layout.addLayout(grid)
+        body_layout.addStretch(1)
+
+        card_layout.addLayout(body_layout)
+
+        parent_layout.addRow(card)
+
+    def _update_channel_number_chip(self, index: int, checked: bool):
+        """Style the channel number chip: soft green background when the
+        channel is selected, plain/muted when it isn't."""
+        label = self.channel_number_labels[index]
+        if checked:
+            label.setStyleSheet(
+                "background-color: #d1e3e9; color: #053a46; font-weight: 600;"
+                "border-radius: 14px;"
+            )
+        else:
+            label.setStyleSheet(
+                "background-color: transparent; color: #94a3b8; font-weight: 600;"
+            )
 
     @staticmethod
     def _row(input_field, combo_box) -> QtWidgets.QWidget:
@@ -147,10 +291,14 @@ class ParameterTab(QtWidgets.QWidget):
         layout.addWidget(combo_box)
         return container
 
+    def _clear_notes(self):
+        """Clear the notes text field."""
+        self.notes_field.clear()
+
     # -------------------------------------------------------------------------
     # Time Estimation
     # -------------------------------------------------------------------------
-
+    
     def _update_time_estimate(self):
         """Calculate and display estimated sweep time based on current parameters."""
         try:
@@ -190,6 +338,108 @@ class ParameterTab(QtWidgets.QWidget):
     # -------------------------------------------------------------------------
     # Parameter Retrieval
     # -------------------------------------------------------------------------
+
+    # Recommended sweep window per architecture, as (start V, stop V, step mV).
+    # An n-i-p cell generates in Q4 and is swept from above Voc down through
+    # zero; a p-i-n cell contacted the same way generates in Q2, so the whole
+    # window mirrors about the origin and the step changes sign with it. These
+    # are the values the toggle offers — the operator can still type anything.
+    ARCHITECTURE_RANGES = {
+        False: (1.2, -0.2, -10.0),      # n-i-p  -> Q4
+        True:  (-1.2, 0.2, 10.0),       # p-i-n  -> Q2
+    }
+
+    def recommended_range(self, is_pin: bool) -> tuple:
+        """The (start, stop, step) this architecture should be swept over."""
+        return self.ARCHITECTURE_RANGES[bool(is_pin)]
+
+    def _current_range(self) -> tuple:
+        """What the fields hold now, in (V, V, mV), or None if unparsable."""
+        try:
+            start = float(self.start_voltage.text())
+            stop = float(self.stop_voltage.text())
+            step = float(self.step_size.text())
+        except ValueError:
+            return None
+        if self.start_unit.currentText() == "mV":
+            start /= 1000.0
+        if self.stop_unit.currentText() == "mV":
+            stop /= 1000.0
+        if self.step_unit.currentText() == "V":
+            step *= 1000.0
+        return start, stop, step
+
+    def apply_architecture_range(self, is_pin: bool) -> None:
+        """Write the recommended window into the fields."""
+        start, stop, step = self.recommended_range(is_pin)
+        self.start_unit.setCurrentText("V")
+        self.stop_unit.setCurrentText("V")
+        self.step_unit.setCurrentText("mV")
+        self.start_voltage.setText(f"{start:g}")
+        self.stop_voltage.setText(f"{stop:g}")
+        self.step_size.setText(f"{step:g}")
+
+    def _offer_architecture_range(self, is_pin: bool) -> None:
+        """Offer the mirrored sweep window when the architecture changes.
+
+        This is what makes the toggle do something rather than label something.
+        A p-i-n cell contacted like an n-i-p one generates in the SECOND
+        quadrant, so the n-i-p window (1.2 V -> -0.2 V) never reaches its
+        operating point: the sweep would return no maximum power point and the
+        metrics would come back NaN.
+
+        It ASKS rather than overwrites. Silently discarding a deliberately
+        typed sweep window is its own data-quality bug, and some cells are
+        measured over a deliberately unusual range.
+        """
+        recommended = self.recommended_range(is_pin)
+        current = self._current_range()
+        if current is not None and all(
+                abs(a - b) < 1e-9 for a, b in zip(current, recommended)):
+            return                                    # already correct
+
+        other = self.recommended_range(not is_pin)
+        looks_default = current is not None and all(
+            abs(a - b) < 1e-9 for a, b in zip(current, other))
+
+        name = "p-i-n" if is_pin else "n-i-p"
+        start, stop, step = recommended
+        if looks_default:
+            # Untouched values from the other architecture: just mirror them.
+            self.apply_architecture_range(is_pin)
+            return
+
+        answer = QtWidgets.QMessageBox.question(
+            self, "Apply recommended sweep range?",
+            f"A {name} cell generates in "
+            f"{'the second' if is_pin else 'the fourth'} quadrant.\n\n"
+            f"Apply the recommended range for {name}?\n"
+            f"    Start {start:g} V\n    Stop {stop:g} V\n    Step {step:g} mV\n\n"
+            "Choosing No keeps your current values, which may not reach this "
+            "device's operating point.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes,
+        )
+        if answer == QtWidgets.QMessageBox.Yes:
+            self.apply_architecture_range(is_pin)
+
+    def _update_architecture_labels(self, is_pin: bool):
+        """Emphasise the selected side and mute the other.
+
+        The toggle track alone reads as one blob of colour at a glance; the
+        label is what the operator actually reads, so the active one carries
+        the colour and the weight.
+        """
+        from solarjv_analyzer.gui.theme import tokens as _t
+
+        active = ("font-weight: 700; font-size: 13px; color: {};"
+                  " background: transparent;")
+        muted = ("font-weight: 500; font-size: 13px; color: #94a3b8;"
+                 " background: transparent;")
+        self._arch_nip_label.setStyleSheet(
+            muted if is_pin else active.format(_t.PRIMARY))
+        self._arch_pin_label.setStyleSheet(
+            active.format(_t.ARCH_PIN_RED_TEXT) if is_pin else muted)
 
     def get_parameters(self) -> dict:
         """
@@ -239,6 +489,10 @@ class ParameterTab(QtWidgets.QWidget):
             area /= 100.0
         elif area_unit == "m²":
             area *= 10000.0
+            
+        # Notes
+        notes_text = self.notes_field.toPlainText().strip()
+        save_notes = self.save_notes_checkbox.isChecked()
 
         return {
             'start_voltage': start_v,
@@ -247,6 +501,9 @@ class ParameterTab(QtWidgets.QWidget):
             'sweep_rate': sweep_rate,
             'compliance_current': compliance,
             'device_area': area,
+            'architecture': "p-i-n" if self.architecture_toggle.isChecked() else "n-i-p",
+            'notes_text': notes_text if save_notes else '',
+            'save_notes': save_notes,
         }
 
     # -------------------------------------------------------------------------
@@ -257,15 +514,28 @@ class ParameterTab(QtWidgets.QWidget):
         """Connect UI signals to their handlers."""
         self.select_all_channels.toggled.connect(self.on_select_all_channels)
 
-    def on_select_all_channels(self, checked: bool):
-        """
-        Select or deselect all channel checkboxes.
+        # Connect each individual channel to update Select All state and its number chip
+        for idx, channel in enumerate(self.channels):
+            channel.toggled.connect(self._update_select_all_state)
+            # Use a lambda with a default argument to capture the correct index
+            channel.toggled.connect(lambda checked, i=idx: self._update_channel_number_chip(i, checked))
 
-        Args:
-            checked: True to select all, False to deselect all
-        """
-        for channel in self.channels:
+    def _update_select_all_state(self):
+        """Update Select All toggle state based on individual channel selections."""
+        all_checked = all(channel.isChecked() for channel in self.channels)
+        self.select_all_channels.blockSignals(True)
+        self.select_all_channels.setChecked(all_checked)
+        self.select_all_channels.blockSignals(False)
+        self.select_all_channels.sync_visual_state()
+
+    def on_select_all_channels(self, checked: bool):
+        """Select or deselect all channel toggles."""
+        for idx, channel in enumerate(self.channels):
+            channel.blockSignals(True)
             channel.setChecked(checked)
+            channel.blockSignals(False)
+            channel.sync_visual_state()
+            self._update_channel_number_chip(idx, checked)
 
     # -------------------------------------------------------------------------
     # Channel Selection

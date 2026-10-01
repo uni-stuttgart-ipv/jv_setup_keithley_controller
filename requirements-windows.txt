@@ -1,0 +1,44 @@
+# Known-good pinned set for the Windows lab PC.
+#
+# Why pinned: `pip install -e .` takes the newest of everything, so two PCs
+# installed a month apart get different libraries and "it works on the other
+# machine" stops being a useful sentence. These versions are the ones the
+# project is currently developed and tested against.
+#
+#   py -m pip install -r requirements-windows.txt
+#   py -m pip install -e . --no-deps
+#
+# !!! REQUIRES PYTHON 3.11 OR NEWER — verified on 3.13. !!!
+# numpy 2.3 and scipy 1.16 dropped support for 3.9 and 3.10, so on an older
+# interpreter pip refuses the whole file with:
+#     ERROR: Ignored the following versions that require a different python
+#     version: ... Requires-Python >=3.10
+#     ERROR: No matching distribution found for pyvisa==1.15.0
+# That message means your Python is too old, NOT that the package is missing.
+# Check first:  py -0p     (lists every Python installed, with its path)
+# Then install with the version named explicitly:  py -3.13 -m pip install ...
+#
+# Python 3.9 is still needed for Briefcase packaging ([tool.briefcase]), so keep
+# it installed — just don't run the app with it.
+
+pymeasure==0.15.0
+PyQt5==5.15.11
+pyqtgraph==0.13.7
+pyvisa==1.15.0
+pyserial==3.5
+numpy==2.3.3
+scipy==1.16.2
+pandas==2.3.2
+argon2-cffi==25.1.0
+
+# VISA backend. Pure Python, talks to the Keithley over RS-232 through
+# pyserial — no NI driver install, no reboot. Remove this line if the PC has
+# NI-VISA installed and you want to use it instead (see docs/install-windows.md).
+pyvisa-py==0.7.2
+
+# Optional, only for running the test suite on this machine:
+# pytest==8.4.2
+
+# NOTE: pyproject.toml also lists matplotlib and reportlab, but nothing in
+# src/ imports either of them. They are ~80 MB of install for no benefit and
+# are deliberately left out here.

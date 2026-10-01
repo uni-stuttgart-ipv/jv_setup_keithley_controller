@@ -5,49 +5,128 @@ build-backend = "hatchling.build"
 [project]
 name = "solarjv-analyzer"
 version = "0.0.1"
-description = "J–V Analysis GUI using PyMeasure and PyQt5"
+description = "Automated multi-channel J–V characterisation and SPO degradation testing platform for solar cells — Keithley 2400 SourceMeter with 6-channel multiplexer, PyQt5 graphical interface, and quadrant-agnostic metric extraction."
 authors = [
-  { name = "Yamandeep", email = "st195620@stud.uni-stuttgart.de" }
+  { name = "Yamandeep Soni", email = "st195620@stud.uni-stuttgart.de" }
+]
+maintainers = [
+  { name = "Institut für Photovoltaik (ipv)", email = "ipv@ipv.uni-stuttgart.de" }
 ]
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "LICENSE.txt" }
 classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
   "License :: OSI Approved :: MIT License",
-  "Programming Language :: Python :: 3",
   "Operating System :: MacOS :: MacOS X",
-  "Operating System :: Microsoft :: Windows"
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Physics",
+  "Topic :: Scientific/Engineering :: Interface Engine/Protocol Translator",
 ]
-keywords = ["solar", "JV", "pymeasure", "gui", "photovoltaics"]
+keywords = [
+  "solar",
+  "photovoltaics",
+  "JV-curve",
+  "current-voltage",
+  "I-V-characterisation",
+  "solar-cell",
+  "Keithley-2400",
+  "SourceMeter",
+  "pymeasure",
+  "PyQt5",
+  "pyqtgraph",
+  "SPO",
+  "set-point-operation",
+  "stability-test",
+  "MPPT",
+  "fill-factor",
+  "efficiency",
+  "perovskite",
+  "nip",
+  "pin",
+  "hysteresis",
+  "gui",
+  "university-of-stuttgart",
+  "ipv",
+]
 dependencies = [
   "pymeasure",
   "PyQt5",
+  "pyqtgraph",
   "pyvisa",
+  # PyVISA is only an API: it needs a backend. Without NI-VISA installed
+  # system-wide it finds nothing and every VISAAdapter open fails, which
+  # a packaged app hits even though raw pyserial port detection works.
+  "pyvisa-py",
+  "pyserial",
+  "numpy",
+  "scipy",
+  "pandas",
   "matplotlib",
   "reportlab",
-  "pandas",
-  "scipy",
+  "argon2-cffi",
 ]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "hatch",
+  "briefcase",
+  "google-genai",
+]
+
+[project.urls]
+Homepage = "https://github.com/uni-stuttgart-ipv/jv_setup_keithley_controller"
+Repository = "https://github.com/uni-stuttgart-ipv/jv_setup_keithley_controller.git"
+Issues = "https://github.com/uni-stuttgart-ipv/jv_setup_keithley_controller/issues"
+
+[project.scripts]
+solarjv = "solarjv_analyzer.main:main"
 
 [tool.hatch.envs.default]
 dependencies = [
   "pymeasure",
   "PyQt5",
+  "pyqtgraph",
   "pyvisa",
+  # PyVISA is only an API: it needs a backend. Without NI-VISA installed
+  # system-wide it finds nothing and every VISAAdapter open fails, which
+  # a packaged app hits even though raw pyserial port detection works.
+  "pyvisa-py",
+  "pyserial",
+  "numpy",
+  "scipy",
+  "pandas",
   "matplotlib",
   "reportlab",
-  "pandas",
-  "pyserial",
+  "argon2-cffi",
+  "pytest",
+  "google-genai",
 ]
 
 [tool.hatch.envs.default.scripts]
 start = "python src/solarjv_analyzer/main.py"
+test = "pytest tests/ -v"
+test-quick = "pytest tests/ -q"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.briefcase]
 project_name = "SolarJVAnalyzer"
 formal_name = "Solar JV Analyzer"
-bundle = "com.yourorg.solarjvanalyzer"
+bundle = "com.ipv-uni-stuttgart.solarjvanalyzer"
 version = "0.0.1"
+url = "https://www.ipv.uni-stuttgart.de"
 
 [tool.briefcase.app.solarjv_analyzer]
 sources = ["src/solarjv_analyzer"]
@@ -57,12 +136,33 @@ icon = "app_icon"
 requires = [
   "pymeasure",
   "PyQt5",
+  "pyqtgraph",
   "pyvisa",
+  # PyVISA is only an API: it needs a backend. Without NI-VISA installed
+  # system-wide it finds nothing and every VISAAdapter open fails, which
+  # a packaged app hits even though raw pyserial port detection works.
+  "pyvisa-py",
+  "pyserial",
+  "numpy",
+  "scipy",
+  "pandas",
   "matplotlib",
   "reportlab",
-  "pandas",
-  "scipy",
-  "pyserial",
-  "std-nslog" 
+  "argon2-cffi",
 ]
 license.file = "LICENSE.txt"
+
+# --- Platform-specific extras -------------------------------------------------
+# std-nslog is a macOS-only shim over Apple's NSLog API. It ships a C extension
+# and has no Windows wheel, so it must never appear in the cross-platform
+# `requires` list above.
+[tool.briefcase.app.solarjv_analyzer.macOS]
+requires = [
+  "std-nslog",
+]
+
+[tool.briefcase.app.solarjv_analyzer.windows]
+requires = []
+
+[tool.briefcase.app.solarjv_analyzer.linux]
+requires = []

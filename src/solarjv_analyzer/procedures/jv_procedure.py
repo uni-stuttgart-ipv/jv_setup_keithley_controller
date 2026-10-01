@@ -2,6 +2,7 @@
 Keithley 2400 J-V Measurement Procedure
 
 Implements hardware-controlled staircase sweep for solar cell characterization.
+Supports dual-direction sweeps (Forward + Reverse) by default, with option for single sweep mode.
 Uses the instrument's built-in sweep capability with automatic NPLC calculation
 from user-specified sweep rate.
 """
@@ -20,6 +21,7 @@ from pymeasure.experiment.parameters import (
 )
 
 from solarjv_analyzer.analysis.analysis import compute_jv_metrics, ANALYSIS_LABELS_UNITS
+from solarjv_analyzer.instruments.instrument_manager import visa_session_open
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -30,8 +32,8 @@ class JVProcedure(Procedure):
     J-V sweep procedure for Keithley 2400 SourceMeter.
 
     Executes a hardware-controlled staircase sweep from start_voltage to stop_voltage
-    with specified step_size. The sweep rate determines the measurement speed, and
-    NPLC is automatically calculated to match the requested rate.
+    with specified step_size. By default, performs Forward + Reverse sweeps.
+    Single sweep mode (Forward only) can be enabled in Analysis tab.
 
     Signals:
         results: Emits individual data points during sweep
@@ -79,9 +81,20 @@ class JVProcedure(Procedure):
     device_area = FloatParameter("Device Area", units="cm2", default=0.089)
     incident_power = FloatParameter("Incident Power", units="mW/cm2", default=100)
     user_name = Parameter("User Name", default="")
+    architecture = Parameter("Device Architecture", default="n-i-p")
 
     # Advanced Timing
     auto_zero = BooleanParameter("Auto Zero", default=False)
+    # 50 Hz — European mains, which is where this rig runs. This is the SINGLE
+    # source of truth for the NPLC timing model on every path. A `:SYST:LFR?`
+    # query used to sit in startup()'s fallback-connect branch, which only runs
+    # when no instrument was handed in; in normal operation it never fired, so
+    # the value was 50 anyway — but on the rare fallback path the sweep silently
+    # used different timing. Deterministic beats occasionally-cleverer.
+    #
+    # On 60 Hz mains this must be changed: NPLC is computed as
+    # `time_per_point * line_frequency`, so a wrong value makes the sweep run
+    # at a different rate than the one recorded in the report.
     line_frequency = FloatParameter("Line Frequency", units="Hz", default=50.0)
 
     # Analysis (4-Probe)
@@ -89,6 +102,10 @@ class JVProcedure(Procedure):
     lateral_factor = FloatParameter("4-Probe Lateral Factor", default=1.0)
     probe_spacing = FloatParameter("4-Probe Spacing", units="um", default=2290)
     sample_thickness = FloatParameter("Sample Thickness", units="um", default=500)
+
+    # Sweep Mode
+    single_sweep_mode = BooleanParameter("Single Sweep Mode", default=False)
+    sweep_direction = Parameter("Sweep Direction", default="Forward")
 
     # Debug & Validation
     simulation = BooleanParameter("Simulation Mode", default=False)
@@ -127,7 +144,8 @@ class JVProcedure(Procedure):
         self._line_freq = float(self.line_frequency)
 
         logger.info(f"JVProcedure initialized (Channel {self.active_channel}, "
-                    f"Rate={self.sweep_rate} V/s, AutoZero={'ON' if self.auto_zero else 'OFF'})")
+                    f"Rate={self.sweep_rate} V/s, AutoZero={'ON' if self.auto_zero else 'OFF'}, "
+                    f"SingleSweep={'ON' if self.single_sweep_mode else 'OFF'}")
 
     # -------------------------------------------------------------------------
     # Hardware Communication
@@ -185,6 +203,15 @@ class JVProcedure(Procedure):
         """Emergency abort: turn off output and return instrument to idle."""
         if self._sim or not self.instrument:
             return
+        if not visa_session_open(self.instrument):
+            # Nothing can be sent down a closed session. Say so once instead
+            # of raising "Invalid session handle" three more times, which
+            # buried the real first error in the log.
+            logger.warning(
+                "Safety abort skipped: the VISA session is closed "
+                "(the output could not be commanded off from here)."
+            )
+            return
         try:
             logger.warning("Safety abort initiated")
             self.instrument.write(":OUTP OFF")
@@ -212,42 +239,54 @@ class JVProcedure(Procedure):
     # Sweep Parameter Calculation
     # -------------------------------------------------------------------------
 
-    def _generate_voltage_sequence(self) -> list:
-        """
-        Generate the exact voltage sequence for the sweep.
-
-        Creates a list of voltages from start to stop with the specified step size,
-        ensuring the stop voltage is included.
-
-        Returns:
-            List of voltage values for the sweep
-        """
+    def _generate_voltage_sequence(self):
+        """Generate voltage sequence based on sweep direction."""
         start = float(self.start_voltage)
         stop = float(self.stop_voltage)
-        step = float(self.step_size)
+        step = abs(float(self.step_size))
 
-        if step == 0:
-            step = 0.1
-        if stop < start:
-            step = -abs(step)
-        else:
-            step = abs(step)
+        if step <= 0:
+            raise ValueError(
+                f"Step size must be greater than zero (received {step})."
+            )
 
+        # Generate sequence
         voltages = []
         current = start
-
-        if step > 0:
-            while current <= stop + (0.5 * step):
-                voltages.append(round(current, 6))
-                current += step
+        
+        if self.sweep_direction == "Reverse":
+            # Reverse: start at stop, go to start
+            current = start
+            if start > stop:
+                while current >= stop - (0.5 * step):
+                    voltages.append(round(current, 6))
+                    current -= step
+            else:
+                while current <= stop + (0.5 * step):
+                    voltages.append(round(current, 6))
+                    current += step
         else:
-            while current >= stop + (0.5 * step):
-                voltages.append(round(current, 6))
-                current += step
-
+            # Forward: start to stop
+            if start > stop:
+                while current >= stop - (0.5 * step):
+                    voltages.append(round(current, 6))
+                    current -= step
+            else:
+                while current <= stop + (0.5 * step):
+                    voltages.append(round(current, 6))
+                    current += step
+        
         # Ensure stop voltage is included
-        if voltages and abs(voltages[-1] - stop) > abs(step) * 0.1:
+        if voltages and abs(voltages[-1] - stop) > step * 0.1:
             voltages.append(stop)
+
+        if len(voltages) < 2:
+            raise ValueError(
+                f"Sweep range produces only {len(voltages)} point(s). "
+                f"Check start voltage ({start}), stop voltage ({stop}), "
+                f"and step size ({step}). At least 2 points are required "
+                f"for a valid sweep."
+            )
 
         return voltages
 
@@ -256,7 +295,7 @@ class JVProcedure(Procedure):
         Calculate NPLC and source delay from the requested sweep rate.
 
         Uses professor's method: total_time = voltage_range / sweep_rate
-        time_per_point = total_time / total_points
+        time_per_point = total_time / single_points
         NPLC = time_per_point * line_frequency
 
         Returns:
@@ -266,7 +305,12 @@ class JVProcedure(Procedure):
         stop = float(self.stop_voltage)
         step = abs(float(self.step_size))
 
-        total_points = int(abs(stop - start) / step) + 1
+        single_points = int(abs(stop - start) / step) + 1
+
+        if self.single_sweep_mode:
+            total_points = single_points
+        else:
+            total_points = (single_points * 2) - 1
 
         # If sweep_rate is not specified, use user-provided NPLC
         if self.sweep_rate <= 0:
@@ -274,7 +318,7 @@ class JVProcedure(Procedure):
 
         voltage_range = abs(stop - start)
         total_time = voltage_range / self.sweep_rate
-        time_per_point = total_time / total_points
+        time_per_point = total_time / single_points
 
         nplc = time_per_point * self._line_freq
         nplc = max(0.01, min(10.0, nplc))
@@ -285,6 +329,7 @@ class JVProcedure(Procedure):
 
         logger.info(f"Sweep timing: {total_time:.2f}s total, {time_per_point*1000:.1f}ms/point, "
                     f"NPLC={nplc:.3f}, delay={source_delay*1000:.1f}ms")
+        logger.info(f"Points: single direction={single_points}, total={total_points}")
 
         return nplc, source_delay
 
@@ -304,6 +349,17 @@ class JVProcedure(Procedure):
         """
         if self._configured:
             return self._total_points
+
+        if not self._sim and self.instrument is not None \
+                and not visa_session_open(self.instrument):
+            # Fail with something the operator can act on. Previously the
+            # first :OUTP OFF raised a raw pyvisa InvalidSession from four
+            # frames down, with no hint that the instrument simply needed
+            # reconnecting.
+            raise RuntimeError(
+                "The Keithley's VISA session is closed — the instrument must "
+                "be reconnected before a sweep can run."
+            )
 
         self._ensure_idle()
 
@@ -334,10 +390,13 @@ class JVProcedure(Procedure):
         step_v = self._expected_voltages[1] - self._expected_voltages[0]
 
         self._write(":SOUR:FUNC VOLT", "Source function")
-        self._write(":SOUR:VOLT:MODE SWE", "Sweep mode")
+        # Manual Table 10-4, footnote 1: the sweep MODE command "should
+        # normally be sent after START, STOP, and STEP to avoid delays caused
+        # by rebuilding sweep when each command is sent."
         self._write(f":SOUR:VOLT:STAR {start_v}", "Start voltage")
         self._write(f":SOUR:VOLT:STOP {stop_v}", "Stop voltage")
         self._write(f":SOUR:VOLT:STEP {step_v}", "Step size")
+        self._write(":SOUR:VOLT:MODE SWE", "Sweep mode")
         self._check_errors("After source config")
 
         # Configure measurement
@@ -446,6 +505,8 @@ class JVProcedure(Procedure):
         logger.debug(f"Received {len(values)} values")
 
         points_parsed = 0
+        compliance_a = abs(float(self.compliance_current))
+        n_clipped = 0
         for i in range(0, len(values) - 1, 2):
             try:
                 voltage = float(values[i])
@@ -455,16 +516,38 @@ class JVProcedure(Procedure):
                 measured_currents.append(current)
                 points_parsed += 1
 
-                self.emit('results', {
-                    "Channel": channel,
-                    "Voltage (V)": voltage,
-                    "Current (A)": current,
-                    "Time (s)": duration,
-                    "Status": "OK",
-                })
+                # A reading at (>=99% of) the compliance limit is the
+                # instrument's clamp, not the device's J-V curve. Such
+                # points are NOT emitted at all — they never appear on the
+                # plot or in the data file; only real measurements do. They
+                # are still appended to the internal arrays above so the
+                # sweep-completeness validation and the forward/reverse
+                # index split operate on the raw point count.
+                at_compliance = abs(current) >= 0.99 * compliance_a
+                if at_compliance:
+                    n_clipped += 1
+                else:
+                    self.emit('results', {
+                        "Channel": channel,
+                        "Voltage (V)": voltage,
+                        "Current (A)": current,
+                        "Time (s)": duration,
+                        "Status": "OK",
+                    })
 
             except (ValueError, IndexError) as e:
                 logger.warning(f"Failed to parse point {i//2}: {e}")
+
+        if n_clipped:
+            # Record immediately so the count is available even if the
+            # analysis stage never runs (e.g. an all-clamped sweep).
+            self.compliance_clipped_points = n_clipped
+            logger.warning(
+                f"{n_clipped} point(s) at the compliance limit "
+                f"({compliance_a} A) suppressed — clamped by the instrument, "
+                "not measurements of the cell. Reduce the start voltage or "
+                "raise compliance."
+            )
 
         self.emit("progress", 100)
         logger.info(f"Parsed {points_parsed}/{total_points} points")
@@ -482,8 +565,8 @@ class JVProcedure(Procedure):
     # Analysis and File Writing
     # -------------------------------------------------------------------------
 
-    def _write_analysis_to_file(self, channel: int, metrics: dict):
-        """Append analysis results to the data file."""
+    def _write_analysis_to_file(self, channel: int, metrics: dict, direction: str = "Forward"):
+        """Write analysis block to the temp file with direction."""
         try:
             results_obj = getattr(self, "results", None)
             data_path = None
@@ -507,8 +590,8 @@ class JVProcedure(Procedure):
             # Avoid duplicate analysis blocks
             try:
                 with open(data_path, 'r', encoding='utf-8') as f:
-                    if f"Channel\t{channel}" in f.read():
-                        logger.debug(f"Analysis for Channel {channel} already exists")
+                    if f"Channel\t{channel}_{direction}" in f.read():
+                        logger.debug(f"Analysis for Channel {channel} ({direction}) already exists")
                         return
             except FileNotFoundError:
                 pass
@@ -516,7 +599,7 @@ class JVProcedure(Procedure):
             # Write analysis block
             with open(data_path, "a", encoding="utf-8") as f:
                 f.write("\n[[ANALYSIS]]\n")
-                f.write(f"Channel\t{channel}\n")
+                f.write(f"Channel\t{channel}_{direction}\n")
                 for label, unit in self.ANALYSIS_LABELS_UNITS:
                     val = metrics.get(label, 0.0)
                     if isinstance(val, float):
@@ -526,7 +609,7 @@ class JVProcedure(Procedure):
                     f.write(f"{label}\t{formatted}\t{unit}\n")
                 f.write("[[/ANALYSIS]]\n")
 
-            logger.debug(f"Analysis written for Channel {channel}")
+            logger.debug(f"Analysis written for Channel {channel} ({direction})")
 
         except Exception as e:
             logger.warning(f"Failed to write analysis: {e}")
@@ -564,16 +647,6 @@ class JVProcedure(Procedure):
                 self.instrument = get_keithley(address=self.gpib_address)
                 logger.info(f"Connected to Keithley at {self.gpib_address}")
 
-                # Query line frequency
-                try:
-                    resp = self.instrument.ask(":SYST:LFR?")
-                    resp = resp.strip().upper()
-                    if resp in ("50", "60"):
-                        self._line_freq = float(resp)
-                        logger.info(f"Line frequency: {self._line_freq} Hz")
-                except Exception as e:
-                    logger.warning(f"Could not query line frequency: {e}")
-
             self._configured = False
             self._last_metrics = None
             logger.info("Startup complete")
@@ -589,8 +662,9 @@ class JVProcedure(Procedure):
 
         try:
             channel = int(self.active_channel)
+            mode = "Single (Forward only)" if self.single_sweep_mode else "Dual (Forward + Reverse)"
             logger.info(f"Channel {channel}: {self.start_voltage}V → {self.stop_voltage}V, "
-                       f"step={self.step_size}V, rate={self.sweep_rate}V/s")
+                       f"step={self.step_size}V, rate={self.sweep_rate}V/s, mode={mode}")
 
             # Select MUX channel
             if self.mux is not None:
@@ -630,12 +704,40 @@ class JVProcedure(Procedure):
             logger.info("Sweep execution finished")
             logger.info("=" * 50)
 
+    @staticmethod
+    def filter_compliance_points(voltages, currents, compliance_a, threshold=0.99):
+        """Split off points clamped at the compliance limit.
+
+        A reading with |I| >= threshold x |compliance| is the SourceMeter's
+        programmed ceiling, not the device's J-V characteristic (verified:
+        a real clamped sweep read 0.09999789 A at a 0.1 A limit). Returns
+        (clean_v, clean_i, n_flagged).
+        """
+        v = np.asarray(voltages, dtype=float)
+        i = np.asarray(currents, dtype=float)
+        keep = np.abs(i) < threshold * abs(float(compliance_a))
+        return v[keep], i[keep], int(i.size - np.count_nonzero(keep))
+
+    def _analysis_kwargs(self) -> dict:
+        """Extra analysis parameters forwarded to compute_jv_metrics.
+
+        Wires the Analysis-Settings fields (architecture, contact threshold,
+        4-probe geometry) into the metric computation so they have a real
+        effect rather than remaining front-end decoration.
+        """
+        return {
+            "architecture": self.architecture,
+            "contact_threshold_a": float(self.contact_threshold),
+            "sample_thickness_um": float(self.sample_thickness),
+            "lateral_factor": float(self.lateral_factor),
+        }
+
     def _finalize_analysis(self, channel: int):
         """
         Compute J-V metrics, store results, and write to file.
 
-        Calculates efficiency, fill factor, Voc, Jsc, and other parameters
-        from the collected I-V data.
+        For dual sweep mode, computes separate metrics for Forward and Reverse directions.
+        For single sweep mode, computes metrics for the current sweep direction only.
         """
         try:
             if not self._voltages or not self._currents:
@@ -645,24 +747,123 @@ class JVProcedure(Procedure):
             voltages = self._voltages[:min_len]
             currents = self._currents[:min_len]
 
-            metrics = compute_jv_metrics(
-                v_raw=voltages,
-                i_raw=currents,
-                area_cm2=float(self.device_area),
-                incident_power_mw_per_cm2=float(self.incident_power),
-            )
+            # Compliance-clamped points are the instrument's current ceiling,
+            # not measurements of the device (a 0.7 V start at 0.1 A
+            # compliance produces a flat J = 0.0999... plateau). They are
+            # excluded from METRIC computation per branch below — AFTER the
+            # forward/reverse index split, which must operate on the raw
+            # point count. The raw data file keeps every point, tagged in
+            # its Status column.
+            compliance_a = float(self.compliance_current)
+            self.compliance_clipped_points = 0
 
-            self.analysis_results[channel] = metrics
-            self._last_metrics = {"Channel": channel, **metrics}
-            self.emit('analysis', {"Channel": channel, **metrics})
+            total_points = len(voltages)
 
-            logger.info(f"Channel {channel} Results: "
-                       f"EFF={metrics.get('EFF', 0):.2f}%, "
-                       f"FF={metrics.get('FF', 0):.2f}%, "
-                       f"Voc={metrics.get('Voc', 0):.4f}V, "
-                       f"Jsc={metrics.get('Jsc', 0):.4f}mA/cm²")
+            # Calculate points per direction
+            start = float(self.start_voltage)
+            stop = float(self.stop_voltage)
+            step = abs(float(self.step_size))
+            points_per_direction = int(abs(stop - start) / step) + 1
 
-            self._write_analysis_to_file(channel, metrics)
+            if self.single_sweep_mode or total_points == points_per_direction:
+                # Single sweep mode — use the actual sweep direction
+                direction = self.sweep_direction  # "Forward" or "Reverse"
+
+                v_clean, i_clean, n_clip = self.filter_compliance_points(
+                    voltages, currents, compliance_a
+                )
+                self.compliance_clipped_points = n_clip
+                if n_clip:
+                    logger.warning(
+                        f"Excluding {n_clip} compliance-clamped point(s) from analysis."
+                    )
+                if v_clean.size == 0:
+                    logger.error("All points at compliance — no valid data to analyse.")
+                    return
+
+                metrics = compute_jv_metrics(
+                    v_raw=v_clean,
+                    i_raw=i_clean,
+                    area_cm2=float(self.device_area),
+                    incident_power_mw_per_cm2=float(self.incident_power),
+                    **self._analysis_kwargs(),
+                )
+
+                self.analysis_results[channel] = {direction: metrics}
+                self._last_metrics = {"Channel": channel, "Direction": direction, **metrics}
+                
+                self.emit('analysis', {"Channel": channel, "Direction": direction, **metrics})
+                self._write_analysis_to_file(channel, metrics, direction)
+
+                logger.info(f"Channel {channel} ({direction}): "
+                        f"EFF={metrics.get('EFF', 0):.2f}%, "
+                        f"FF={metrics.get('FF', 0):.2f}%, "
+                        f"Voc={metrics.get('Voc', 0):.2f}mV, "
+                        f"Jsc={metrics.get('Jsc', 0):.3f}mA/cm²")
+
+            else:
+                # Dual sweep mode — split into Forward and Reverse FIRST
+                # (index-based split needs the raw point count), THEN drop
+                # compliance-clamped points per branch.
+                forward_v = voltages[:points_per_direction]
+                forward_i = currents[:points_per_direction]
+
+                reverse_v = list(reversed(voltages[points_per_direction - 1:]))
+                reverse_i = list(reversed(currents[points_per_direction - 1:]))
+
+                fwd_v, fwd_i, n_clip_f = self.filter_compliance_points(
+                    forward_v, forward_i, compliance_a
+                )
+                rev_v, rev_i, n_clip_r = self.filter_compliance_points(
+                    reverse_v, reverse_i, compliance_a
+                )
+                self.compliance_clipped_points = n_clip_f + n_clip_r
+                if self.compliance_clipped_points:
+                    logger.warning(
+                        f"Excluding {n_clip_f} forward / {n_clip_r} reverse "
+                        "compliance-clamped point(s) from analysis."
+                    )
+                if fwd_v.size == 0 or rev_v.size == 0:
+                    logger.error("A full branch was at compliance — no valid data.")
+                    return
+
+                forward_metrics = compute_jv_metrics(
+                    v_raw=fwd_v,
+                    i_raw=fwd_i,
+                    area_cm2=float(self.device_area),
+                    incident_power_mw_per_cm2=float(self.incident_power),
+                    **self._analysis_kwargs(),
+                )
+
+                reverse_metrics = compute_jv_metrics(
+                    v_raw=rev_v,
+                    i_raw=rev_i,
+                    area_cm2=float(self.device_area),
+                    incident_power_mw_per_cm2=float(self.incident_power),
+                    **self._analysis_kwargs(),
+                )
+
+                self.analysis_results[channel] = {
+                    "Forward": forward_metrics,
+                    "Reverse": reverse_metrics
+                }
+
+                self.emit('analysis', {"Channel": channel, "Direction": "Forward", **forward_metrics})
+                self.emit('analysis', {"Channel": channel, "Direction": "Reverse", **reverse_metrics})
+
+                self._write_analysis_to_file(channel, forward_metrics, "Forward")
+                self._write_analysis_to_file(channel, reverse_metrics, "Reverse")
+
+                logger.info(f"Channel {channel} - Forward: "
+                        f"EFF={forward_metrics.get('EFF', 0):.2f}%, "
+                        f"FF={forward_metrics.get('FF', 0):.2f}%, "
+                        f"Voc={forward_metrics.get('Voc', 0):.2f}mV, "
+                        f"Jsc={forward_metrics.get('Jsc', 0):.3f}mA/cm²")
+                logger.info(f"Channel {channel} - Reverse: "
+                        f"EFF={reverse_metrics.get('EFF', 0):.2f}%, "
+                        f"FF={reverse_metrics.get('FF', 0):.2f}%, "
+                        f"Voc={reverse_metrics.get('Voc', 0):.2f}mV, "
+                        f"Jsc={reverse_metrics.get('Jsc', 0):.3f}mA/cm²")
 
         except Exception as e:
             logger.warning(f"Analysis failed: {e}")
