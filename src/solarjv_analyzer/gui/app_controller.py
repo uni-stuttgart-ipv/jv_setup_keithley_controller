@@ -131,6 +131,72 @@ class AppController:
         self._combined_spo_params = {}
         self._combined_spo_powers = []
 
+        # Every unlock in this class hangs off a finish handler; a handler
+        # that never runs cannot unlock anything. See _idle_watchdog().
+        self._stuck_ticks = 0
+        self._idle_timer = QtCore.QTimer(self.view)
+        self._idle_timer.setInterval(2000)
+        self._idle_timer.timeout.connect(self._idle_watchdog)
+        self._idle_timer.start()
+
+    def _idle_watchdog(self):
+        """Unlock the window when nothing is actually running any more.
+
+        Every exit path re-enables the controls correctly — `_return_to_idle`,
+        `_on_combined_spo_finished`, `on_abort_returned`, `on_failed` and both
+        exits of `_start_spo_phase` all call `_set_combined_config_enabled(True)`,
+        and a lock/unlock cycle restores the architecture toggle exactly as it
+        should. The failure is that none of them RUN: pymeasure raises inside
+        `Manager._finish()` *before* it emits `finished` (one empty results
+        table is enough — see the 2026-10-01 logs), so the sweeps end, the
+        queue empties, and the toggle, the voltages and Run stay greyed with
+        nothing left to re-enable them.
+
+        Rather than chase every way a handler can die, this asks the ground
+        truth — is anything actually running? — and recovers. The state must
+        look idle for THREE consecutive ticks (~6 s) before it acts: a queue
+        being built briefly shows no running experiment, and unlocking inside
+        that window would fight the run that is just starting.
+
+        A paused queue (`has_next()`) is legitimately not idle, so it is left
+        alone — Resume and Clear own that state.
+
+        UI recovery only. If a finish handler died it may also have skipped
+        the file merge, which this deliberately does not retry; the warning
+        below is the signal to go and look.
+        """
+        try:
+            if (self.spo_running or self.manager.is_running()
+                    or self.manager.experiments.has_next()):
+                self._stuck_ticks = 0
+                return
+
+            worker = getattr(self, "_spo_worker", None)
+            if worker is not None and worker.isRunning():
+                self._stuck_ticks = 0
+                return
+
+            try:
+                unlocked = self.view.combined_tab.jv_params.isEnabled()
+            except AttributeError:
+                unlocked = True
+            if not self.is_busy and unlocked:
+                self._stuck_ticks = 0
+                return
+
+            self._stuck_ticks += 1
+            if self._stuck_ticks < 3:
+                return
+            self._stuck_ticks = 0
+            logger.warning(
+                "Nothing is running but the window was still locked - a finish "
+                "handler did not complete. Returning to idle; check that the "
+                "last run's report was written."
+            )
+            self._return_to_idle()
+        except Exception as exc:                       # noqa: BLE001
+            logger.debug(f"Idle watchdog skipped: {exc}")
+
     # -------------------------------------------------------------------------
     # Signal Connections
     # -------------------------------------------------------------------------
@@ -156,7 +222,8 @@ class AppController:
         Collect parameters from UI and queue experiments for selected channels.
 
         Handles both single-file (merged) and multi-file output modes.
-        Preserves existing channel data in the analysis panel.
+        Clears the plots and the analysis table so the screen shows only
+        this queue's channels.
         """
         if self.is_busy:
             self._refuse_busy("a new queue")
@@ -192,9 +259,6 @@ class AppController:
         self.processed_files = set()
         self.is_single_file_mode = file_params['single_file']
 
-        # Preserve existing channel data in the analysis panel
-        self._preserve_existing_channel_data(selected_channels)
-
         # Connect hardware
         sim_mode = False  
         try:
@@ -211,6 +275,11 @@ class AppController:
         if not self._keithley_usable("JV queue"):
             self.is_busy = False
             return
+
+        # The run is certain to start, so the previous one now comes off the
+        # screen. Purging earlier — before the hardware checks above — would
+        # have discarded good results every time a run failed to start.
+        self._reset_view_for_new_run(selected_channels)
 
         # Generate file paths with timestamp
         timestamp_str = datetime.now().strftime(TIMESTAMP_FORMAT)
@@ -236,53 +305,65 @@ class AppController:
                 selected_channels, procedure_params, sim_mode
             )
 
-    def _preserve_existing_channel_data(self, new_channels):
+    def _reset_view_for_new_run(self, channels):
+        """Wipe every trace of the previous run before queueing a new one.
+
+        A run used to MERGE into whatever was already on screen. The analysis
+        table was rebuilt for the UNION of the old and new channels and the
+        old metrics copied back in, while the previous experiments — and so
+        their curves — were left in the manager untouched. Measuring ch1-3
+        and then ch4-6 showed all six, which was the intent; but the ordinary
+        case was far more confusing. Pressing Run left the last run's curves
+        on the plot and the last run's numbers in the table until each new
+        channel happened to overwrite its own row, so for the length of a
+        queue the screen showed two experiments at once with nothing to say
+        which row belonged to which.
+
+        A new queue now starts from a blank screen. Bringing earlier results
+        back for comparison is what the Open button is for — and `load_files()`
+        performs this same purge before loading them.
+
+        Deliberately does NOT touch run state (`is_busy`, the run controls):
+        this runs mid-start, with the run already claimed by the caller.
         """
-        Preserve analysis data for channels not being re-measured.
+        # Drops the experiments, their browser rows AND their plot curves.
+        self.manager.clear()
+        # Belt and braces: `clear_experiments()` re-arms after clearing for a
+        # reason (see `_rearm_manager`), and a run that starts from a
+        # dis-armed manager queues its sweeps and then never runs them.
+        self._rearm_manager()
+        self.view.browser_widget.browser.clear()
+        self.finished_experiment_count = 0
+
+        # Rebuild the table for THIS run's channels only, cells empty.
+        ordered = sorted(channels)
+        self.view.analysis_panel.reset_channels(
+            ordered, JVProcedure.ANALYSIS_LABELS_UNITS)
+        self.view.analysis_panel.clear_all()
+        self._sync_channel_indicators(ordered)
+
+        self._reset_combined_spo_view()
+
+    def _reset_combined_spo_view(self):
+        """Blank the JV+SPO tab's SPO trace and its three readouts.
+
+        Clearing the J-V half of that tab while leaving the previous run's SPO
+        curve and drift figures below it would be worse than clearing nothing:
+        the two halves would be showing different experiments.
         """
-        # Collect existing channels and experiments
-        existing_channels = set()
-        existing_experiments = []
-        root = self.view.browser_widget.browser.invisibleRootItem()
+        self._spo_times = []
+        self._spo_currents = []
+        self._spo_voltages = []
+        self._combined_spo_powers = []
+        try:
+            self.view.combined_spo_curve.setData([], [])
+            self.view.combined_spo_mean.setText("— mW")
+            self.view.combined_spo_drift.setText("— %")
+            self.view.combined_spo_elapsed.setText("— s")
+        except AttributeError:
+            # The combined tab's widgets are built lazily; nothing to blank.
+            pass
 
-        for i in range(root.childCount()):
-            item = root.child(i)
-            exp = self.manager.experiments.with_browser_item(item)
-            if exp:
-                existing_experiments.append(exp)
-                if hasattr(exp.procedure, 'active_channel'):
-                    try:
-                        existing_channels.add(int(exp.procedure.active_channel))
-                    except (ValueError, TypeError):
-                        pass
-
-        # Combine old and new channels
-        all_channels = sorted(existing_channels.union(set(new_channels)))
-        self.view.analysis_panel.reset_channels(all_channels, JVProcedure.ANALYSIS_LABELS_UNITS)
-        self._sync_channel_indicators(all_channels)
-
-        # Restore data for channels not being measured
-        for exp in existing_experiments:
-            if hasattr(exp.procedure, 'analysis_results') and exp.procedure.analysis_results:
-                results = exp.procedure.analysis_results
-                for channel, metrics in results.items():
-                    if channel not in new_channels:
-                        if isinstance(metrics, dict):
-                            # Handle both single-direction keys ("Forward" or "Reverse")
-                            # and dual-direction keys ({"Forward": ..., "Reverse": ...})
-                            for direction, dir_metrics in metrics.items():
-                                self.view.analysis_panel.analysis({
-                                    'Channel': channel,
-                                    'Direction': direction,
-                                    **dir_metrics
-                                })
-                        else:
-                            # Legacy format: single metrics dict without direction nesting
-                            self.view.analysis_panel.analysis({
-                                'Channel': channel,
-                                'Direction': 'Forward',
-                                **metrics
-                            })
 
     def _queue_single_file_experiment(self, directory, base, ext, timestamp,
                                   channels, params, sim_mode):
@@ -1250,9 +1331,6 @@ class AppController:
         self.processed_files = set()
         self.is_single_file_mode = file_params['single_file']
 
-        # Preserve existing channel data
-        self._preserve_existing_channel_data(selected_channels)
-
         # ---- Connect hardware --------------------------------------------
         try:
             self.view.instrument_manager.connect_keithley(simulation=False)
@@ -1267,6 +1345,10 @@ class AppController:
         if not self._keithley_usable("Combined JV+SPO run"):
             self._combined_mode = False
             return
+
+        # Same as queue_experiment: clear the previous run only once this one
+        # is certain to start.
+        self._reset_view_for_new_run(selected_channels)
 
         # ---- Generate file paths -----------------------------------------
         timestamp_str = datetime.now().strftime(TIMESTAMP_FORMAT)

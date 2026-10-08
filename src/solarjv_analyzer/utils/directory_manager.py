@@ -5,6 +5,7 @@ Manages user preferences for output directory location across the application.
 Structure: Base/Username/Date/{Calibration,JV,SPO}/
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -104,18 +105,55 @@ class DirectoryManager:
             parent: Parent widget
             mode: 'Calibration', 'JV' or 'SPO' - which subfolder to use
         """
-        if hasattr(self, '_initialized'):
-            return
-        self._initialized = True
+        if not hasattr(self, '_initialized'):
+            self._initialized = True
+            self.directory_input = None
+            self.browse_button = None
+            self.open_button = None
+            self.hint_label = None
+            self._base_root = None
+            self._widget_mode = None
 
+        # Applied on EVERY construction, not just the first. This is a
+        # singleton, so the second window to ask for one gets the first
+        # window's object back — and used to get the first window's `mode`
+        # with it, silently ignoring the argument it just passed. That bit
+        # on the relogin loop: the main window leaves the shared mode at
+        # "JV", logout tears the windows down but NOT the class attribute
+        # holding the instance, so the next login's calibration window
+        # constructed itself with mode="Calibration" and was handed a JV
+        # manager. Its reports and its Open Folder button went to JV.
         self.parent = parent
-        self.username = username
+        if username:
+            self.username = username
+        elif not hasattr(self, 'username'):
+            self.username = None
         self.mode = mode  # 'Calibration', 'JV' or 'SPO'
-        self.directory_input = None
-        self.browse_button = None
-        self.open_button = None
-        self.hint_label = None
-        self._base_root = None
+
+    @contextlib.contextmanager
+    def scoped_mode(self, mode):
+        """Resolve paths as `mode` for the duration of the block.
+
+        `self.mode` is shared process-wide, so any window that needs a folder
+        other than whatever the last caller left behind must say so explicitly
+        rather than trust the current value. Restores the previous mode even
+        if the body raises.
+        """
+        previous = self.mode
+        self.mode = mode or previous
+        try:
+            yield self
+        finally:
+            self.mode = previous
+
+    def _widget_scope(self):
+        """Scope for the directory widget's own buttons and labels.
+
+        The widget belongs to one window and therefore to one folder; it must
+        keep showing — and opening — that folder no matter which mode some
+        other window has since switched the shared manager into.
+        """
+        return self.scoped_mode(self._widget_mode or self.mode)
 
     def set_mode(self, mode):
         """Set the mode ('Calibration', 'JV' or 'SPO')."""
@@ -249,20 +287,26 @@ class DirectoryManager:
     def _update_display_directory(self):
         """Update the directory input field with the full path."""
         if self.directory_input:
-            display_dir = self._get_display_directory()
-            self.directory_input.setText(display_dir)
-            self._update_hint()
+            with self._widget_scope():
+                display_dir = self._get_display_directory()
+                self.directory_input.setText(display_dir)
+                self._update_hint()
 
-    def create_directory_widget(self, title="Output Directory"):
+    def create_directory_widget(self, title="Output Directory", mode=None):
         """
         Create a directory selection widget.
 
         Args:
             title: Group box title
+            mode: pin the widget to this folder ('Calibration', 'JV', 'SPO').
+                Defaults to the manager's current mode. Pass it whenever the
+                owning window has a fixed folder, so the display and the Open
+                Folder button stay on it.
 
         Returns:
             QWidget: Group box containing directory input and buttons
         """
+        self._widget_mode = mode or self.mode
         group = QtWidgets.QGroupBox(title)
         layout = QtWidgets.QVBoxLayout(group)
 
@@ -374,9 +418,10 @@ class DirectoryManager:
 
     def _on_browse(self):
         """Open folder dialog to select base output directory."""
+        with self._widget_scope():
+            start = self.dialog_start_dir()
         selected = QtWidgets.QFileDialog.getExistingDirectory(
-            self.parent, "Select Base Output Directory",
-            self.dialog_start_dir()
+            self.parent, "Select Base Output Directory", start
         )
         if selected:
             self.save_preference(selected)
@@ -384,6 +429,10 @@ class DirectoryManager:
 
     def _on_open(self):
         """Open the folder the finished reports are in."""
+        with self._widget_scope():
+            self._open_current_folder()
+
+    def _open_current_folder(self):
         destination = self.store_destination()
         if destination:
             self._open_path(destination)

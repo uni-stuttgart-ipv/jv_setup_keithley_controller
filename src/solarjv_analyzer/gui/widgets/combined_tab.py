@@ -116,6 +116,11 @@ class CombinedTab(QtWidgets.QWidget):
         layout.addWidget(spo_group)
 
         # ---- Channel Selection (reparented from ParameterTab) -----------
+        # Kept as attributes: once `form.takeRow()` above lifts these two out
+        # of `jv_params`, they are siblings of it rather than children, so
+        # `set_config_enabled()` has to reach them by hand.
+        self._channel_card = channel_card
+        self._notes_widget = notes_widget
         if channel_card is not None:
             layout.addWidget(channel_card)
 
@@ -146,11 +151,21 @@ class CombinedTab(QtWidgets.QWidget):
         return self.jv_params.get_selected_channels()
 
     def set_config_enabled(self, enabled: bool):
-        """Enable or disable all inputs (locked during a combined run)."""
+        """Enable or disable all inputs (locked during a combined run).
+
+        Channel Selection and Notes are REPARENTED out of `jv_params` in
+        `_build_ui`, so `jv_params.setEnabled(False)` never reached them:
+        both stayed live for the whole run, and re-ticking a channel
+        mid-queue looked as though it had changed something when it had not.
+        """
         self.jv_params.setEnabled(enabled)
         self.hold_duration.setEnabled(enabled)
         self.sampling_interval.setEnabled(enabled)
         self.preconditioning.setEnabled(enabled)
+        for widget in (getattr(self, "_channel_card", None),
+                       getattr(self, "_notes_widget", None)):
+            if widget is not None:
+                widget.setEnabled(enabled)
 
     @property
     def sweep_rate(self):

@@ -512,7 +512,11 @@ class CalibrationWindow(QtWidgets.QMainWindow):
 
     def _create_directory_group(self):
         card, layout = self._card("OUTPUT")
-        dir_widget = self.dir_manager.create_directory_widget(title="")
+        # Pinned: the OUTPUT card on this window always shows — and
+        # opens — the Calibration folder, whatever mode another window
+        # has since left the shared manager in.
+        dir_widget = self.dir_manager.create_directory_widget(
+            title="", mode="Calibration")
         # The info label inside carries a long absolute path; without word
         # wrap its minimum width blows out the whole left rail and clips
         # every card against the scroll viewport.
@@ -1052,7 +1056,12 @@ class CalibrationWindow(QtWidgets.QMainWindow):
     # -------------------------------------------------------------------------
     def _get_calibration_file_path(self):
         """Generate permanent file path for calibration data."""
-        return self.dir_manager.get_file_path(prefix="calibration", create=True)
+        # Explicit mode: the shared manager's current value belongs to
+        # whichever window touched it last, and a calibration report filed
+        # under JV is wrong in the operator's folder and in the store.
+        with self.dir_manager.scoped_mode("Calibration"):
+            return self.dir_manager.get_file_path(
+                prefix="calibration", create=True)
 
     def _start_calibration(self):
         self._setup_manager()
