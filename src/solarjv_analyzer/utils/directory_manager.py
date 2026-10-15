@@ -18,7 +18,7 @@ from PyQt5 import QtWidgets, QtCore
 logger = logging.getLogger(__name__)
 
 
-MODE_FOLDERS = ("Calibration", "JV", "SPO")
+MODE_FOLDERS = ("Calibration", "JV", "MPP", "SPO")
 
 
 def ensure_day_folders(username: str = None) -> list:
@@ -156,7 +156,7 @@ class DirectoryManager:
         return self.scoped_mode(self._widget_mode or self.mode)
 
     def set_mode(self, mode):
-        """Set the mode ('Calibration', 'JV' or 'SPO')."""
+        """Set the mode — one of MODE_FOLDERS."""
         self.mode = mode
         self._update_display_directory()
 

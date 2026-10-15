@@ -22,6 +22,7 @@ from pymeasure.display.browser import BrowserItem
 from pymeasure.experiment import Results
 
 from solarjv_analyzer.procedures.jv_procedure import JVProcedure
+from solarjv_analyzer.store.finalize import published_file
 from solarjv_analyzer.config import TIMESTAMP_FORMAT
 
 # SPO is a self-contained, optional module: if the spo/ package is removed,
@@ -34,6 +35,18 @@ except ImportError:
     SpoProcedure = SpoWorker = compute_spo_metrics = None
     SPO_METRICS_UNITS = []
     SPO_AVAILABLE = False
+
+try:
+    from solarjv_analyzer.mpp.mpp_procedure import MppProcedure, MppWorker
+    from solarjv_analyzer.mpp.mpp_analysis import (
+        compute_mpp_metrics, MPP_METRICS_UNITS)
+    MPP_AVAILABLE = True
+except ImportError:
+    MppProcedure = None
+    MppWorker = None
+    compute_mpp_metrics = None
+    MPP_METRICS_UNITS = []
+    MPP_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +130,10 @@ class AppController:
         self.spo_running = False
         self._spo_worker = None
         self._spo_procedure = None
+
+        self.mpp_running = False
+        self._mpp_worker = None
+        self._mpp_procedure = None
         self._spo_times = []
         self._spo_currents = []
         self._spo_voltages = []
@@ -286,6 +303,23 @@ class AppController:
         filename_timestamp = timestamp_str.replace(":", "-").replace(" ", "_")
         base, ext = _split_output_name(file_params['filename'])
         directory = file_params['directory']
+        # The staging folder is TRANSIENT. Once the sweeper has published
+        # everything in it, `_prune_empty_dirs` removes the now-empty dated
+        # mode folder -- so the path the file panel is still displaying can
+        # stop existing between one run and the next. pymeasure's Results()
+        # opens the file for writing and does not create parents, so the run
+        # died with FileNotFoundError before a single point was measured.
+        #
+        # Creating it here is the fix: producers own the directory they are
+        # about to write into, and makedirs is cheap and idempotent.
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as exc:
+            logger.error(f"Could not create the output folder {directory}: {exc}")
+            QtWidgets.QMessageBox.critical(
+                self.view, "Output Folder Unavailable",
+                f"Could not create the output folder:\n{directory}\n\n{exc}")
+            return
         # Remember what the operator typed. `_process_multi_files()` writes the
         # FINAL per-channel reports and used to name them "Output_<ts>_chN.csv",
         # discarding the name entirely — so every run from every user produced
@@ -469,8 +503,15 @@ class AppController:
             forward_params['single_sweep_mode'] = True
             forward_params['sweep_direction'] = 'Forward'
 
+            # `_temp`, like every other recorder path: pymeasure writes the
+            # header at construction and then appends for the whole sweep, so
+            # without it a queued channel's file sits in staging under a
+            # publishable name and the sweeper takes it away mid-run.
+            # `_process_multi_files` reads this path back out of
+            # `experiment_files` and names the report via `_final_report_name`,
+            # so the suffix never reaches the operator.
             forward_path = os.path.join(
-                directory, f"{base}_{timestamp}_ch{channel_num}_forward{ext}"
+                directory, f"{base}_{timestamp}_ch{channel_num}_forward_temp{ext}"
             )
             self.experiment_files[f"{channel_num}_forward"] = forward_path
 
@@ -502,7 +543,7 @@ class AppController:
                 reverse_params['stop_voltage'] = params.get('start_voltage', 1.2)
 
                 reverse_path = os.path.join(
-                    directory, f"{base}_{timestamp}_ch{channel_num}_reverse{ext}"
+                    directory, f"{base}_{timestamp}_ch{channel_num}_reverse_temp{ext}"
                 )
                 self.experiment_files[f"{channel_num}_reverse"] = reverse_path
 
@@ -1360,6 +1401,23 @@ class AppController:
         self._run_base_name = base
         self._run_ext = ext
         directory = file_params['directory']
+        # The staging folder is TRANSIENT. Once the sweeper has published
+        # everything in it, `_prune_empty_dirs` removes the now-empty dated
+        # mode folder -- so the path the file panel is still displaying can
+        # stop existing between one run and the next. pymeasure's Results()
+        # opens the file for writing and does not create parents, so the run
+        # died with FileNotFoundError before a single point was measured.
+        #
+        # Creating it here is the fix: producers own the directory they are
+        # about to write into, and makedirs is cheap and idempotent.
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as exc:
+            logger.error(f"Could not create the output folder {directory}: {exc}")
+            QtWidgets.QMessageBox.critical(
+                self.view, "Output Folder Unavailable",
+                f"Could not create the output folder:\n{directory}\n\n{exc}")
+            return
 
         # JV file path (same as single-file mode)
         channel_list_str = "_".join(map(str, selected_channels))
@@ -1849,9 +1907,13 @@ class AppController:
         params_dict = self.view.params_tab.get_parameters()
         analysis_dict = self.view.analysis_settings_tab.get_parameters()
 
-        device_area = params_dict.get('device_area', 0.089)
-        compliance_current = params_dict.get('compliance_current', 0.18)
-        incident_power = analysis_dict.get('incident_power', 100.0)
+        # Same rule as MPP: the Hold Voltage card answers this, and it reads
+        # its own fields in Quick JV mode or the J-V Parameters tab in
+        # Manual. Both modes now share one card, so both ask it the same way.
+        card_settings = self.view.spo_param_tab.device_settings()
+        device_area = card_settings['device_area']
+        compliance_current = card_settings['compliance_current']
+        incident_power = card_settings['incident_power']
 
         sim_mode = False
         try:
@@ -1903,6 +1965,163 @@ class AppController:
 
         self._spo_worker.start()
         logger.info(f"SPO started on Channel {spo_params['active_channel']}")
+
+    # -------------------------------------------------------------------
+    # MPP (standalone, Advanced tab)
+    # -------------------------------------------------------------------
+
+    def start_mpp(self):
+        """Collect the MPP fields, build an MppProcedure, and run it."""
+        if not MPP_AVAILABLE:
+            logger.warning("Cannot start MPP: MPP module is not available.")
+            return
+
+        if self.is_busy or self.spo_running or self.mpp_running:
+            self._refuse_busy("an MPP run")
+            return
+
+        param_tab = self.view.mpp_param_tab
+        if not param_tab.has_valid_start_voltage():
+            logger.warning("Cannot start MPP: no valid start voltage.")
+            return
+
+        mpp_params = param_tab.get_parameters()
+
+        # The cell's description comes from the Start Voltage card, which
+        # answers it differently depending on its mode: its own fields when
+        # Quick JV is selected (you just measured this cell with them), the
+        # J-V Parameters tab when Manual is -- because in Manual mode the
+        # card shows nothing but the voltage box.
+        card_settings = param_tab.vmpp_card.device_settings()
+        device_area = card_settings['device_area']
+        compliance_current = card_settings['compliance_current']
+        incident_power = card_settings['incident_power']
+        architecture = card_settings['architecture']
+
+        sim_mode = False
+        try:
+            self.view.instrument_manager.connect_keithley(simulation=sim_mode)
+            self.view.instrument_manager.connect_mux(simulation=sim_mode)
+        except Exception as e:
+            logger.error(f"MPP hardware connection failed: {e}")
+            self.view.update_instrument_lights()
+            return
+        self.view.update_instrument_lights()
+
+        if not self._keithley_usable("MPP run"):
+            return
+
+        self._mpp_procedure = MppProcedure(
+            instrument=self.view.instrument_manager.keithley,
+            mux=self.view.instrument_manager.mux,
+            manager=self.view.instrument_manager,
+            simulation=sim_mode,
+            device_area=device_area,
+            incident_power=incident_power,
+            compliance_current=compliance_current,
+            architecture=architecture,
+            # A stable DC reading, as SPO uses: the tracker sits at a voltage
+            # rather than sweeping, so there is no sweep rate to derive from.
+            nplc=1.0,
+            user_name=self.view.username,
+            username=self.view.username,
+            check_errors_between_points=False,
+            **mpp_params,
+        )
+
+        self._mpp_worker = MppWorker(self._mpp_procedure)
+        self._mpp_worker.results_ready.connect(self._on_mpp_results)
+        self._mpp_worker.status_changed.connect(self._on_mpp_status)
+        self._mpp_worker.run_finished.connect(self._on_mpp_run_finished)
+        self._mpp_worker.run_failed.connect(self._on_mpp_run_failed)
+
+        self.mpp_running = True
+        self.is_busy = True
+        self.view.mpp_widget.start_mpp()
+        self.view.mpp_start_button.setEnabled(False)
+        self.view.mpp_abort_button.setEnabled(True)
+
+        self._mpp_worker.start()
+        logger.info(
+            f"MPP started on Channel {mpp_params['active_channel']} at "
+            f"{mpp_params['start_voltage']:+.3f} V for "
+            f"{mpp_params['run_time']:.0f} min")
+
+    def abort_mpp(self):
+        """Ask the running MPP tracker to stop between samples."""
+        if not MPP_AVAILABLE or not self.mpp_running or self._mpp_worker is None:
+            return
+        logger.info("MPP abort requested")
+        self.view.mpp_abort_button.setEnabled(False)
+        self.view.mpp_widget.abort_mpp()
+        self._mpp_worker.abort()
+
+    def _on_mpp_results(self, record: dict):
+        """One live sample: draw power and the tracked voltage."""
+        self.view.mpp_widget.update_plot(
+            record["Time (s)"], record["Power (W)"], record["Voltage (V)"])
+
+    def _on_mpp_status(self, status: str):
+        self.view.mpp_widget.status_label.setText(status)
+
+    def _on_mpp_run_finished(self, proc):
+        """Compute the metrics, write the report, and return the window to idle.
+
+        `MppWorker` emits this on every path out, including failure, so this is
+        the single place the run is wound up.
+        """
+        self.mpp_running = False
+        self.is_busy = False
+        self.view.mpp_abort_button.setEnabled(False)
+
+        metrics, report_path = {}, None
+        try:
+            samples = getattr(proc, "samples", []) if proc is not None else []
+            if samples:
+                metrics = compute_mpp_metrics(
+                    [s[0] for s in samples],
+                    [s[1] for s in samples],
+                    [s[2] for s in samples],
+                    area_cm2=float(proc.device_area),
+                    incident_power_mw_cm2=float(
+                        getattr(proc, "incident_power", 100.0)),
+                    probe_count=proc.probe_count,
+                    direction_flips=proc.direction_flips,
+                    clamp_hits=proc.clamp_hits,
+                    start_voltage_v=float(proc.start_voltage),
+                )
+                report = proc.report
+                if report is not None:
+                    report_path = report.finalize(
+                        metrics, dict(MPP_METRICS_UNITS),
+                        notes_text=getattr(self, 'current_notes_text', ''),
+                        save_notes=getattr(self, 'current_save_notes', False),
+                    )
+                    logger.info(f"MPP report saved: {report_path}")
+                if metrics.get("clamp_hits"):
+                    # Not a modal: the run is still usable and the operator is
+                    # told in the report. But it must not pass unremarked.
+                    logger.warning(
+                        f"MPP hit its excursion clamp "
+                        f"{metrics['clamp_hits']} time(s); the tracked voltage "
+                        "wanted to leave its window, so the reported power is "
+                        "not necessarily a maximum.")
+        except Exception as e:
+            logger.error(f"Failed to finalize MPP report: {e}")
+
+        self.view.mpp_widget.on_mpp_finished(metrics, report_path)
+        self._disconnect_instruments()
+        # Through the window's gate, so Start honours BOTH the filename and
+        # the start voltage rather than being enabled directly.
+        self.view._on_mpp_start_voltage_ready(
+            self.view.mpp_param_tab.has_valid_start_voltage())
+
+        self._mpp_worker = None
+        self._mpp_procedure = None
+
+    def _on_mpp_run_failed(self, message: str):
+        """Log it; the wind-up happens in _on_mpp_run_finished, always emitted."""
+        logger.error(f"MPP run failed: {message}")
 
     def abort_spo(self):
         """Abort the currently running SPO test via the SpoWorker."""
@@ -2488,7 +2707,10 @@ class AppController:
         The analysis summary will have column headers with units included.
         """
         try:
-            with open(filepath, 'w', newline='') as f:
+            # published_file writes to `<filepath>.part` and renames it
+            # only once the handle is closed, so the sweeper can never
+            # see this report under its final name while it is partial.
+            with published_file(filepath, newline='') as f:
                 # Write experimental parameters
                 if parameters:
                     f.write("[[ EXPERIMENTAL PARAMETERS ]]\n")

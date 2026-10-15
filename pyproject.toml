@@ -73,6 +73,10 @@ dependencies = [
   "matplotlib",
   "reportlab",
   "argon2-cffi",
+  # The SMTP password lives in the OS credential store, never in this
+  # package or on the S: drive. On Windows this is Credential Manager via
+  # DPAPI. It MUST ship in the installer or the lab PCs cannot send OTPs.
+  "keyring",
 ]
 
 [project.optional-dependencies]
@@ -149,6 +153,10 @@ requires = [
   "matplotlib",
   "reportlab",
   "argon2-cffi",
+  # The SMTP password lives in the OS credential store, never in this
+  # package or on the S: drive. On Windows this is Credential Manager via
+  # DPAPI. It MUST ship in the installer or the lab PCs cannot send OTPs.
+  "keyring",
 ]
 license.file = "LICENSE.txt"
 

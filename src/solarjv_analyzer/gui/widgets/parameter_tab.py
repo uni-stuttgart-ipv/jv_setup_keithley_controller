@@ -49,6 +49,10 @@ class ParameterTab(QtWidgets.QWidget):
     def _layout(self):
         """Build the parameters form layout."""
         layout = QtWidgets.QFormLayout(self)
+        # Cards added to this form (Hold Voltage, Channel Selection) must line
+        # up with File Output, which is not nested in here. Qt's default 9px
+        # form inset is what pushed them in and made them narrower.
+        layout.setContentsMargins(0, 9, 0, 9)
         layout.setVerticalSpacing(1)
 
         # Start Voltage

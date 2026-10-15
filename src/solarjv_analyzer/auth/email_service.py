@@ -3,7 +3,23 @@ Email Service for SolarJV Analyzer authentication.
 
 Sends HTML-formatted emails via SMTP for OTP verification,
 registration confirmation, and password-reset confirmation.
-Credentials are read from environment variables; never hardcoded.
+
+THE SMTP PASSWORD IS NEVER STORED IN THIS FILE, IN A CONFIG FILE, OR ON THE
+S: DRIVE. It lives in the operating system's credential store (Windows
+Credential Manager via DPAPI, Keychain on macOS), encrypted at rest under a
+key the OS derives from the machine and account -- a key that is not in this
+program and does not ship in the installer.
+
+An admin puts it there once per lab PC:
+
+    python tools/setup_smtp_credential.py
+
+Everything else -- host, port, sender address -- is NOT secret and may still
+come from a shared config file, so those stay centrally editable.
+
+If no credential is found the app says so and refuses to send. It does NOT
+fall back to a built-in value: a silent fallback is exactly how a real
+password came to be committed here in the first place.
 """
 
 import logging
@@ -34,70 +50,165 @@ RESEND_COOLDOWN_SECONDS = 60
 # SMTP configuration
 # ---------------------------------------------------------------------------
 
+# Non-secret defaults only. There is deliberately no "password" key here --
+# see the structural test in tests/auth/test_email_service.py, which fails if
+# one reappears.
 _DEFAULT_SMTP = {
     "host": "smtp.uni-stuttgart.de",
     "port": 587,
     "user": "",
-    "password": "",
-    "from_addr": "solarjv@ipv.uni-stuttgart.de",
+    "from_addr": "",
     "from_name": "SolarJV Analyzer",
     "use_tls": True,
 }
+
+# Identifies this application's entry in the OS credential store.
+KEYRING_SERVICE = "SolarJV Analyzer SMTP"
+
+# Settings that may come from a shared config file. "password" is absent on
+# purpose: a shared file is readable by everyone the share is readable by.
+_FILE_SETTINGS = ("host", "port", "user", "from_addr", "from_name")
 
 _smtp_config = None
 
 
 def _resolve_config_paths() -> list:
-    """Return ordered list of paths to check for email_config.json.
-    S: drive root takes priority on Windows (lab deployment)."""
-    import sys
-    paths = []
-    if sys.platform == "win32":
-        paths.append("S:\\solarjv_email_config.json")
-    paths.append(os.path.join(os.path.expanduser("~"), ".solarjv", "email_config.json"))
-    return paths
+    """Where to look for email_config.json: the local machine, only.
+
+    The S: drive used to be checked first. It is gone: the setup script
+    writes this file during commissioning, so every machine has its own, and
+    a shared config on the share only ever masked it.
+    """
+    return [os.path.join(os.path.expanduser("~"), ".solarjv", "email_config.json")]
+
+
+def _password_from_keyring(user: str) -> str:
+    """Ask the OS credential store for this user's SMTP password.
+
+    Returns "" for every failure -- not installed, nothing stored, store
+    locked. The caller treats "not configured" and "could not be read" the
+    same way: refuse to send and say so.
+    """
+    if not user:
+        return ""
+    try:
+        import keyring
+    except ImportError:
+        logger.warning(
+            "keyring is not installed, so the SMTP password cannot be read "
+            "from the OS credential store.")
+        return ""
+    try:
+        return keyring.get_password(KEYRING_SERVICE, user) or ""
+    except Exception as exc:                          # noqa: BLE001
+        logger.error(f"Could not read the SMTP password from the credential "
+                     f"store: {exc}")
+        return ""
 
 
 def _get_smtp_config() -> dict:
-    """Read SMTP settings from config file or environment variables.
-    Priority: S: drive (lab) → env vars → ~/.solarjv/ (fallback)."""
+    """Assemble the SMTP settings.
+
+    Non-secret settings: built-in defaults, then a config file, then
+    environment variables. The password comes from the OS credential store,
+    or from SMTP_PASSWORD when that is set (for development and CI).
+    """
     global _smtp_config
     if _smtp_config is not None:
         return _smtp_config
 
     cfg = dict(_DEFAULT_SMTP)
 
-    # 1. Try file-based configs (S: drive first, then local)
     import json
+    # EVERY config file is consulted, in priority order, and each key is taken
+    # from the FIRST file that defines it.
+    #
+    # This used to `break` at the first readable file. On a lab PC that meant
+    # a shared S: config -- which may predate per-machine commissioning and
+    # need not name a user at all -- silently masked the local file the setup
+    # script writes. The password sat in the vault under a username the
+    # application never saw, and it reported "not configured" with no way to
+    # tell why. Falling through keeps S: authoritative for what it does
+    # define, without letting it hide what it does not.
+    sources = {}
     for path in _resolve_config_paths():
         try:
             with open(path) as f:
                 file_cfg = json.load(f)
-            for k in ("host", "port", "user", "password", "from_addr", "from_name"):
-                if k in file_cfg:
-                    cfg[k] = file_cfg[k]
-            cfg["port"] = int(cfg["port"])
-            logger.info(f"SMTP config loaded from {path}")
-            break
-        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError):
             continue
+        if "password" in file_cfg:
+            # Refusing rather than using it is the point. This file lives on
+            # a share every whitelisted lab user can read; honouring it would
+            # keep the plaintext password alive and nothing would improve.
+            logger.error(
+                f"{path} contains a 'password' field. It is being IGNORED -- "
+                f"a shared config file is readable by everyone the share is "
+                f"readable by. Remove that field, and store the password with "
+                f"tools/setup_smtp_credential.py instead.")
+        taken = []
+        for k in _FILE_SETTINGS:
+            if k in file_cfg and file_cfg[k] not in ("", None) and k not in sources:
+                cfg[k] = file_cfg[k]
+                sources[k] = path
+                taken.append(k)
+        if taken:
+            logger.info(f"SMTP settings {', '.join(taken)} from {path}")
+        else:
+            logger.debug(f"SMTP config {path} added nothing new.")
 
-    # 2. Environment variable overrides (for admin/debug use)
-    for key in ("host", "port", "user", "password", "from_addr", "from_name"):
+    for key in _FILE_SETTINGS:
         env_val = os.environ.get(f"SMTP_{key.upper()}")
         if env_val is not None:
             cfg[key] = env_val
-    cfg["port"] = int(cfg["port"])
+    try:
+        cfg["port"] = int(cfg["port"])
+    except (TypeError, ValueError):
+        logger.error(f"Bad SMTP port {cfg['port']!r}; falling back to 587.")
+        cfg["port"] = 587
     cfg["use_tls"] = os.environ.get("SMTP_USE_TLS", "1") == "1"
+
+    # The secret, last: an explicit env var wins (development, CI), otherwise
+    # the OS credential store. Nothing else, and no built-in fallback.
+    cfg["password"] = (os.environ.get("SMTP_PASSWORD")
+                       or _password_from_keyring(cfg.get("user", "")))
 
     _smtp_config = cfg
     return cfg
 
 
+def reset_config_cache() -> None:
+    """Forget the cached settings so the next call re-reads them.
+
+    The config is read once and cached for the life of the process. After an
+    admin stores a new password the running app would otherwise keep using
+    the old one.
+    """
+    global _smtp_config
+    _smtp_config = None
+
+
 def is_configured() -> bool:
-    """Return True if SMTP credentials are set."""
+    """True when there is a username AND a password to send with."""
     cfg = _get_smtp_config()
     return bool(cfg.get("user") and cfg.get("password"))
+
+
+def configuration_problem() -> str:
+    """A sentence naming what is missing, or "" when all is well.
+
+    Worth having: "could not send the email" is a dead end for whoever is
+    standing at the lab PC, and the fix is usually one command.
+    """
+    cfg = _get_smtp_config()
+    if not cfg.get("user"):
+        return ("No SMTP username is configured. Set it in the email config "
+                "file or the SMTP_USER environment variable.")
+    if not cfg.get("password"):
+        return (f"No SMTP password is stored on this machine for "
+                f"'{cfg['user']}'. An administrator can add it by running:\n\n"
+                f"    python tools/setup_smtp_credential.py")
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -200,9 +311,13 @@ def _send_email(to_email: str, subject: str, html_body: str) -> Tuple[bool, str]
     """Build a multipart email with plain-text fallback and send via SMTP."""
     cfg = _get_smtp_config()
 
-    if not cfg["user"] or not cfg["password"]:
-        logger.warning("SMTP not configured — email not sent.")
-        return False, "Email service is not configured. Contact the lab administrator."
+    problem = configuration_problem()
+    if problem:
+        # Log the specific cause for whoever has to fix it; tell the operator
+        # something they can act on rather than a dead end.
+        logger.warning(f"SMTP not configured — email not sent. {problem}")
+        return False, ("Email service is not configured on this machine. "
+                       "Contact the lab administrator.")
 
     # Strip HTML tags for plain-text fallback
     import re

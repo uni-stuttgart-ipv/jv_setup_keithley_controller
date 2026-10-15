@@ -22,7 +22,10 @@ from datetime import datetime
 
 from solarjv_analyzer import config
 
-MODES = ("Calibration", "JV", "SPO")
+# Must stay in step with `utils.directory_manager.MODE_FOLDERS`: this tuple
+# decides which store folder a staged file belongs to, and a mode missing here
+# silently falls back to "JV", filing the data under the wrong measurement.
+MODES = ("Calibration", "JV", "MPP", "SPO")
 
 # The J-V mode folder used to be called "Main". Files staged by an older build
 # — or sitting in staging across an upgrade — must still publish somewhere
@@ -36,6 +39,22 @@ STAGING_DATE_FMT = "%d-%m-%Y"     # what DirectoryManager writes
 
 _STAGING_DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")
 CLAIM_SUFFIX = ".publishing"
+
+# A file still being written. `store.finalize.published_file()` builds every
+# report under this suffix and renames it away only once the handle is closed,
+# so the suffix is the one reliable statement that a file is NOT finished.
+# `.part` rather than `.tmp`: `.tmp` sits in antivirus and disk-cleaner exclude
+# lists, and FILE_ATTRIBUTE_TEMPORARY is an unrelated Windows cache-manager
+# flag. Neither belongs on a file holding measurement data.
+PART_SUFFIX = ".part"
+
+# A live, append-as-you-go journal: the SPO/MPP raw time series. Excluded from
+# publishing for the same reason as PART_SUFFIX — it is still being written —
+# but it means the OPPOSITE thing when it is found abandoned. A stale `.part`
+# is a half-written report and must be deleted; a stale `.journal` is real
+# measurement data that a crash cut short, and the sweeper has always rescued
+# those by publishing them. The janitor therefore promotes it instead.
+JOURNAL_SUFFIX = ".journal"
 
 # `_temp` immediately before an optional extension. A regex rather than
 # splitext() so a filename containing dots elsewhere cannot fool it.
@@ -82,6 +101,20 @@ def is_temp_name(filename: str) -> bool:
     nothing: an abort never reaches the merge step, so temps are all it leaves.
     """
     return bool(_TEMP_RE.search(original_name(filename)))
+
+
+def is_part_name(filename: str) -> bool:
+    """True for a file still being written by `finalize.published_file()`.
+
+    Unlike the quiet-time heuristic this replaces, it cannot be fooled by a
+    writer that pauses: the name changes only after the handle is closed.
+    """
+    return original_name(filename).endswith(PART_SUFFIX)
+
+
+def is_journal_name(filename: str) -> bool:
+    """True for a live raw journal (see JOURNAL_SUFFIX)."""
+    return original_name(filename).endswith(JOURNAL_SUFFIX)
 
 
 def original_name(filename: str) -> str:

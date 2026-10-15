@@ -11,6 +11,7 @@ involved: `attach(window)` redirects `DirectoryManager`'s base root to staging
 and runs a sweeper on a timer. See `docs/plans/s-drive-publishing.md`.
 """
 
+from .finalize import published_file
 from .identity import active_user, app_user, set_app_user, windows_user
 from .paths import destination_dir, staging_root, store_date, store_root
 from .publisher import PublishError, publish_file, sha256_of

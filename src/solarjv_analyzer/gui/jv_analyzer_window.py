@@ -44,7 +44,38 @@ except ImportError:
     SpoParameterTab = None
     SPO_AVAILABLE = False
 
+# MPP is optional in the same way, and for the same reason.
+try:
+    from solarjv_analyzer.mpp.mpp_widget import MppWidget, MppParameterTab
+    MPP_AVAILABLE = True
+except ImportError:
+    MppWidget = None
+    MppParameterTab = None
+    MPP_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+
+class ModeSpec:
+    """One Advanced-tab mode: what it shows, and what it does on arrival.
+
+    Replaces a pair of hand-written show()/hide() lists. Those were fine for
+    two modes and became a liability at three: every widget had to be named in
+    every list, and a widget forgotten in one of them is invisible in a mode
+    nobody tested.
+
+    Here each widget is named ONCE, in the mode that owns it. `_show_mode()`
+    hides everything the other modes own and shows this mode's, so a new mode
+    is a new row rather than an edit to every existing list.
+    """
+
+    def __init__(self, key, button, widgets, folder, on_enter=None):
+        self.key = key
+        self.button = button
+        self.widgets = tuple(w for w in widgets if w is not None)
+        self.folder = folder
+        self.on_enter = on_enter
+
 
 
 class TightStackedWidget(QtWidgets.QStackedWidget):
@@ -587,13 +618,19 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         # a container widget — zero changes to their internal logic.
         advanced_container = QtWidgets.QWidget()
         advanced_layout = QtWidgets.QVBoxLayout(advanced_container)
-        advanced_layout.setContentsMargins(12, 8, 12, 8)
+        # No left/right inset. FilePanel sits directly in the sidebar, so
+        # anything nested in here starts further right than it does and every
+        # card below ends up narrower than File Output, with its title out of
+        # line. Vertical padding stays.
+        advanced_layout.setContentsMargins(0, 8, 0, 8)
         advanced_layout.setSpacing(12)
 
         # Existing mode toggle: JV Sweep vs SPO
         self.jv_mode_button = QtWidgets.QPushButton("JV Sweep")
+        self.mpp_mode_button = QtWidgets.QPushButton("MPP")
         self.spo_mode_button = QtWidgets.QPushButton("SPO")
-        for btn in (self.jv_mode_button, self.spo_mode_button):
+        for btn in (self.jv_mode_button, self.mpp_mode_button,
+                    self.spo_mode_button):
             btn.setCheckable(True)
             btn.setCursor(QtCore.Qt.PointingHandCursor)
             btn.setObjectName("ModeButton")
@@ -602,11 +639,13 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.mode_button_group = QtWidgets.QButtonGroup(self)
         self.mode_button_group.setExclusive(True)
         self.mode_button_group.addButton(self.jv_mode_button)
+        self.mode_button_group.addButton(self.mpp_mode_button)
         self.mode_button_group.addButton(self.spo_mode_button)
 
         mode_row = QtWidgets.QHBoxLayout()
         mode_row.setSpacing(8)
         mode_row.addWidget(self.jv_mode_button)
+        mode_row.addWidget(self.mpp_mode_button)
         mode_row.addWidget(self.spo_mode_button)
         advanced_layout.addLayout(mode_row)
 
@@ -632,6 +671,14 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
             self.spo_param_tab = QtWidgets.QWidget()
         self.spo_param_tab.hide()
         params_stack_layout.addWidget(self.spo_param_tab)
+
+        if MPP_AVAILABLE:
+            self.mpp_param_tab = MppParameterTab(self)
+        else:
+            logger.warning("MPP module unavailable; MPP mode disabled.")
+            self.mpp_param_tab = QtWidgets.QWidget()
+        self.mpp_param_tab.hide()
+        params_stack_layout.addWidget(self.mpp_param_tab)
 
         input_tabs.addTab(self.params_stack, "Parameters")
         input_tabs.addTab(self.instr_tab, "Instrument")
@@ -673,6 +720,19 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         spo_button_layout.addWidget(self.spo_start_button)
         spo_button_layout.addWidget(self.spo_abort_button)
 
+        # Advanced-mode MPP buttons
+        self.mpp_start_button = QtWidgets.QPushButton("Start MPP")
+        self.mpp_start_button.setObjectName("QueueButton")
+        self.mpp_start_button.setEnabled(False)
+        self.mpp_abort_button = QtWidgets.QPushButton("Abort MPP")
+        self.mpp_abort_button.setObjectName("AbortButton")
+        self.mpp_abort_button.setEnabled(False)
+
+        mpp_button_layout = QtWidgets.QHBoxLayout()
+        mpp_button_layout.setSpacing(12)
+        mpp_button_layout.addWidget(self.mpp_start_button)
+        mpp_button_layout.addWidget(self.mpp_abort_button)
+
         # Combined-mode buttons
         self.combined_run_button = QtWidgets.QPushButton("Run JV + SPO")
         self.combined_run_button.setObjectName("QueueButton")
@@ -697,6 +757,7 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         adv_btn_stack.setContentsMargins(0, 0, 0, 0)
         adv_btn_stack.setSpacing(10)
         adv_btn_stack.addLayout(button_layout)
+        adv_btn_stack.addLayout(mpp_button_layout)
         adv_btn_stack.addLayout(spo_button_layout)
         self._button_stack.addWidget(advanced_btn_wrapper)  # page 1: advanced
 
@@ -733,6 +794,26 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         sidebar_dock = QtWidgets.QDockWidget("Inputs")
         sidebar_dock.setWidget(scroll_area)
         sidebar_dock.setFeatures(QtWidgets.QDockWidget.NoDockWidgetFeatures)
+        # Qt draws a dock's title bar itself, in the platform style, and only
+        # part of it answers to a stylesheet -- which is why "Inputs" came out
+        # left-aligned in a different colour from every other heading. Supply
+        # our own title bar widget and it is just a label we control. The dock
+        # has no features enabled, so there is nothing else in that bar to lose.
+        from solarjv_analyzer.gui.theme import tokens as _tokens
+        dock_title = QtWidgets.QLabel("Inputs")
+        dock_title.setObjectName("DockTitle")
+        dock_title.setAlignment(QtCore.Qt.AlignCenter)
+        dock_title.setStyleSheet(
+            f"#DockTitle {{"
+            f"  font-weight: 600;"
+            f"  font-size: 14px;"
+            f"  color: {_tokens.SECONDARY};"      # the group-box title colour
+            f"  padding: 12px;"
+            f"  background: {_tokens.SURFACE_LOWEST};"
+            f"  border-bottom: 1px solid {_tokens.SURFACE_VARIANT};"
+            f"}}"
+        )
+        sidebar_dock.setTitleBarWidget(dock_title)
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, sidebar_dock)
 
         # ---- Main display area stack --------------------------------------
@@ -762,6 +843,13 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         legacy_layout.setContentsMargins(0, 0, 0, 0)
         legacy_layout.addWidget(self.vertical_splitter)
 
+        # MPP view: like SPO, it replaces the JV display area while active.
+        if MPP_AVAILABLE:
+            self.mpp_widget = MppWidget(self, self.mpp_param_tab)
+        else:
+            self.mpp_widget = QtWidgets.QWidget()
+            self.mpp_mode_button.setEnabled(False)
+            self.mpp_mode_button.setToolTip("MPP module is not installed.")
         # SPO view: replaces the JV display area entirely while active.
         if SPO_AVAILABLE:
             self.spo_widget = SpoWidget(self, self.spo_param_tab)
@@ -788,6 +876,17 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
 
         self.spo_display.hide()
         legacy_layout.addWidget(self.spo_display)
+
+        self.mpp_display = QtWidgets.QWidget()
+        mpp_display_layout = QtWidgets.QVBoxLayout(self.mpp_display)
+        mpp_display_layout.setContentsMargins(0, 0, 0, 0)
+        mpp_display_layout.addWidget(self.mpp_widget)
+        self.mpp_display.hide()
+        # Parented here, beside the SPO view. Built without this it was an
+        # orphan top-level widget: MPP mode would have shown nothing, and
+        # nothing in it was ever destroyed, which leaked a ViewBox per plot
+        # per window into pyqtgraph's registry.
+        legacy_layout.addWidget(self.mpp_display)
 
         self._main_display_stack = QtWidgets.QStackedWidget()
         self._main_display_stack.addWidget(combined_display)   # page 0: combined
@@ -1403,6 +1502,15 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         before the process exits."""
         logger.info("Window close requested — performing safety shutdown.")
 
+        # Hand the MPP plot's second ViewBox back before the window goes: a
+        # child widget's closeEvent is not called when its parent closes, and
+        # a ViewBox left in pyqtgraph's registry crashes the next window build.
+        if MPP_AVAILABLE and hasattr(self.mpp_widget, "release"):
+            try:
+                self.mpp_widget.release()
+            except Exception as exc:                  # noqa: BLE001
+                logger.debug(f"MPP plot release failed: {exc}")
+
         # Get this operator's results onto the store BEFORE anything is torn
         # down. The store folder is named after the signed-in user, so a file
         # left in staging would later be filed under whoever signs in next.
@@ -1449,14 +1557,40 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+        # 1b. Abort any running MPP — same join, same reason as SPO above.
+        # This was missing: only SPO was handled, so closing during a
+        # tracking run left a QThread mid-:READ? while the VISA session was
+        # torn down underneath it.
+        if getattr(self.controller, 'mpp_running', False):
+            logger.info("Aborting MPP run before close...")
+            try:
+                self.controller.abort_mpp()
+            except Exception as exc:                  # noqa: BLE001
+                logger.warning(f"MPP abort during close failed: {exc}")
+            mpp_worker = getattr(self.controller, '_mpp_worker', None)
+            if mpp_worker is not None:
+                mpp_worker.wait(15000)
+
         # 3. Abort any running Quick JV — join it too (same teardown race).
-        if (hasattr(self, 'spo_param_tab')
-                and getattr(self.spo_param_tab, '_quick_jv_running', False)):
-            logger.info("Aborting Quick JV before close...")
-            worker = getattr(self.spo_param_tab, '_quick_jv_worker', None)
+        #
+        # BOTH cards, not just SPO's. Once MPP got its own Hold Voltage card
+        # there were two possible Quick JV workers and only one was being
+        # stopped, so a sweep started from the MPP tab survived the close.
+        # Reached through the card itself: both tabs own one, and that is
+        # where the sweep state actually lives now.
+        for tab_name in ('spo_param_tab', 'mpp_param_tab'):
+            tab = getattr(self, tab_name, None)
+            card = getattr(tab, 'vmpp_card', None) if tab is not None else None
+            if card is None or not getattr(card, '_quick_jv_running', False):
+                continue
+            logger.info(f"Aborting Quick JV on {tab_name} before close...")
+            worker = getattr(card, '_quick_jv_worker', None)
             if worker is not None:
-                worker.abort()
-                worker.wait(10000)
+                try:
+                    worker.abort()
+                    worker.wait(10000)
+                except Exception as exc:              # noqa: BLE001
+                    logger.warning(f"Quick JV abort failed: {exc}")
 
         # 3b. Stop the hardware monitor and join its worker — a QThread
         #     destroyed while still running takes the process with it.
@@ -1610,10 +1744,20 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
                 self.vertical_splitter.indexOf(self.bottom_section), 1
             )
             self.bottom_section.show()
-            if self.jv_mode_button.isChecked():
-                self._show_jv_mode()
-            else:
-                self._show_spo_mode()
+            # Restore whichever Advanced mode we were actually in.
+            #
+            # This used to ask "is JV checked? no? then SPO" -- a two-way
+            # question written when there were two modes. With MPP added it
+            # sent MPP here to SPO: re-entering the Advanced tab left the MPP
+            # button lit while SPO's parameters, Start button, report button
+            # and plot were the ones on screen. Ask the mode table instead,
+            # so a fourth mode cannot reintroduce this.
+            mode = self._active_mode
+            if mode not in self.MODE_SPECS:
+                mode = "jv"
+            self._show_mode(mode)
+            # ...and make sure the toggle agrees with what is now shown.
+            self._revert_mode_button()
 
         # Force the entire sidebar to recalculate heights based on the
         # newly visible page. Without this, Qt keeps the old page's geometry.
@@ -1686,7 +1830,10 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         queued/running — the switch is cancelled and the previous mode
         button state is restored.
         """
-        switching_to_spo = button is self.spo_mode_button
+        target = next((key for key, spec in self.MODE_SPECS.items()
+                       if spec.button is button), None)
+        if target is None or target == self._active_mode:
+            return
 
         if getattr(self.controller, 'spo_running', False):
             QtWidgets.QMessageBox.warning(
@@ -1694,7 +1841,7 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
                 "An SPO measurement is currently running.\n\n"
                 "Please abort it before switching modes."
             )
-            self._revert_mode_button(switching_to_spo)
+            self._revert_mode_button()
             return
 
         if self._jv_is_busy():
@@ -1703,65 +1850,119 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
                 "A JV measurement is currently queued or running.\n\n"
                 "Please wait for it to finish, or abort it, before switching modes."
             )
-            self._revert_mode_button(switching_to_spo)
+            self._revert_mode_button()
             return
 
-        if switching_to_spo:
-            self._show_spo_mode()
-        else:
-            self._show_jv_mode()
+        self._show_mode(target)
 
-    def _revert_mode_button(self, was_switching_to_spo: bool):
-        """Restore the mode toggle to reflect the mode we're actually still in."""
-        if was_switching_to_spo:
-            self.jv_mode_button.setChecked(True)
-        else:
-            self.spo_mode_button.setChecked(True)
+    def _revert_mode_button(self):
+        """Put the toggle back to the mode we are actually still in.
 
-    def _show_spo_mode(self):
-        """Show the SPO view and hide the JV plot/browser/analysis views."""
-        self.vertical_splitter.hide()
-        self.spo_display.show()
-        self.params_tab.hide()
-        self.spo_param_tab.show()
-        self.queue_button.hide()
-        self.abort_button.hide()
-        self.spo_start_button.show()
-        self.spo_abort_button.show()
+        This used to take a boolean — "were we switching to SPO?" — which only
+        works while there are exactly two modes. With three, the question that
+        matters is which mode we never left.
+        """
+        spec = self.MODE_SPECS.get(getattr(self, "_active_mode", "jv"))
+        if spec is not None:
+            spec.button.setChecked(True)
+
+    def _build_mode_specs(self):
+        """The Advanced tab's modes, each owning its widgets exactly once."""
+        self.MODE_SPECS = {
+            "jv": ModeSpec(
+                key="jv",
+                button=self.jv_mode_button,
+                widgets=(self.vertical_splitter, self.params_tab,
+                         self.queue_button, self.abort_button),
+                folder="JV",
+                on_enter=self._enter_jv_mode,
+            ),
+        }
+        if getattr(self, "mpp_display", None) is not None:
+            self.MODE_SPECS["mpp"] = ModeSpec(
+                key="mpp",
+                button=self.mpp_mode_button,
+                widgets=(self.mpp_display, self.mpp_param_tab,
+                         self.mpp_start_button, self.mpp_abort_button),
+                folder="MPP",
+                on_enter=self._enter_mpp_mode,
+            )
+        if getattr(self, "spo_display", None) is not None:
+            self.MODE_SPECS["spo"] = ModeSpec(
+                key="spo",
+                button=self.spo_mode_button,
+                widgets=(self.spo_display, self.spo_param_tab,
+                         self.spo_start_button, self.spo_abort_button),
+                folder="SPO",
+                on_enter=self._enter_spo_mode,
+            )
+        self._active_mode = "jv"      # jv_mode_button starts checked
+
+    def _show_mode(self, key: str):
+        """Put the Advanced tab into `key`."""
+        spec = self.MODE_SPECS.get(key)
+        if spec is None:
+            logger.warning(f"Unknown Advanced mode {key!r}; staying put.")
+            return
+
+        # Hide first, then show: a widget two modes shared would otherwise be
+        # hidden again right after being shown.
+        for other in self.MODE_SPECS.values():
+            if other.key == key:
+                continue
+            for widget in other.widgets:
+                widget.hide()
+        for widget in spec.widgets:
+            widget.show()
+
+        self._active_mode = key
+        if spec.on_enter is not None:
+            spec.on_enter()
+        self._relayout_sidebar()
+        # The visible run control just changed — repaint it so a paused queue
+        # still shows Resume after switching view.
+        if getattr(self, 'controller', None) is not None:
+            self.controller._apply_run_control()
+
+    def _enter_jv_mode(self):
+        self._set_file_panel_spo_mode(False)
+        self._update_save_directory()
+        self._on_filename_changed(self.file_panel.filename_input.text())
+
+    def _enter_mpp_mode(self):
+        self._update_mpp_save_directory()
+        self._set_file_panel_spo_mode(True)
+        if MPP_AVAILABLE:
+            self.mpp_widget.set_mode_mpp()
+            self.mpp_widget.set_filename(self.file_panel.filename_input.text())
+
+    def _enter_spo_mode(self):
         self._update_spo_save_directory()
         self._set_file_panel_spo_mode(True)
         self.spo_widget.set_mode_spo()
         self.spo_widget.set_filename(self.file_panel.filename_input.text())
-        self._relayout_sidebar()
-        # The visible run control just changed — repaint it so a
-        # paused queue still shows Resume after switching view.
-        if getattr(self, 'controller', None) is not None:
-            self.controller._apply_run_control()
+
+    def _show_spo_mode(self):
+        """Show the SPO view. Kept: the controller calls this by name."""
+        self._show_mode("spo")
 
     def _show_jv_mode(self):
-        """Show the JV plot/browser/analysis views and hide the SPO view."""
-        self.spo_display.hide()
-        self.vertical_splitter.show()
-        self.spo_param_tab.hide()
-        self.params_tab.show()
-        self.spo_start_button.hide()
-        self.spo_abort_button.hide()
-        self.queue_button.show()
-        self.abort_button.show()
-        self._set_file_panel_spo_mode(False)
-        self._update_save_directory()
-        self._on_filename_changed(self.file_panel.filename_input.text())
-        self._relayout_sidebar()
-        # The visible run control just changed — repaint it so a
-        # paused queue still shows Resume after switching view.
-        if getattr(self, 'controller', None) is not None:
-            self.controller._apply_run_control()
+        """Show the JV plot/browser/analysis views."""
+        self._show_mode("jv")
 
     def _set_file_panel_spo_mode(self, spo_mode: bool):
         """Adapt the File Panel for SPO mode: only the single-file checkbox
         is JV-specific and gets locked.  The filename prefix stays editable
         in both modes so validation remains active."""
         self.file_panel.single_file_checkbox.setEnabled(not spo_mode)
+
+    def _on_mpp_start_voltage_ready(self, ready: bool):
+        """Enable Start MPP only when filename + start voltage are set and idle."""
+        running = getattr(self.controller, 'mpp_running', False)
+        self.mpp_start_button.setEnabled(
+            self._filename_valid and ready and not running)
+        self.mpp_start_button.style().unpolish(self.mpp_start_button)
+        self.mpp_start_button.style().polish(self.mpp_start_button)
 
     def _on_spo_vmpp_ready(self, ready: bool):
         """Enable Start SPO only when filename + Vmpp are ready and SPO is idle."""
@@ -1786,11 +1987,28 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.queue_button.setEnabled(self._filename_valid and not busy)
         self.combined_run_button.setEnabled(self._filename_valid and not busy)
 
-        # Re-evaluate SPO button (respects its own Vmpp + idle gating)
+        # Re-evaluate every mode's own start button.
+        #
+        # Each one is gated on BOTH a filename and its own voltage, and only
+        # the voltage half announces itself with a signal. So a filename
+        # typed after the voltage was set has to re-ask here, or the button
+        # stays disabled until something touches the voltage again.
+        #
+        # MPP was missing from this list: running Quick JV first and naming
+        # the file second left Start MPP dead until the sweep was re-run.
         if hasattr(self, 'spo_widget') and hasattr(self.spo_widget, 'has_valid_hold_voltage'):
             self._on_spo_vmpp_ready(self.spo_widget.has_valid_hold_voltage())
+        if (hasattr(self, 'mpp_param_tab')
+                and hasattr(self.mpp_param_tab, 'has_valid_start_voltage')):
+            self._on_mpp_start_voltage_ready(
+                self.mpp_param_tab.has_valid_start_voltage())
+
         # Force Qt to repaint buttons so :disabled / :enabled CSS takes effect
-        for btn in (self.queue_button, self.spo_start_button, self.combined_run_button):
+        buttons = [self.queue_button, self.spo_start_button,
+                   self.combined_run_button]
+        if hasattr(self, 'mpp_start_button'):
+            buttons.append(self.mpp_start_button)
+        for btn in buttons:
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
@@ -1831,7 +2049,13 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         self.action_open.clicked.connect(self.open_experiment)
 
         # SPO mode toggle and Start/Abort buttons
+        self._build_mode_specs()
         self.mode_button_group.buttonClicked.connect(self._on_mode_button_clicked)
+        if MPP_AVAILABLE:
+            self.mpp_start_button.clicked.connect(self.controller.start_mpp)
+            self.mpp_abort_button.clicked.connect(self.controller.abort_mpp)
+            self.mpp_param_tab.start_voltage_ready.connect(
+                self._on_mpp_start_voltage_ready)
         if SPO_AVAILABLE:
             self.spo_start_button.clicked.connect(self.controller.start_spo)
             self.spo_abort_button.clicked.connect(self.controller.abort_spo)
@@ -1950,10 +2174,20 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
         """Update save directory using directory manager."""
         main_dir = self.dir_manager.get_current_directory(create=True)
         self.file_panel.set_directory(main_dir)
-        # Open Folder follows the dir_manager's CURRENT mode, so it lands in
-        # JV or SPO on the store to match whichever view is active.
-        self.file_panel.store_destination_getter = self.dir_manager.store_destination
-        self.file_panel.dialog_start_dir_getter = self.dir_manager.dialog_start_dir
+        self._pin_folder_buttons("JV")
+
+    def _update_mpp_save_directory(self):
+        """Show the MPP output folder in the file panel while MPP is active."""
+        previous_mode = self.dir_manager.mode
+        try:
+            self.dir_manager.set_mode("MPP")
+            mpp_dir = self.dir_manager.get_current_directory(create=False)
+        finally:
+            # ALWAYS restore: the directory manager is a process-wide
+            # singleton, and leaving it on MPP files every later J-V run there.
+            self.dir_manager.set_mode(previous_mode)
+        self.file_panel.set_directory(mpp_dir)
+        self._pin_folder_buttons("MPP")
 
     def _update_spo_save_directory(self):
         """Show the SPO output directory in the file panel while SPO mode
@@ -1969,14 +2203,42 @@ class JVAnalyzerWindow(QtWidgets.QMainWindow):
             # directory lookup raises (e.g. unreachable network base dir).
             self.dir_manager.set_mode(previous_mode)
         self.file_panel.set_directory(spo_dir)
-        # Open Folder must follow the view, not the singleton's restored mode:
-        # the mode is put back to JV above, so a plain `store_destination`
-        # reference would send the operator to the JV folder while they are
-        # looking at SPO.
-        self.file_panel.store_destination_getter = self._spo_store_destination
+        self._pin_folder_buttons("SPO")
+
+    def _pin_folder_buttons(self, mode: str) -> None:
+        """Point Open Folder and Browse at `mode`'s folder, for good.
+
+        The directory manager is a process-wide singleton, so every lookup
+        has to put its mode back afterwards -- otherwise a later J-V run
+        files itself under MPP. That restore is exactly why handing the file
+        panel a plain `dir_manager.store_destination` reference sends the
+        operator to the JV folder while they are looking at MPP: by the time
+        they click the button, the mode is back to JV.
+
+        These close over the mode instead, so they are right whenever they
+        are called. SPO had this for Open Folder but not for Browse, and MPP
+        had it for neither -- hence one helper for all three modes.
+        """
+        def pinned(call):
+            def run():
+                previous = self.dir_manager.mode
+                try:
+                    self.dir_manager.set_mode(mode)
+                    return call()
+                finally:
+                    self.dir_manager.set_mode(previous)
+            return run
+
+        self.file_panel.store_destination_getter = pinned(
+            self.dir_manager.store_destination)
+        self.file_panel.dialog_start_dir_getter = pinned(
+            self.dir_manager.dialog_start_dir)
 
     def _spo_store_destination(self) -> str:
-        """The SPO folder on the store, regardless of the singleton's mode."""
+        """The SPO folder on the store, regardless of the singleton's mode.
+
+        Kept because other code may reference it by name.
+        """
         previous_mode = self.dir_manager.mode
         try:
             self.dir_manager.set_mode("SPO")

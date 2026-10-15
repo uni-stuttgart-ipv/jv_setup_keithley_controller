@@ -10,6 +10,7 @@ import os
 import pytest
 
 from solarjv_analyzer.spo.spo_report import SpoReport
+from solarjv_analyzer.store import paths
 
 
 PARAMS = {
@@ -21,8 +22,14 @@ METRICS = {"mean_power_mw": 12.5, "drift_percent": -1.2}
 
 
 def _run(tmp_path, rows=5, name="spo_ch3_2026-09-19T10-00-00_raw.csv"):
-    raw = tmp_path / name
-    report = SpoReport(str(raw))
+    """Returns the report plus the path the journal is LIVE at.
+
+    While a hold runs the journal carries JOURNAL_SUFFIX so the store sweeper
+    cannot claim and delete it mid-run. It only takes the plain `_raw.csv`
+    name when it has to outlive the run — see `final_raw` below.
+    """
+    raw = tmp_path / (name + paths.JOURNAL_SUFFIX)
+    report = SpoReport(str(tmp_path / name))
     report.init(PARAMS)
     for i in range(rows):
         report.write_row(i * 1.0, 0.85, 0.0147, 0.0125)
@@ -58,7 +65,11 @@ def test_a_truncated_report_does_not_take_the_journal_with_it(tmp_path, monkeypa
     target = report.finalize(METRICS)
 
     assert os.path.exists(target)
-    assert raw.exists(), "the journal was deleted despite an unverified report"
+    # Promoted, not merely kept: under its journal name the sweeper would skip
+    # it and the janitor would eventually remove the only good copy.
+    final_raw = raw.with_suffix("")          # strip JOURNAL_SUFFIX
+    assert final_raw.exists(), "the journal was lost despite an unverified report"
+    assert not raw.exists()
 
 
 def test_verification_rejects_a_truncated_report(tmp_path):
@@ -92,14 +103,24 @@ def test_the_journal_survives_when_finalize_is_never_called(tmp_path):
 
 
 def test_writing_the_report_over_the_raw_path_deletes_nothing(tmp_path):
-    """Combined mode passes an explicit output_path. If it ever collided with
-    the raw path, discarding the raw would discard the report."""
-    report, raw = _run(tmp_path)
+    """Combined mode passes an explicit output_path.
 
-    target = report.finalize(METRICS, output_path=str(raw))
+    It used to be possible for that path to equal the raw path, so discarding
+    the raw would discard the report. The journal suffix makes the collision
+    structurally impossible — the report never carries it — but the report
+    may still legitimately take the raw file's *logical* name, and that must
+    leave the report standing.
+    """
+    report, raw = _run(tmp_path)
+    logical_raw = raw.with_suffix("")        # strip JOURNAL_SUFFIX
+
+    target = report.finalize(METRICS, output_path=str(logical_raw))
 
     assert os.path.exists(target)
-    assert raw.exists()
+    assert os.path.samefile(target, str(logical_raw))
+    assert open(target, encoding="utf-8").read().startswith(
+        "[[ EXPERIMENTAL PARAMETERS ]]"), "the report was overwritten by the raw"
+    assert not raw.exists(), "the journal should have been cleared"
 
 
 def test_an_undeletable_journal_is_not_an_error(tmp_path, monkeypatch):
@@ -117,6 +138,27 @@ def test_an_undeletable_journal_is_not_an_error(tmp_path, monkeypatch):
 
 
 def test_discard_can_be_switched_off(tmp_path):
+    """Keeping the raw means keeping a real file, not a journal in limbo."""
     report, raw = _run(tmp_path)
     report.finalize(METRICS, discard_raw=False)
-    assert raw.exists()
+
+    final_raw = raw.with_suffix("")          # strip JOURNAL_SUFFIX
+    assert final_raw.exists(), "the kept raw must carry its real name"
+    assert not raw.exists()
+    # and it is now something the store will actually publish
+    assert not paths.is_journal_name(final_raw.name)
+    assert not paths.is_part_name(final_raw.name)
+
+
+def test_the_live_journal_is_invisible_to_the_store(tmp_path):
+    """The whole point of the suffix: a running hold cannot be published.
+
+    Before this, the raw CSV carried its final name for the length of the
+    hold and was protected only by the sweeper's quiet window — which a slow
+    sampling interval defeats.
+    """
+    report, raw = _run(tmp_path)
+
+    assert paths.is_journal_name(raw.name)
+    assert raw.exists(), "the journal should be live during the hold"
+    assert not (tmp_path / "spo_ch3_2026-09-19T10-00-00_raw.csv").exists()

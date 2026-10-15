@@ -203,6 +203,16 @@ def main():
             # MUX yet, and a cable pulled later must turn its light red.
             if hasattr(main_window, 'start_hardware_monitor'):
                 main_window.start_hardware_monitor()
+            # The main window is attached by now and owns the sweeping from
+            # here on, so retire the calibration window's sidecar rather than
+            # leaving a second sweeper running against the same staging root.
+            # This is the ordinary path — every successful login reaches it —
+            # so a leak here would be a leak on every single run.
+            try:
+                store.detach(calib_window)
+            except Exception as exc:                  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    f"Could not detach calibration publishing: {exc}")
             calib_window.close()
 
         # Connect calibration window signals
@@ -216,9 +226,21 @@ def main():
         if SessionManager.current_user is None:
             relogin = True
 
-        # Clean up main window if still visible
-        if main_window and main_window.isVisible():
-            main_window.close()
+        # Clean up the main window if it is still around.
+        #
+        # handle_logout() deliberately deleteLater()s it -- otherwise the
+        # window, its plots and its store sidecar outlive every logout and a
+        # shift's worth of logins piles them up. Qt destroys the C++ object
+        # but Python still holds the wrapper here, and touching a deleted
+        # wrapper raises RuntimeError. A window we deleted on purpose is
+        # also, by definition, already closed.
+        if main_window is not None:
+            try:
+                if main_window.isVisible():
+                    main_window.close()
+            except RuntimeError:
+                pass                      # already destroyed on logout
+            main_window = None
 
     sys.exit(0)
 
@@ -249,7 +271,22 @@ def handle_logout(window):
     except Exception as exc:                          # noqa: BLE001
         logging.getLogger(__name__).warning(
             f"Could not clear the store identity: {exc}")
+    # Stop this window's publishing before letting go of it. Without this the
+    # sidecar — its 60 s sweep timer and its filesystem watcher — outlives the
+    # window for the rest of the process, so a lab PC that sees ten logins in a
+    # shift ends up with ten sweepers racing on one staging folder.
+    try:
+        store.detach(window)
+    except Exception as exc:                          # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            f"Could not detach store publishing: {exc}")
     window.close()
+    # Let Qt destroy it. The window is going out of scope here and nothing
+    # should deliver it another signal.
+    try:
+        window.deleteLater()
+    except Exception:                                 # noqa: BLE001
+        pass
     # Flag for main loop: no current user → relogin
     SessionManager.current_user = None
 

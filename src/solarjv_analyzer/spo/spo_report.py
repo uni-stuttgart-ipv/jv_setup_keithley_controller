@@ -29,6 +29,9 @@ import csv
 import logging
 import os
 
+from solarjv_analyzer.store import paths
+from solarjv_analyzer.store.finalize import published_file
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,10 +63,25 @@ class SpoReport:
             filepath: Full path to the raw, live-written CSV file.
         """
         self.filepath = filepath
+        # The journal is appended to for the whole hold, so it must never
+        # carry a publishable name — the sweeper would claim and delete it
+        # mid-run. `filepath` stays the logical raw name so the derived
+        # report path (`_default_report_path`) is unchanged.
+        self._raw_path = filepath + paths.JOURNAL_SUFFIX
         self.parameters = {}
         self._file = None
         self._writer = None
         self._rows = []  # kept in memory to build the final report
+
+    @property
+    def raw_path(self) -> str:
+        """Where the journal is being written right now.
+
+        Not `filepath`: while the hold runs the journal carries
+        JOURNAL_SUFFIX so the store sweeper cannot claim it mid-run. It takes
+        `filepath` only if it has to outlive the run.
+        """
+        return self._raw_path
 
     def init(self, parameters: dict):
         """
@@ -74,7 +92,7 @@ class SpoReport:
             parameters: Mapping of parameter name -> (value, unit).
         """
         self.parameters = parameters
-        self._file = open(self.filepath, "w", newline="", encoding="utf-8")
+        self._file = open(self._raw_path, "w", newline="", encoding="utf-8")
         for name, (value, unit) in parameters.items():
             unit_str = f" {unit}" if unit else ""
             self._file.write(f"# {name}: {value}{unit_str}\n")
@@ -142,7 +160,9 @@ class SpoReport:
         target = output_path or self._default_report_path()
 
         try:
-            with open(target, "w", newline="", encoding="utf-8") as f:
+            # Written via a `.part` sibling, renamed on close — see
+            # store.finalize. The sweeper never sees a partial report.
+            with published_file(target, newline="", encoding="utf-8") as f:
                 # COLUMN-WISE, to match the J-V report exactly: one header
                 # row of names (units folded into the header) and one row of
                 # values. The old row-wise "Parameter,Value,Unit" layout meant
@@ -182,10 +202,21 @@ class SpoReport:
             logger.info(f"SPO formatted report saved: {target}")
         except Exception as e:
             logger.error(f"Failed to write SPO formatted report: {e}")
+            # The report did not survive, so the journal is now the only copy
+            # of this hold. Give it its final name so the sweeper publishes it
+            # exactly as it did when the journal carried that name throughout.
+            # Both callers of finalize() log and swallow this exception, so
+            # without the rescue the data would be janitored and lost.
+            self._promote_raw()
             raise
 
         if discard_raw:
             self._discard_raw(target)
+        else:
+            # "Keep both" has to mean a real file. Left as a journal it would
+            # be skipped by the sweeper and removed by the janitor — the
+            # opposite of what the caller asked for.
+            self._promote_raw()
 
         return target
 
@@ -224,19 +255,52 @@ class SpoReport:
             return False
         return True
 
+    def _promote_raw(self):
+        """Give the journal its final name, so it is a real, publishable file.
+
+        Used on every path where the journal has to outlive the run: the
+        report could not be written, it could not be verified, or the caller
+        asked to keep both. Until this runs the journal carries
+        JOURNAL_SUFFIX, which the sweeper skips and the janitor eventually
+        clears — correct while a hold is in progress, wrong once it is the
+        copy that matters.
+
+        Failure is logged and swallowed: the data is still on disk either
+        way, and the janitor promotes a stale journal on a later pass.
+        """
+        raw = getattr(self, "_raw_path", None)
+        if not raw or not os.path.exists(raw):
+            return
+        try:
+            from solarjv_analyzer.store.finalize import promote
+            promote(raw, self.filepath)
+            logger.info(
+                f"Kept the raw SPO time series as "
+                f"{os.path.basename(self.filepath)}; it will reach the store.")
+        except OSError as exc:
+            logger.warning(f"Could not rescue the raw SPO journal {raw}: {exc}")
+
     def _discard_raw(self, report_path: str):
         """Remove the raw journal now that the report has replaced it."""
-        raw = self.filepath
+        raw = self._raw_path
         if not raw:
             return
         if _same_path(raw, report_path):
-            # The report was written over the raw path — there is no separate
-            # journal to remove, and removing it would delete the report.
+            # Unreachable now that the journal carries JOURNAL_SUFFIX and the
+            # report never does — kept because it costs nothing and removing
+            # it would re-open the "report written over the raw path" hazard
+            # if either name scheme ever changes again.
             return
         if not self._report_is_complete(report_path):
+            # The report exists but does not hold every row, so the journal is
+            # still the better copy. Promote it rather than merely keeping it:
+            # under its in-progress name the sweeper would skip it and the
+            # janitor would eventually remove it, where the old layout had it
+            # published. Same outcome as before, reached deliberately.
             logger.warning(
                 f"Keeping the raw SPO CSV {os.path.basename(raw)}: the report "
                 "could not be verified.")
+            self._promote_raw()
             return
         try:
             os.remove(raw)

@@ -23,6 +23,7 @@ from pymeasure.experiment import Results
 from solarjv_analyzer.instruments.instrument_manager import InstrumentManager
 from solarjv_analyzer.procedures.jv_procedure import JVProcedure
 from solarjv_analyzer.utils.directory_manager import DirectoryManager
+from solarjv_analyzer.store.finalize import published_file
 from solarjv_analyzer.gui.style import BASE_STYLESHEET, FONT_FAMILY
 from solarjv_analyzer.gui.calibration_style import (
     calibration_stylesheet, load_design_fonts, label_font,
@@ -1094,6 +1095,20 @@ class CalibrationWindow(QtWidgets.QMainWindow):
         file_path = self._get_calibration_file_path()
         self._calibration_file_path = file_path
 
+        # pymeasure appends to its file for the whole sweep, so it must NOT
+        # carry a publishable name: the sweeper would claim it mid-run and
+        # delete it under the recorder. J-V already hands pymeasure a
+        # `*_temp` path for exactly this reason; calibration was the odd one
+        # out. `is_temp_name()` excludes it, `_write_calibration_report()`
+        # then writes the real report to `file_path` through published_file.
+        #
+        # It must not be `file_path + PART_SUFFIX`: the report writer uses
+        # that exact name for its own in-progress file, and the two would
+        # collide.
+        raw_base, raw_ext = os.path.splitext(file_path)
+        raw_path = f"{raw_base}_temp{raw_ext}"
+        self._calibration_raw_path = raw_path
+
         procedure = CalibrationProcedure(
             instrument=self.instrument_manager.keithley,
             mux=None,  # direct connection — no MUX in the calibration gate
@@ -1117,7 +1132,7 @@ class CalibrationWindow(QtWidgets.QMainWindow):
         # Store procedure for report writing
         self._calibration_procedure = procedure
 
-        results = Results(procedure, file_path)
+        results = Results(procedure, raw_path)
         self._current_results = results
 
         # Channel 1's colour from the shared palette — calibration always
@@ -1195,7 +1210,9 @@ class CalibrationWindow(QtWidgets.QMainWindow):
                 'Current (A)': list(i_clean),
             }
 
-            with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            # Written via a `.part` sibling, renamed on close — see
+            # store.finalize. The sweeper never sees a partial report.
+            with published_file(filepath, newline='', encoding='utf-8') as f:
                 f.write("[[ EXPERIMENTAL PARAMETERS ]]\n")
                 f.write("Parameter,Value,Unit\n")
                 for key, value in params.items():
@@ -1228,8 +1245,30 @@ class CalibrationWindow(QtWidgets.QMainWindow):
                     f.write(f",{data['Voltage (V)'][i]},{data['Current (A)'][i]}\n")
 
             logger.info(f"Calibration report saved: {filepath}")
+
+            # The recorder's working file has served its purpose: every row it
+            # held is in the report above, taken from the procedure in memory.
+            # J-V deletes its `_temp` files after merging; without the same
+            # here one accumulates in staging after every calibration, where
+            # nothing publishes it and nothing clears it.
+            self._discard_calibration_raw()
         except Exception as e:
             logger.error(f"Failed to write calibration report: {e}")
+
+    def _discard_calibration_raw(self):
+        """Remove the recorder's working file once the report is written.
+
+        Only ever called after a successful report write, so the data is never
+        the last copy. Failure is logged, not raised: an undeletable working
+        file is untidy, not a failed calibration.
+        """
+        raw = getattr(self, "_calibration_raw_path", "")
+        if not raw or not os.path.exists(raw):
+            return
+        try:
+            os.remove(raw)
+        except OSError as exc:
+            logger.warning(f"Could not remove the calibration working file: {exc}")
 
     def _update_progress_bar(self, value):
         self.progress_bar.setValue(int(value))

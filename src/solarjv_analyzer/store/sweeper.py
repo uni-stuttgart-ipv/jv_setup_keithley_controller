@@ -1,14 +1,24 @@
 r"""Find finished files and publish them.
 
-There is no hook anywhere in the application. A file is considered finished
-when three cheap conditions hold, and between them they cover every case:
+There is no hook anywhere in the application; the sweeper decides for itself.
+A file is considered finished when these conditions hold:
 
+  * it is not named `*.part` — every report is written under that suffix and
+    renamed only once its handle is closed (see `store.finalize`), so the
+    absence of the suffix is a statement of fact, not a guess, and it is the
+    condition the others now exist only to back up;
+  * it is not named `*.journal` — the live SPO/MPP raw time series. A hold
+    that crashes leaves one behind, and `sweep()` rescues it by promoting it
+    to its final name so it publishes, which is what used to happen when the
+    journal carried that name all along;
   * it is not named `*_temp.csv` — those are the per-channel intermediates the
     app merges and deletes itself. An aborted JV run never reaches the merge,
     so temps are all it leaves and nothing is published;
-  * it has not been modified for `STORE_QUIET_SECONDS` — an SPO raw CSV grows
-    every sampling interval, so a running hold is never picked up mid-run,
-    while a crashed one goes quiet and is rescued on the next sweep;
+  * it has not been modified for `STORE_QUIET_SECONDS`. Once every producer
+    writes through `finalize.published_file()` this is 0.0 and does nothing;
+    it is kept as a per-class fallback for files nobody has converted yet, and
+    `LOG_QUIET_SECONDS` still governs session logs, which are held open for a
+    whole session and have no completion event of their own;
   * it is not empty.
 
 Session logs are handled separately: they live outside staging, are still open
@@ -29,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 NOISY_AFTER_ATTEMPTS = 3          # demote repeated identical failures to debug
 LOG_QUIET_SECONDS = 300.0         # a session log must be idle this long
+STALE_IN_PROGRESS_SECONDS = 6 * 3600.0   # longer than the 3 h MPP run cap
 _INTERNAL_NAMES = ("_publish_journal.json", "_publish_journal.json.tmp")
 
 
@@ -124,7 +135,10 @@ def find_finished(staging: str = None, quiet_seconds: float = None) -> list:
         return found
     for directory, _subdirs, files in os.walk(staging):
         for name in files:
-            if name in _INTERNAL_NAMES or paths.is_temp_name(name):
+            if (name in _INTERNAL_NAMES
+                    or paths.is_part_name(name)
+                    or paths.is_journal_name(name)
+                    or paths.is_temp_name(name)):
                 continue
             full = os.path.join(directory, name)
             # A file left claimed by an interrupted sweep is already ours and
@@ -165,6 +179,61 @@ def _logs_dir() -> str:
         return ""
 
 
+def _tidy_in_progress(staging: str) -> None:
+    """Deal with in-progress files a crash left behind. Never raises.
+
+    The two suffixes mean opposite things once their writer is gone:
+
+      * `*.part` is a half-written report. `published_file()` removes its own
+        part file on success and on exception, so one surviving here means the
+        process died mid-write. The content is partial and the measurements it
+        was built from are still in memory or in a journal, so it is deleted.
+        Publishing it would put a truncated report on the store under a name
+        nobody could tell apart from a good one.
+      * `*.journal` is the raw SPO/MPP time series, flushed row by row. A
+        crash leaves real data here, so it is promoted to its final name and
+        published on this same sweep. That is exactly what used to happen when
+        the journal carried its final name throughout.
+
+    Age is measured from the LAST WRITE, never from creation: a legitimate
+    hold keeps its journal open for hours and touches it every sampling
+    interval, so only a file nothing has written to for longer than the
+    longest possible run is considered abandoned.
+    """
+    if not os.path.isdir(staging):
+        return
+    now = time.time()
+    for directory, _subdirs, files in os.walk(staging):
+        for name in files:
+            is_part = paths.is_part_name(name)
+            is_journal = paths.is_journal_name(name)
+            if not (is_part or is_journal):
+                continue
+            full = os.path.join(directory, name)
+            try:
+                if now - os.path.getmtime(full) <= STALE_IN_PROGRESS_SECONDS:
+                    continue            # still being written, or recently was
+            except OSError:
+                continue
+            final = full[:-len(paths.PART_SUFFIX)] if is_part else \
+                full[:-len(paths.JOURNAL_SUFFIX)]
+            try:
+                if is_journal and not os.path.exists(final) \
+                        and os.path.getsize(full) > 0:
+                    os.rename(full, final)
+                    logger.warning(
+                        f"Rescued an abandoned raw journal as "
+                        f"{os.path.basename(final)}; a run must have crashed.")
+                else:
+                    # A part file, an empty journal, or a journal whose report
+                    # was written after all — none of them hold anything worth
+                    # keeping.
+                    os.remove(full)
+                    logger.info(f"Removed an abandoned in-progress file: {name}")
+            except OSError as exc:
+                logger.debug(f"Could not tidy {full}: {exc}")
+
+
 def sweep(staging: str = None, store: str = None, include_logs: bool = True) -> dict:
     """Publish everything that is ready. Safe to call from a worker thread.
 
@@ -186,6 +255,8 @@ def sweep(staging: str = None, store: str = None, include_logs: bool = True) -> 
         summary["pending"] += 1
         logger.debug("Store sweep held: no user signed in yet.")
         return summary
+
+    _tidy_in_progress(staging)
 
     journal = open_journal(staging)
     second = extra_target()

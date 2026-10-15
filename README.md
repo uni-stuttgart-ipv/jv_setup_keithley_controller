@@ -5,13 +5,13 @@
 <h1 align="center">SolarJV Analyzer</h1>
 
 <p align="center">
-  <strong>Automated J–V Characterisation & SPO Degradation Testing Platform</strong><br>
+  <strong>Automated J–V Characterisation, MPP Tracking & SPO Degradation Testing</strong><br>
   <em>University of Stuttgart · Institut für Photovoltaik (ipv)</em>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-≥3.8-blue.svg" alt="Python" />
-  <img src="https://img.shields.io/badge/tests-148%20passed-brightgreen.svg" alt="Tests" />
+  <img src="https://img.shields.io/badge/tests-468%20passed-brightgreen.svg" alt="Tests" />
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey.svg" alt="Platform" />
 </p>
@@ -22,27 +22,33 @@
 
 1. [Overview](#overview)
 2. [Key Features](#key-features)
-3. [System Architecture](#system-architecture)
-4. [Hardware Requirements](#hardware-requirements)
-5. [Installation](#installation)
-6. [Running the Application](#running-the-application)
-7. [Application Workflow](#application-workflow)
-8. [Solar Cell Metrics](#solar-cell-metrics)
+3. [Data storage and attribution](#data-storage-and-attribution)
+4. [System Architecture](#system-architecture)
+5. [Hardware Requirements](#hardware-requirements)
+6. [Installation](#installation)
+7. [Running the Application](#running-the-application)
+8. [Solar Cell Metrics — Calculation & Validation Guide](#solar-cell-metrics--calculation--validation-guide)
 9. [Device Architecture: n‑i‑p vs p‑i‑n](#device-architecture-n‑i‑p-vs-p‑i‑n)
-10. [SPO — Set‑Point Operation](#spo--set-point-operation)
-11. [Testing](#testing)
-12. [Building Standalone Applications](#building-standalone-applications)
-13. [Project Structure](#project-structure)
-14. [Configuration](#configuration)
-15. [Data Format](#data-format)
-16. [Development Guide](#development-guide)
-17. [License](#license)
+10. [Analysis-Settings Field Wiring (audit note)](#analysis-settings-field-wiring-audit-note)
+11. [SPO — Set‑Point Operation](#spo--set‑point-operation)
+12. [MPP — Maximum Power Point Tracking](#mpp--maximum-power-point-tracking)
+13. [The shared Hold Voltage card](#the-shared-hold-voltage-card)
+14. [Commissioning a lab PC](#commissioning-a-lab-pc)
+15. [Testing](#testing)
+16. [Building Standalone Applications](#building-standalone-applications)
+17. [Project Structure](#project-structure)
+18. [Configuration](#configuration)
+19. [Data Format](#data-format)
+20. [Development Guide](#development-guide)
+21. [License](#license)
 
 ---
 
 ## Overview
 
-**SolarJV Analyzer** is a Python-based, PyQt5 graphical application for automated, multi-channel **J–V (current–voltage) sweep characterisation** and **SPO (Set‑Point Operation) long-term stability testing** of solar cells. It provides a complete experimental pipeline: from instrument control to real-time visualisation, on-the-fly solar cell metric extraction, and structured data export.
+**SolarJV Analyzer** is a Python-based, PyQt5 graphical application for automated, multi-channel **J–V (current–voltage) sweep characterisation**, **MPP (maximum power point) tracking** and **SPO (Set‑Point Operation) long-term stability testing** of solar cells. It provides a complete experimental pipeline: from instrument control to real-time visualisation, on-the-fly solar cell metric extraction, and structured data export.
+
+The Advanced tab offers three measurement modes — **JV Sweep**, **MPP** and **SPO** — sharing one instrument stack, one output pipeline and one Hold Voltage card.
 
 The software interfaces directly with a **Keithley 2400 SourceMeter** and a **6‑channel multiplexer** to measure up to six solar cells sequentially in a single experimental run. It supports **dual-direction sweeps** (forward + reverse) for hysteresis analysis and **device architecture selection** (n‑i‑p / p‑i‑n) with quadrant-agnostic metric computation.
 
@@ -72,6 +78,7 @@ Designed and maintained at the **Institute for Photovoltaics (ipv), University o
 | **Curvature-Aware Voc/Isc** | Local regression at the zero crossing with residual-gated quadratic refinement; **no crossing → NaN**, never an extrapolated (fabricated) value |
 | **Rs / Rsh Extraction** | Voltage-span-selected local slope regression (±max(2·step, 25 mV)) at V=Voc (Rs) and V=0 (Rsh) |
 | **SPO Metrics** | Mean power, standard deviation, drift percentage, energy yield (trapezoidal integration), peak/trough power |
+| **MPP Tracking** | Perturb-and-observe tracker with bounded excursion; reports drift, probe count, direction flips and clamp hits |
 
 ### Data Management & UI
 
@@ -79,9 +86,11 @@ Designed and maintained at the **Institute for Photovoltaics (ipv), University o
 |---------|-------------|
 | **Structured CSV Export** | Experiment parameters, analysis summary, and measurement data in a single self-documenting file with `[[ EXPERIMENTAL PARAMETERS ]]`, `[[ ANALYSIS SUMMARY ]]`, and `[[ MEASUREMENT DATA ]]` block tags |
 | **File Loading & Restoration** | Previously saved measurement files are fully restored — plot curves, browser tree, analysis matrix, and channel data |
-| **Crash-Safe SPO Logging** | Every SPO sample is flushed to disk immediately with `fsync` — a crash never loses previously recorded data |
+| **Crash-Safe SPO / MPP Logging** | Every sample is flushed to disk immediately with `fsync` — a crash never loses previously recorded data, and an interrupted MPP run's journal is promoted to a real report |
+| **Atomic Report Store** | Reports reach the shared store only when complete: write `.part` → fsync → close → rename, reconciled by a file watcher plus a periodic sweep |
+| **Shared Hold Voltage Card** | One widget serves MPP and SPO — Manual or Quick JV, every field with a unit selector that converts rather than relabels |
 | **User Authentication** | SQLite-backed login system with Argon2id password hashing, registration, password reset, and timestamped session logs |
-| **Directory Management** | Automatic `Base/Username/Date/{Calibration\|JV\|SPO}/` folder structure, where `Username` is the **application login** — see [Data storage and attribution](#data-storage-and-attribution) |
+| **Directory Management** | Automatic `Base/Username/Date/{Calibration\|JV\|MPP\|SPO}/` folder structure, where `Username` is the **application login** — see [Data storage and attribution](#data-storage-and-attribution) |
 | **Filename Validation** | Execution buttons are gated on a non-empty filename prefix — prevents orphaned data files |
 
 ### Modern UI
@@ -105,7 +114,7 @@ Every measurement is filed under the name the operator **signed into the
 application** with:
 
 ```
-S:\Data\JV\<app login>\<yyyy-mm-dd>\<Calibration|JV|SPO>\
+S:\Data\JV\<app login>\<yyyy-mm-dd>\<Calibration|JV|MPP|SPO>\
 ```
 
 The same name is used for the local working folders, so a given person's data
@@ -137,14 +146,36 @@ username is non-empty and unique, so the store records *who signed in*, not a
 fact verified by the operating system. That is appropriate for a shared lab
 instrument; it is not an audit trail.
 
+### How a finished report reaches the store
+
+Every report is written through one helper, `store/finalize.py`:
+
+```
+write to <final>.part  →  flush + fsync  →  close  →  rename to <final>
+```
+
+The **close** is the completion guarantee — a `.part` file is never a
+finished report, so a crash can leave a partial file but never a
+partial-looking real one. A `QFileSystemWatcher` on the staging folders
+triggers a sweep within ~300 ms of the rename, with a periodic sweep behind
+it as the correctness net (Windows coalesces and can drop directory
+notifications outright). A finished report now reaches the store in well
+under a second; it used to take about 25.
+
+Two suffixes exist, with deliberately **opposite** cleanup rules:
+
+| Suffix | What it is | When stale |
+|--------|------------|------------|
+| `.part` | A report being written | **Deleted** — a half-written report is worthless |
+| `.journal` | The live raw time series of a hold | **Promoted** — a crashed run's journal is the only copy of its data |
+
 ### Known limitation
 
-The publisher only takes files that have been quiet for
-`STORE_QUIET_SECONDS`. A file still being written at the moment of logout stays
-in staging and is published on a later tick — under whoever is signed in then.
-In practice a run is finished long before anyone logs out, but if you abort a
-measurement and immediately log out, check that the file landed in the right
-folder.
+Logging out triggers a final publish and waits for it. A file still being
+written at that exact moment is published on a later tick, under whoever is
+signed in then. In practice a run finishes long before anyone logs out, but
+if you abort a measurement and immediately log out, check that the file
+landed in the right folder.
 
 ## System Architecture
 
@@ -273,6 +304,7 @@ pandas             # CSV parsing & data management
 matplotlib         # (optional) additional plotting
 reportlab          # PDF report generation
 argon2-cffi        # Password hashing
+keyring            # OS credential vault (DPAPI on Windows) for the SMTP password
 ```
 
 ---
@@ -294,7 +326,10 @@ hatch run start
 1. **Login** — Authenticate with University ID and password (Ctrl+Shift+A reveals Register / Forgot Password)
 2. **Calibration** — Mandatory reference cell check. Can be skipped only for emergency data recovery
 3. **Main Window** — Configure sweep parameters, select channels, enter filename, run measurements
-4. **Logout** — Disconnects instruments, ends session, returns to login
+4. **Advanced modes** — Switch the main window to **JV + SPO**, **SPO** or
+   **MPP** for stability testing; the Hold Voltage card can locate the hold
+   point with a Quick JV first
+5. **Logout** — Disconnects instruments, ends session, returns to login
 
 ---
 
@@ -419,6 +454,7 @@ SPO (Set‑Point Operation) is a passive stability test: the Keithley sources a 
 ### SPO Workflow
 
 1. **Quick JV** — A fast single sweep locates Vmpp and auto-fills the hold voltage
+   (the [shared Hold Voltage card](#the-shared-hold-voltage-card))
 2. **Configuration** — Set hold duration, sampling interval, and pre-conditioning time
 3. **Pre-Conditioning** — The cell stabilises at the hold voltage before logging begins
 4. **Data Collection** — Current and power are sampled every N seconds, written to a crash-safe CSV
@@ -463,9 +499,157 @@ Every SPO sample is written to a raw CSV file and flushed to disk with `os.fsync
 
 ---
 
+## MPP — Maximum Power Point Tracking
+
+MPP is an **active** stability test, where SPO is a passive one. Instead of
+holding a fixed voltage, the tracker perturbs the operating point and keeps
+whichever direction produced more power — so it follows the maximum as the
+cell ages, soaks or warms.
+
+### The algorithm
+
+Perturb-and-observe:
+
+1. **Baseline** — hold the present voltage for `Probe Interval`, recording a
+   sample every `Data Interval`
+2. **Probe** — step one `Probe Step` in the current direction and record
+   `Probe Points` samples
+3. **Decide** — compare the sums of the last *N* powers from each phase; keep
+   the new voltage if it won, otherwise reverse direction
+4. Repeat until `Run Time` elapses
+
+A `Max Excursion` window around the start voltage bounds the search. Hitting
+it is **counted and reported** (`clamp_hits`), never silently obeyed.
+
+### Choosing the intervals — this matters more than it looks
+
+One cycle takes `Probe Interval + Probe Points × Data Interval` and moves the
+operating point by exactly **one** `Probe Step`. With the defaults (60 s
+interval, 3 points, 10 s data, 10 mV step) a cycle is ~90 s and a 5-minute run
+travels **about 30 mV in total**. A start voltage 100 mV away will never reach
+the maximum, and the report will still look entirely plausible.
+
+Two practical consequences, both learned on hardware:
+
+* **For a short run, shorten the probe interval.** 10 s interval with 1 s data
+  gives a 13 s cycle — roughly 23 cycles in 5 minutes.
+* **Keep `Probe Interval` several times `Data Interval`.** Each baseline phase
+  must collect several samples; if the two are equal, the comparison degrades
+  to one sample against one and noise decides the direction.
+
+On a soaking perovskite, power can drift upward faster than a 10 mV step
+changes it. The tracker then follows the drift rather than the P(V) curve —
+visible as the voltage walking steadily in one direction while power rises
+monotonically. Pre-condition for longer, or probe less often, if you see that.
+
+### Sign convention
+
+Identical to SPO. Powers are reported as **magnitudes** (like `Pmpp`) and
+voltages **signed** (like `Vmpp`). The live plot shows generated power
+−(V·I), positive while the cell generates in Q2 and Q4 alike — so a cell that
+is *consuming* plots below zero, which is exactly what you want to see.
+
+### Output
+
+A journal (`.journal`) is written and fsynced per sample, and promoted to a
+real report if the run crashes. On completion the formatted report carries
+the parameters, an analysis summary (`mean_power_mw`, `drift_percent`,
+`efficiency_percent`, `probe_count`, `direction_flips`, `clamp_hits`, …) and
+the full time series with a `Phase` column marking `baseline` / `probe`.
+
+`Open MPP Report…` reads one back into the live view.
+
+> **Note:** `run_time_s` in the summary is the **last sample's timestamp**,
+> which is up to one sample interval short of the true elapsed run time.
+
+---
+
+## The shared Hold Voltage card
+
+MPP and SPO use **one** widget (`gui/widgets/vmpp_card.py`) for setting the
+hold / start voltage. It has two modes:
+
+**Manual** — just the voltage box and its unit selector.
+
+**Quick JV** — a self-contained mini sweep, with seven fields in this order:
+
+| Field | Units |
+|-------|-------|
+| Start | V / mV |
+| Stop | V / mV |
+| Step Size | V / mV |
+| Sweep Rate | V/s / mV/s |
+| Compliance | A / mA / µA |
+| Device Area | cm² / mm² / m² |
+| Device Architecture | n‑i‑p / p‑i‑n toggle |
+
+These open with the **same defaults as the J–V Sweep tab** (1.2 V → −0.2 V,
+−10 mV, 100 mV/s, 180 mA, 0.089 cm²), because it is the same measurement and
+a Quick JV result should be comparable with a full sweep of the same cell.
+
+Flipping the architecture **mirrors the sweep window** (p‑i‑n generates in
+quadrant 2, so −1.2 V → +0.2 V), asking first if you have typed your own
+values. Changing a unit converts the number, so the physical quantity is
+preserved — switching Compliance from mA to A cannot silently mean 180 A.
+
+**Where the run reads its device settings from depends on the mode:** Quick JV
+selected → the card's own fields; Manual selected → the J–V Parameters tab,
+because in Manual the card shows nothing to read. Incident power always comes
+from the Analysis tab.
+
+---
+
+## Commissioning a lab PC
+
+The SMTP password is **never** in the source tree. It lives in the operating
+system's credential store — Windows Credential Manager via DPAPI, encrypted
+under a key derived from that machine and account. The app fails loudly when
+it is missing rather than falling back to a built-in value.
+
+```powershell
+copy tools\smtp_local_config.example.py tools\smtp_local_config.py
+   # fill in SMTP_USER, SMTP_FROM_ADDR, SMTP_PASSWORD
+python tools\setup_smtp_credential.py --test
+```
+
+`tools/smtp_local_config.py` is in `.gitignore`, so `git add .` cannot pick it
+up. The setup script refuses to run if a password constant is added to the
+*tracked* script, and writes the non-secret settings (username, host, port,
+sender) to `~/.solarjv/email_config.json` — which is how the application finds
+the vault entry, since it looks the password up **by username**.
+
+Other flags: `--check` (is one stored?), `--delete`, `--diagnose` (prints
+exactly what the application sees, never the password).
+
+**Order matters on a fresh machine.** A new install has an empty `auth.db`
+with no users, and registration needs an OTP email — so the credential has to
+be in place before the first account can be created.
+
+> Run the script from a normal prompt **as the account that runs the app**.
+> DPAPI ties the stored credential to that Windows profile, and a mismatch is
+> silent: the app simply reports "not configured".
+
+---
+
 ## Testing
 
-The project has a comprehensive test suite: **148 tests in 16 files**, covering the analysis pipeline, SPO metrics, auth, hardware protocol logic, and UI widgets. Two dedicated *scientific-correctness* suites (`tests/analysis/test_scientific_correctness.py`, `tests/spo/test_spo_scientific_correctness.py`) verify every metric against analytic ground truth derived from the single-diode model — expected values are never transcribed from the implementation's own output.
+The project has a comprehensive test suite: **468 tests across 45 files**, covering the analysis pipeline, SPO and MPP metrics, the report store, auth and e-mail, hardware protocol logic, and the GUI's wiring. Two dedicated *scientific-correctness* suites (`tests/analysis/test_scientific_correctness.py`, `tests/spo/test_spo_scientific_correctness.py`) verify every metric against analytic ground truth derived from the single-diode model — expected values are never transcribed from the implementation's own output.
+
+Three kinds of test are worth knowing about before adding code:
+
+* **Scientific correctness** — ground truth from the single-diode model, never
+  from this code's own output.
+* **Store contract tests** (`tests/store/`) assert what the publisher must
+  *never* do — e.g. that no code path calls `os.remove` / `os.replace` /
+  `os.rename` on a path under the store root. They parse the source with
+  `ast`, so a regression is caught wherever it is written, not only on a path
+  some test happens to execute.
+* **Characterisation tests** (`tests/gui/test_spo_card_contract.py` and
+  friends) pinned the SPO tab's observable behaviour *before* its Hold Voltage
+  card was replaced by the shared widget, so the refactor could be shown to
+  preserve behaviour.
+
+GUI tests need an X server. On a headless box: `xvfb-run -a pytest tests/`.
 
 ### Running Tests
 
@@ -537,6 +721,8 @@ jv_setup_keithley_controller/
 │   │   └── analysis.py                 # compute_jv_metrics (11 solar cell metrics)
 │   ├── auth/
 │   │   ├── database.py                 # SQLite user DB, Argon2id hashing
+│   │   ├── email_service.py            # OTP e-mail; password from the OS vault
+│   │   ├── otp_widget.py               # One-time-code entry
 │   │   ├── session.py                  # SessionManager, per-session log files
 │   │   └── login_dialog.py             # Dark-themed split-screen login UI
 │   ├── gui/
@@ -549,6 +735,11 @@ jv_setup_keithley_controller/
 │   │       ├── instrument_tab.py       # Sense mode, range, NPLC preview
 │   │       ├── analysis_settings_tab.py
 │   │       ├── file_panel.py           # Filename prefix, directory, validation
+│   │       ├── log_panel.py            # Live run log
+│   │       ├── vmpp_card.py            # SHARED Hold Voltage card (MPP + SPO)
+│   │       ├── unit_field.py           # Number + unit selector, converts on change
+│   │       ├── single_channel_selector.py
+│   │       ├── combined_tab.py
 │   │       ├── toggle_switch.py        # iOS-style animated toggle switch
 │   │       └── channel_pinout.py
 │   ├── instruments/
@@ -561,26 +752,37 @@ jv_setup_keithley_controller/
 │   │   ├── spo_analysis.py             # compute_spo_metrics (stability, drift, energy)
 │   │   ├── spo_report.py               # Crash-safe CSV writer (fsync per row)
 │   │   └── spo_widget.py               # SPO configuration + live P-vs-t plot
+│   ├── mpp/
+│   │   ├── mpp_procedure.py            # Perturb-and-observe tracker
+│   │   ├── mpp_analysis.py             # compute_mpp_metrics (drift, flips, clamps)
+│   │   ├── mpp_report.py               # Journal per sample + formatted report
+│   │   └── mpp_widget.py               # MPP configuration + live P-vs-t plot
+│   ├── store/
+│   │   ├── paths.py                    # Store root, per-user/date/mode layout
+│   │   ├── identity.py                 # Stable report identity
+│   │   ├── publisher.py                # published_file(): .part → fsync → rename
+│   │   ├── journal.py                  # Crash journals (.journal is promoted)
+│   │   ├── finalize.py                 # Promote / discard on reconciliation
+│   │   ├── sweeper.py                  # Periodic level-triggered sweep
+│   │   └── sidecar.py                  # Per-window watcher attach/detach
 │   ├── utils/
 │   │   └── directory_manager.py        # Singleton: Base/Username/Date/Mode paths
 │   └── windows/
 │       └── calibration_window.py       # Mandatory pre-measurement calibration gate
-├── tests/
+├── tools/
+│   ├── setup_smtp_credential.py        # Store the SMTP password in the OS vault
+│   ├── smtp_local_config.example.py    # Template — copy, fill in, never committed
+│   └── repro_window_crash.py           # Window build/destroy loop (crash hunting)
+├── tests/                              # 468 tests, 45 files
 │   ├── conftest.py                     # Shared fixtures (synthetic I-V curves)
-│   ├── analysis/test_analysis.py       # 18 tests — all 11 metrics + edge cases
-│   ├── spo/test_spo_analysis.py        # 10 tests — SPO metrics + first-principles
-│   ├── spo/test_spo_report.py          # 5 tests — crash-safe CSV + finalised report
-│   ├── auth/test_database.py           # 13 tests — registration, auth, password reset
-│   ├── config/test_config.py           # 3 tests — frozen singleton, constants
-│   ├── instruments/test_mux_controller.py  # 4 tests — hex command generation
-│   ├── procedures/test_jv_procedure.py     # 11 tests — voltage seq, NPLC, parsing
-│   ├── utils/test_directory_manager.py     # 6 tests — paths, modes, preferences
-│   ├── gui/widgets/test_analysis_panel.py # 14 tests — matrix table public API
-│   ├── gui/widgets/test_parameter_tab.py   # 6 tests — architecture toggle, units
-│   ├── gui/widgets/test_file_panel.py      # 6 tests — filename validation
-│   ├── gui/widgets/test_toggle_switch.py    # 3 tests — toggle state + signal
-│   ├── test_app_controller.py              # 4 tests — CSV parsing, architecture
-│   └── test_session.py                     # 6 tests — session lifecycle + logs
+│   ├── analysis/                       # Metrics + scientific correctness
+│   ├── spo/                            # SPO metrics, report, raw-sample discard
+│   ├── mpp/                            # Tracking algorithm
+│   ├── store/                          # Publisher, sweeper, sidecar, AST contracts
+│   ├── auth/                           # User DB + e-mail service
+│   ├── gui/                            # Mode switching, wiring, card contracts
+│   ├── instruments/ procedures/ utils/ config/ tools/
+│   └── test_app_controller.py, test_session.py
 ├── pyproject.toml                     # Build config (Hatchling), Briefcase settings
 ├── Login.png                          # 3D lab illustration (~6 MB)
 ├── channel_pinout.png                 # MUX channel pinout reference
@@ -601,6 +803,15 @@ Edit `src/solarjv_analyzer/config.py`:
 | `DATE_FORMAT` | `"%d-%m-%Y"` | Date format for data subdirectories |
 | `CHANNEL_COUNT` | `6` | Number of MUX channels |
 | `SIMULATION_MODE` | `False` | **Deprecated** — no simulated fallback in production |
+| `STORE_ROOT` | `S:\Data\JV` | Protected share where finished reports are published |
+| `STAGING_ROOT` | `%LOCALAPPDATA%\SolarJV\staging` | Working files; must allow deletion, because the store does not |
+| `STORE_ENABLED` | `True` | Master switch — `SOLARJV_STORE_ENABLED=0` restores pre-store behaviour |
+| `STORE_SWEEP_INTERVAL_MS` | `60000` | Safety-net sweep behind the file watcher |
+| `STORE_QUIET_SECONDS` | `0.0` | Legacy guess-based completion test; 0 because `published_file()` gives a real completion event |
+
+Two of these are overridable from the environment — `SOLARJV_STORE_ROOT` and
+`SOLARJV_STORE_ENABLED` — which is how rehearsals and the test suite avoid
+touching the real share.
 
 ---
 
@@ -654,12 +865,17 @@ Time (s),Voltage (V),Current (A),Power (mW)
 
 ### Adding a New Feature
 
-1. **Identify the layer**: UI widget → `gui/widgets/`, procedure → `procedures/`, hardware → `instruments/`, analysis → `analysis/` or `spo/`
-2. **Follow existing patterns** — the SPO module mirrors the JV module's structure
+1. **Identify the layer**: UI widget → `gui/widgets/`, procedure → `procedures/`, hardware → `instruments/`, analysis → `analysis/`, `spo/` or `mpp/`
+2. **Follow existing patterns** — `spo/` and `mpp/` both mirror the JV module's structure (procedure / analysis / report / widget)
 3. **Use `DirectoryManager` singleton** for all file paths — never hardcode paths
 4. **Add logging** with `logger = logging.getLogger(__name__)` at module level
 5. **Thread safety** — hardware calls MUST run in background workers; cross-thread data MUST use Qt signals
 6. **Add tests** — pure logic in Tier 1, widgets in Tier 3, hardware-dependent in Tier 2
+7. **Before refactoring a widget**, pin its behaviour with characterisation
+   tests first, then prove the tests fail against a deliberately broken copy —
+   a test that cannot fail is not evidence
+8. **Never write to the store directly.** Use `store.finalize.published_file()`
+   so the report appears under its final name only once it is closed on disk
 
 ### Code Style
 
@@ -671,9 +887,17 @@ Time (s),Voltage (V),Current (A),Power (mW)
 ### Key Architectural Patterns
 
 - **Singleton `DirectoryManager`** — one instance across the entire application
-- **SPO is optional** — the `spo/` package uses `try/except ImportError` guards; the JV application runs without it
+- **SPO and MPP are optional** — both packages are imported behind `try/except ImportError` guards; the JV application runs without either
+- **One shared card, two tabs** — MPP and SPO both embed `VmppCard`; it owns
+  the Quick JV run, and `device_settings()` decides whether area/compliance
+  come from the card or the J–V Parameters tab
+- **Secrets live in the OS vault** — no credential is ever read from the source
+  tree, and a missing one is reported, not substituted
 - **PyMeasure Manager for JV, custom QThread for SPO** — different threading models for different experiment types
 - **Hardware-controlled sweeps** — Keithley configured via SCPI trigger model, not software-point-by-point
+- **Level-triggered reconciliation** — the file watcher is a latency
+  optimisation; the periodic sweep is what makes publishing correct, so no
+  dropped OS event can strand a report
 
 ---
 

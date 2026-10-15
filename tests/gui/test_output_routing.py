@@ -3,7 +3,7 @@
 Bug history (2026-09-17): a combined JV+SPO run wrote its SPO raw CSV and SPO
 report into the **Main** folder next to the JV report. `start_combined_run`
 built both SPO paths from `file_params['directory']`, which is the file panel's
-path and therefore always the "Main" mode folder. A *standalone* SPO run was
+path and therefore always the "JV" mode folder. A *standalone* SPO run was
 unaffected because `SpoProcedure` resolves the SPO folder itself — but in
 combined mode the controller passes an explicit `csv_path`, which bypasses
 that entirely.
@@ -113,13 +113,13 @@ def test_combined_run_files_jv_and_spo_in_their_own_folders(
         def folder_of(path):
             return os.path.basename(os.path.dirname(path))
 
-        assert folder_of(controller.merged_file_path) == "Main"
+        assert folder_of(controller.merged_file_path) == "JV"
         assert folder_of(controller._combined_spo_csv_path) == "SPO"
         assert folder_of(controller._combined_spo_report_path) == "SPO"
 
         # The singleton's mode must be put back, or every later JV run files
         # itself under SPO.
-        assert window.dir_manager.mode == "Main"
+        assert window.dir_manager.mode == "JV"
     finally:
         _teardown(app, window)
 

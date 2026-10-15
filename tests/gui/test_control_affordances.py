@@ -166,6 +166,21 @@ def test_pyqtgraphs_view_registry_does_not_grow_per_window(app, fresh_dirs):
     from pyqtgraph.graphicsItems.ViewBox import ViewBox
     from solarjv_analyzer.gui.jv_analyzer_window import JVAnalyzerWindow
 
+    # Count only the ViewBoxes THIS test creates. `AllViews` is module-level
+    # state shared by the whole run, and entries left by earlier tests are
+    # collected at moments nothing here controls, so a raw len() moves for
+    # reasons that have nothing to do with these windows.
+    #
+    # By id, deliberately: holding the ViewBoxes themselves would keep alive
+    # the very objects whose release is being measured. And NO gc.collect()
+    # here — forcing a collection mid-suite frees Python wrappers whose C++
+    # objects pyqtgraph still walks, which segfaults a later window build.
+    # That is the same crash this test exists to prevent, caused by the test.
+    before = {id(view) for view in ViewBox.AllViews}
+
+    def mine():
+        return sum(1 for view in ViewBox.AllViews if id(view) not in before)
+
     kept = []                       # a fixture or traceback frame does this
     sizes = []
     for _ in range(3):
@@ -175,6 +190,20 @@ def test_pyqtgraphs_view_registry_does_not_grow_per_window(app, fresh_dirs):
         win.deleteLater()
         app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
         app.processEvents()
-        sizes.append(len(ViewBox.AllViews))
+        sizes.append(mine())
 
-    assert max(sizes) == min(sizes), f"the registry grew: {sizes}"
+    try:
+        # Each window must give back exactly what it took, so the count after
+        # the first equals the count after the third. A rising series is the
+        # leak.
+        assert max(sizes) == min(sizes), f"the registry grew: {sizes}"
+    finally:
+        # Release them. Holding three closed windows is the whole point of the
+        # test, but leaving them held poisons the registry for everything that
+        # runs afterwards: the next `ViewBox.__init__` walks these entries and
+        # dereferences C++ objects Qt has already freed, which takes the whole
+        # process down with no traceback. Reproduced here as an intermittent
+        # segfault in a later window build.
+        kept.clear()
+        app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        app.processEvents()

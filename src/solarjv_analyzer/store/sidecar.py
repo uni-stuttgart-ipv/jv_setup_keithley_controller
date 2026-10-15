@@ -24,6 +24,7 @@ off" and never to a broken application: every step is guarded and logged.
 
 import logging
 import os
+import weakref
 import time
 
 from PyQt5 import QtCore, QtWidgets
@@ -34,7 +35,15 @@ from .identity import active_user
 
 logger = logging.getLogger(__name__)
 
-_sidecars = {}          # keep references alive: id(window) -> StoreSidecar
+# id(window) -> (weakref to window, StoreSidecar). The window is in the value
+# because CPython reuses id() once an object is freed, so the key alone
+# cannot tell "already attached" from "a new window at a recycled address".
+# Getting that wrong is silent and total — attach() would report success and
+# install nothing, and that operator's reports would never leave staging.
+#
+# It is a *weak* reference so this registry does not itself become the thing
+# keeping every window the application has ever shown alive.
+_sidecars = {}
 
 
 def is_enabled() -> bool:
@@ -83,6 +92,20 @@ class StoreSidecar(QtCore.QObject):
         self._thread = None
         self._status_label = None
         self._timer = None
+        self._rerun_requested = False
+        # Watching the staging folders is what makes publishing prompt. The
+        # periodic timer stays as the safety net: Windows coalesces and can
+        # drop directory notifications outright when its buffer overflows,
+        # and Qt stops watching a path the moment it is renamed or removed —
+        # which is exactly what `.part` -> final does on every report.
+        self._watcher = QtCore.QFileSystemWatcher(self)
+        self._watcher.directoryChanged.connect(self._on_directory_changed)
+        # One sweep per burst, not one per notification: a single report
+        # produces several events (create, write, rename) within a few ms.
+        self._debounce = QtCore.QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(300)
+        self._debounce.timeout.connect(self.sweep_now)
 
     # -- setup ----------------------------------------------------------
     def install(self) -> bool:
@@ -91,6 +114,7 @@ class StoreSidecar(QtCore.QObject):
         self._add_status_label()
         self._rewire_browse()
         self._start_timer()
+        self._sync_watched_dirs()
         self.sweep_now()
         return True
 
@@ -200,9 +224,47 @@ class StoreSidecar(QtCore.QObject):
                 logger.info("Store: second copy disabled")
         self._refresh_status()
 
+    def _on_directory_changed(self, _path: str) -> None:
+        """Something appeared or vanished in a staging folder."""
+        # Restarts the timer, so a burst of events costs one sweep.
+        self._debounce.start()
+
+    def _sync_watched_dirs(self) -> None:
+        """Point the watcher at staging and every folder beneath it.
+
+        Re-synced after every sweep rather than registered by the producers.
+        Producers would have to remember to call in — and SPO picks its folder
+        inside the procedure, on a worker thread, where touching a Qt object
+        is not allowed. Deriving the set from the filesystem needs nobody's
+        cooperation and cannot be forgotten.
+        """
+        root = paths.staging_root()
+        wanted = set()
+        try:
+            if os.path.isdir(root):
+                wanted.add(root)
+                for directory, subdirs, _files in os.walk(root):
+                    wanted.update(os.path.join(directory, d) for d in subdirs)
+        except OSError as exc:
+            logger.debug(f"Store: could not enumerate staging to watch: {exc}")
+            return
+        current = set(self._watcher.directories())
+        stale = current - wanted
+        if stale:
+            self._watcher.removePaths(sorted(stale))
+        fresh = wanted - current
+        if fresh:
+            self._watcher.addPaths(sorted(fresh))
+
     def sweep_now(self) -> None:
         if self._thread is not None and self._thread.isRunning():
+            # A bare return here used to drop the request. That was harmless
+            # while a 20 s poll was the only trigger; with the watcher it is
+            # not, because the dropped wake-up is the one carrying a report
+            # that has just been renamed into place.
+            self._rerun_requested = True
             return
+        self._rerun_requested = False
         self._thread = _SweepThread(self)
         self._thread.finished_sweep.connect(self._on_swept)
         self._thread.start()
@@ -211,6 +273,12 @@ class StoreSidecar(QtCore.QObject):
         if summary.get("published"):
             logger.info(f"Store: published {summary['published']} file(s)")
         self._refresh_status(summary)
+        self._sync_watched_dirs()
+        if self._rerun_requested:
+            # Bounded: a sweep that changes nothing produces no new events, so
+            # the chain stops as soon as staging is empty.
+            self._rerun_requested = False
+            self.sweep_now()
 
     def _refresh_status(self, summary: dict = None) -> None:
         if self._status_label is None:
@@ -234,6 +302,14 @@ class StoreSidecar(QtCore.QObject):
     def shutdown(self) -> None:
         if self._timer is not None:
             self._timer.stop()
+        self._debounce.stop()
+        self._rerun_requested = False
+        try:
+            watched = self._watcher.directories()
+            if watched:
+                self._watcher.removePaths(watched)
+        except RuntimeError:
+            pass                        # already torn down by Qt
         if self._thread is not None and self._thread.isRunning():
             self._thread.wait(5000)
 
@@ -350,13 +426,32 @@ def attach(window) -> bool:
         logger.info("Store publishing is disabled.")
         return False
     key = id(window)
-    if key in _sidecars:
-        return True
+    existing = _sidecars.get(key)
+    if existing is not None:
+        if existing[0]() is window:
+            return True
+        # Same address, different object: the previous window was freed
+        # without detaching. Retire its sidecar and attach this one properly.
+        logger.warning(
+            "Store: stale sidecar found at a recycled window id; retiring it.")
+        _retire(key)
     try:
         sidecar = StoreSidecar(window)
         if not sidecar.install():
+            sidecar.shutdown()
             return False
-        _sidecars[key] = sidecar
+        try:
+            ref = weakref.ref(window)
+        except TypeError:                 # not weak-referenceable
+            ref = lambda: window          # noqa: E731
+        _sidecars[key] = (ref, sidecar)
+        # A window destroyed without a detach() would otherwise leave this
+        # sidecar sweeping forever against a dead window. Qt's `destroyed`
+        # fires on C++ destruction, which is the last moment this is safe.
+        try:
+            window.destroyed.connect(lambda *_, k=key: _retire(k))
+        except Exception:                 # not a QObject, or already dying
+            pass
         logger.info(
             f"Store publishing active: {paths.store_root()} "
             f"(sweep every {config.STORE_SWEEP_INTERVAL_MS / 1000:.0f}s)"
@@ -367,7 +462,21 @@ def attach(window) -> bool:
         return False
 
 
+def _retire(key) -> None:
+    """Stop and forget one sidecar. Safe to call twice, and safe to call
+    from `destroyed`, when the window's C++ object is already gone."""
+    entry = _sidecars.pop(key, None)
+    if entry is None:
+        return
+    try:
+        entry[1].shutdown()
+    except RuntimeError:
+        pass                              # Qt tore the sidecar down with its parent
+    except Exception as exc:              # noqa: BLE001
+        logger.warning(f"Store: sidecar shutdown failed: {exc}")
+
+
 def detach(window) -> None:
-    sidecar = _sidecars.pop(id(window), None)
-    if sidecar is not None:
-        sidecar.shutdown()
+    """Stop publishing for `window`. Always call this before dropping a
+    window; nothing else stops its sweep timer."""
+    _retire(id(window))

@@ -85,7 +85,9 @@ def test_unexpected_layout_falls_back_to_the_file_date(tmp_path):
     staged.write_text("x")
     date_str, mode = paths.classify_staged(str(staged), str(tmp_path))
     expected = datetime.fromtimestamp(staged.stat().st_mtime).strftime("%Y-%m-%d")
-    assert (date_str, mode) == (expected, "Main")
+    # "JV", not "Main": the J-V folder was renamed, and an unrecognised
+    # layout falls back to the name the folder has now.
+    assert (date_str, mode) == (expected, "JV")
 
 
 def test_log_date_comes_from_the_log_filename():

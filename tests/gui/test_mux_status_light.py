@@ -210,7 +210,14 @@ def test_a_failed_open_leaves_the_window_usable(app, fresh_dirs, clean_logging, 
 
         _run_check(app, window)          # must not raise
 
-        assert RED in window.mux_light.styleSheet()
+        # The light reports whether the adapter is PRESENT, not whether the
+        # last open succeeded — see `start_hardware_monitor()`. The port is
+        # patched present here, so green is correct even though the open
+        # failed. Asserting red would be asserting the behaviour that docstring
+        # calls "precisely backwards": the light sat red with the hardware
+        # plugged in and working, and only went green once a run started.
+        assert GREEN in window.mux_light.styleSheet()
+        # The point of the test: a failed open must not take the window down.
         assert window.isEnabled()
     finally:
         _close(app, window)
@@ -303,3 +310,22 @@ def test_monitor_starts_and_stops_cleanly(app, fresh_dirs, clean_logging, monkey
     finally:
         _close(app, window)
         assert not window._hardware_timer.isActive(), "timer left running after close"
+
+
+def test_a_missing_adapter_turns_the_light_red(app, fresh_dirs, clean_logging,
+                                               monkeypatch):
+    """The other half of the presence rule, and the one that matters.
+
+    A disappearing adapter has to show up on the light by itself — neither
+    `is_open` nor a held VISA session would ever report it.
+    """
+    window = _window(app)
+    try:
+        monkeypatch.setattr(port_status, "port_names", lambda: set())
+
+        _run_check(app, window)
+
+        assert RED in window.mux_light.styleSheet()
+        assert window.mux_light.toolTip() == "MUX: Not connected"
+    finally:
+        _close(app, window)

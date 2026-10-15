@@ -94,10 +94,28 @@ def test_the_next_run_queues_rows_that_never_start(window):
 
 
 def test_the_button_is_rearmed_to_abort_when_the_run_ends(window):
-    """The handler is swapped to resume_experiment on abort. When the abort
-    returns with an empty queue the label goes back to "Abort" — but the
-    handler does not, so the label and the wiring disagree."""
+    """The visible run control's label and its click handler must agree.
+
+    They are set together in `_apply_run_control()`, onto whichever button is
+    actually on screen. Both halves matter: this used to be written in five
+    places that drifted apart, AND written unconditionally to
+    `abort_button` — which lives on the Advanced page, so in the combined
+    view the controller relabelled a button nobody could see.
+
+    So the assertions go through `active_run_controls()` rather than
+    `window.abort_button`. Those are different widgets, both labelled
+    "Abort", and testing the wrong one proves nothing.
+    """
     controller = window.controller
+
+    # This is the J-V queue's lifecycle, which lives on the Advanced tab. The
+    # window opens on JV+SPO, where the visible Abort is wired to
+    # `abort_combined` instead — that view's abort has an SPO phase to deal
+    # with. Testing the queue's rearm from there would be testing the wrong
+    # handler, so switch, and say so.
+    window.sidebar_mode_tabs.setCurrentIndex(1)
+    assert not window.in_combined_view(), "expected the Advanced tab"
+
     fired = []
     # Stand-ins, installed before the lifecycle runs so that whatever
     # abort_experiment() connects is one of these and the click is traceable.
@@ -111,9 +129,10 @@ def test_the_button_is_rearmed_to_abort_when_the_run_ends(window):
     controller.manager._running_experiment = None
     controller.on_abort_returned()
 
-    assert window.abort_button.text() == "Abort"
-    window.abort_button.setEnabled(True)
-    window.abort_button.clicked.emit()
+    _start, button = window.active_run_controls()
+    assert button.text() == "Abort"
+    button.setEnabled(True)
+    button.clicked.emit()
 
     assert fired == ["abort"], f"the button labelled Abort ran {fired}"
 

@@ -26,6 +26,7 @@ from PyQt5 import QtCore, QtWidgets
 from solarjv_analyzer.procedures.jv_procedure import JVProcedure
 from solarjv_analyzer.spo.spo_procedure import SpoWorker
 from solarjv_analyzer.gui.widgets.toggle_switch import ToggleSwitch
+from solarjv_analyzer.gui.widgets.vmpp_card import VmppCard
 from solarjv_analyzer.gui.widgets.channel_pinout import build_pinout_label
 
 logger = logging.getLogger(__name__)
@@ -163,12 +164,9 @@ class SpoParameterTab(QtWidgets.QWidget):
         """
         super().__init__(parent)
         self.main_window = main_window
-        self._quick_jv_worker = None
-        self._quick_jv_running = False
-        self._vmpp_source = None  # None | "manual" | "quick_jv"
-        self._quick_jv_voltages = []
-        self._quick_jv_currents = []
-        self._quick_jv_expected_points = 0
+        # The sweep state used to live here. It belongs to the card now, and
+        # the read-only properties below forward to it -- so these must NOT
+        # be re-assigned here or they shadow the property with an attribute.
         self._build_ui()
 
     # -------------------------------------------------------------------
@@ -177,6 +175,10 @@ class SpoParameterTab(QtWidgets.QWidget):
 
     def _build_ui(self):
         form = QtWidgets.QFormLayout(self)
+        # Cards added to this form (Hold Voltage, Channel Selection) must line
+        # up with File Output, which is not nested in here. Qt's default 9px
+        # form inset is what pushed them in and made them narrower.
+        form.setContentsMargins(0, 9, 0, 9)
         form.setVerticalSpacing(8)
 
         self.hold_duration_input = QtWidgets.QLineEdit("300")
@@ -188,10 +190,22 @@ class SpoParameterTab(QtWidgets.QWidget):
         self.preconditioning_input = QtWidgets.QLineEdit("5.0")
         form.addRow("Pre-conditioning (s):", self.preconditioning_input)
 
-        self._create_channel_selector(form)
+        # Order is Parameters, Hold Voltage, Channel Selection -- the same in
+        # every tab that has these two cards, so the panel reads the same way
+        # whichever mode you are in.
+        # ---- Hold Voltage section (the shared card) ----------------------
+        # Built before the channel selector is added to the form but AFTER it
+        # exists, because Quick JV asks the selector which channel to sweep.
+        self.vmpp_card = VmppCard(
+            self.main_window,
+            title="Hold Voltage",
+            placeholder="Enter hold voltage (V)",
+            channel_provider=self.get_selected_channel,
+        )
+        self.vmpp_card.voltage_ready.connect(self.vmpp_ready.emit)
+        form.addRow(self.vmpp_card)
 
-        # ---- Hold Voltage section (card with Quick JV) --------------------
-        self._create_hold_voltage_card(form)
+        self._create_channel_selector(form)
 
     def _create_channel_selector(self, parent_layout):
         """
@@ -298,7 +312,7 @@ class SpoParameterTab(QtWidgets.QWidget):
     def get_parameters(self) -> dict:
         """Collect SPO-specific parameters from the configuration fields."""
         return {
-            'hold_voltage': float(self.vmpp_input.text() or 0.0),
+            'hold_voltage': self.vmpp_card.voltage(0.0),
             'hold_duration': float(self.hold_duration_input.text() or 300.0),
             'sampling_interval': float(self.sampling_interval_input.text() or 1.0),
             'preconditioning_time': float(self.preconditioning_input.text() or 5.0),
@@ -306,556 +320,81 @@ class SpoParameterTab(QtWidgets.QWidget):
         }
 
     def has_valid_hold_voltage(self) -> bool:
-        """True if the Vmpp field currently holds a parsable float."""
-        try:
-            float(self.vmpp_input.text())
-            return True
-        except (TypeError, ValueError):
-            return False
+        """True if the hold-voltage field currently holds a parsable float."""
+        return self.vmpp_card.has_valid_voltage()
 
-    def _on_vmpp_changed(self, _text):
-        # Track provenance: user edits reset to "manual"; Quick JV sets
-        # _vmpp_source = "quick_jv" *before* calling setText so this
-        # handler keeps the green badge.
-        if self._vmpp_source != "quick_jv":
-            self._vmpp_source = "manual" if self.has_valid_hold_voltage() else None
-        self._update_vmpp_badge()
-        self.vmpp_ready.emit(self.has_valid_hold_voltage())
+    def set_hold_voltage(self, value: float, source: str = "manual") -> None:
+        """Used by the combined J-V + SPO run to seed Vmpp from the sweep."""
+        self.vmpp_card.set_voltage(value, source)
 
     def set_config_enabled(self, enabled: bool):
         """Enable/disable all configuration inputs (locked while running)."""
         for widget in (
             self.hold_duration_input, self.sampling_interval_input,
-            self.preconditioning_input, self.vmpp_input,
-            self.manual_mode_button, self.quick_jv_mode_button,
-            self.quick_jv_start_input, self.quick_jv_stop_input,
-            self.quick_jv_rate_input, self.quick_jv_button,
+            self.preconditioning_input,
             *self.channels,
         ):
             widget.setEnabled(enabled)
+        # The card locks its own inputs, including the ones SPO never had.
+        self.vmpp_card.set_config_enabled(enabled)
 
     # -------------------------------------------------------------------
     # Hold Voltage Card (Manual / Quick JV)
     # -------------------------------------------------------------------
 
-    def _create_hold_voltage_card(self, form):
-        """Build the reinvented Hold Voltage card with Manual/Quick JV toggle,
-        shared Vmpp entry, live mini-plot, progress bar, and results grid."""
-        card = QtWidgets.QGroupBox("Hold Voltage")
-        layout = QtWidgets.QVBoxLayout(card)
-        layout.setSpacing(8)
-
-        # ---- Row 1: Shared Vmpp entry + source badge --------------------
-        vmpp_row = QtWidgets.QHBoxLayout()
-        vmpp_row.setSpacing(8)
-
-        self.vmpp_badge = QtWidgets.QLabel("No Vmpp")
-        self.vmpp_badge.setFixedWidth(78)
-        self.vmpp_badge.setAlignment(QtCore.Qt.AlignCenter)
-
-        self.vmpp_input = QtWidgets.QLineEdit()
-        self.vmpp_input.setPlaceholderText("Enter hold voltage (V)")
-        self.vmpp_input.textChanged.connect(self._on_vmpp_changed)
-
-        self._update_vmpp_badge()
-
-        vmpp_unit = QtWidgets.QLabel("V")
-        vmpp_unit.setStyleSheet(
-            "color: #64748b; font-size: 12px; font-weight: 600; background: transparent;"
-        )
-
-        vmpp_row.addWidget(self.vmpp_badge)
-        vmpp_row.addWidget(self.vmpp_input, stretch=1)
-        vmpp_row.addWidget(vmpp_unit)
-        layout.addLayout(vmpp_row)
-
-        # ---- Row 2: Mode toggle -----------------------------------------
-        mode_row = QtWidgets.QHBoxLayout()
-        mode_row.setSpacing(6)
-
-        # Object name is HoldModeButton, not the generic ModeButton: these two
-        # inherited the inner-tab ModeButton style, whose unchecked state is
-        # pale grey on transparent — indistinguishable from a disabled button,
-        # so operators did not realise "Quick JV" was a choice they could make.
-        # See QPushButton#HoldModeButton in the window's stylesheet.
-        self.manual_mode_button = QtWidgets.QPushButton("Manual")
-        self.manual_mode_button.setCheckable(True)
-        self.manual_mode_button.setChecked(True)
-        self.manual_mode_button.setCursor(QtCore.Qt.PointingHandCursor)
-        self.manual_mode_button.setObjectName("HoldModeButton")
-        self.manual_mode_button.setToolTip("Type the hold voltage yourself")
-
-        self.quick_jv_mode_button = QtWidgets.QPushButton("Quick JV")
-        self.quick_jv_mode_button.setCheckable(True)
-        self.quick_jv_mode_button.setCursor(QtCore.Qt.PointingHandCursor)
-        self.quick_jv_mode_button.setObjectName("HoldModeButton")
-        self.quick_jv_mode_button.setToolTip(
-            "Run a short automatic J-V sweep and take Vmpp from it")
-
-        self._mode_button_group = QtWidgets.QButtonGroup(self)
-        self._mode_button_group.setExclusive(True)
-        self._mode_button_group.addButton(self.manual_mode_button, 0)
-        self._mode_button_group.addButton(self.quick_jv_mode_button, 1)
-        self._mode_button_group.buttonClicked.connect(self._on_mode_button_clicked)
-
-        mode_row.addWidget(self.manual_mode_button)
-        mode_row.addWidget(self.quick_jv_mode_button)
-        mode_row.addStretch()
-        layout.addLayout(mode_row)
-
-        # ---- QStackedWidget: Manual hint / Quick JV panel ----------------
-        self.mode_stack = _TightStackedWidget()
-
-        # Page 0: Manual hint
-        manual_page = QtWidgets.QWidget()
-        manual_layout = QtWidgets.QVBoxLayout(manual_page)
-        manual_layout.setContentsMargins(0, 2, 0, 0)
-        manual_hint = QtWidgets.QLabel(
-            "Enter the hold voltage manually, or switch to Quick JV "
-            "to measure Vmpp automatically."
-        )
-        manual_hint.setStyleSheet(
-            "color: #94a3b8; font-size: 11px; background: transparent;"
-        )
-        manual_hint.setWordWrap(True)
-        manual_layout.addWidget(manual_hint)
-        self.mode_stack.addWidget(manual_page)  # index 0
-
-        # Page 1: Quick JV panel
-        quick_jv_page = QtWidgets.QWidget()
-        quick_jv_layout = QtWidgets.QVBoxLayout(quick_jv_page)
-        quick_jv_layout.setContentsMargins(0, 2, 0, 0)
-        quick_jv_layout.setSpacing(8)
-
-        # Sweep parameter row
-        sweep_form = QtWidgets.QFormLayout()
-        sweep_form.setVerticalSpacing(6)
-
-        self.quick_jv_start_input = QtWidgets.QDoubleSpinBox()
-        self.quick_jv_start_input.setRange(-10.0, 10.0)
-        self.quick_jv_start_input.setValue(self.QUICK_JV_START)
-        self.quick_jv_start_input.setDecimals(2)
-        self.quick_jv_start_input.setSingleStep(0.1)
-        self.quick_jv_start_input.setButtonSymbols(
-            QtWidgets.QAbstractSpinBox.NoButtons
-        )
-        sweep_form.addRow("Start (V):", self.quick_jv_start_input)
-
-        self.quick_jv_stop_input = QtWidgets.QDoubleSpinBox()
-        self.quick_jv_stop_input.setRange(-10.0, 10.0)
-        self.quick_jv_stop_input.setValue(self.QUICK_JV_STOP)
-        self.quick_jv_stop_input.setDecimals(2)
-        self.quick_jv_stop_input.setSingleStep(0.1)
-        self.quick_jv_stop_input.setButtonSymbols(
-            QtWidgets.QAbstractSpinBox.NoButtons
-        )
-        sweep_form.addRow("Stop (V):", self.quick_jv_stop_input)
-
-        self.quick_jv_rate_input = QtWidgets.QDoubleSpinBox()
-        self.quick_jv_rate_input.setRange(0.01, 100.0)
-        self.quick_jv_rate_input.setValue(self.QUICK_JV_RATE)
-        self.quick_jv_rate_input.setDecimals(2)
-        self.quick_jv_rate_input.setSingleStep(0.1)
-        self.quick_jv_rate_input.setButtonSymbols(
-            QtWidgets.QAbstractSpinBox.NoButtons
-        )
-        sweep_form.addRow("Rate (V/s):", self.quick_jv_rate_input)
-
-        quick_jv_layout.addLayout(sweep_form)
-
-        # Run button
-        self.quick_jv_button = QtWidgets.QPushButton("Run Quick JV")
-        self.quick_jv_button.setObjectName("QueueButton")
-        self.quick_jv_button.setCursor(QtCore.Qt.PointingHandCursor)
-        self.quick_jv_button.clicked.connect(self._run_quick_jv)
-        quick_jv_layout.addWidget(self.quick_jv_button)
-
-        # Progress bar (hidden until running)
-        self.quick_jv_progress = QtWidgets.QProgressBar()
-        self.quick_jv_progress.setRange(0, 100)
-        self.quick_jv_progress.setValue(0)
-        self.quick_jv_progress.setTextVisible(False)
-        self.quick_jv_progress.setFixedHeight(6)
-        self.quick_jv_progress.setStyleSheet(
-            "QProgressBar { background: #f1f5f9; border: none; border-radius: 3px; }"
-            "QProgressBar::chunk { background: #053a46; border-radius: 3px; }"
-        )
-        self.quick_jv_progress.hide()
-        quick_jv_layout.addWidget(self.quick_jv_progress)
-
-        # Mini I-V plot
-        self.quick_jv_plot = pg.PlotWidget()
-        self.quick_jv_plot.setBackground('w')
-        self.quick_jv_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.quick_jv_plot.setLabel('bottom', 'Voltage', units='V')
-        self.quick_jv_plot.setLabel('left', 'Current', units='A')
-        self.quick_jv_plot.setFixedHeight(150)
-        self.quick_jv_plot.hideButtons()
-        self.quick_jv_curve = self.quick_jv_plot.plot(
-            [], [], pen=pg.mkPen(color='#053a46', width=2)
-        )
-        # MPP marker (green scatter, hidden until results arrive)
-        self.quick_jv_mpp = pg.ScatterPlotItem(
-            [], [], symbol='d', size=12, brush=pg.mkBrush('#16a34a'),
-            pen=pg.mkPen(color='#15803d', width=1),
-        )
-        self.quick_jv_plot.addItem(self.quick_jv_mpp)
-        quick_jv_layout.addWidget(self.quick_jv_plot)
-
-        # Results grid
-        results_group = QtWidgets.QWidget()
-        results_grid = QtWidgets.QGridLayout(results_group)
-        results_grid.setContentsMargins(0, 0, 0, 0)
-        results_grid.setHorizontalSpacing(6)
-        results_grid.setVerticalSpacing(2)
-
-        header_style = "color: #64748b; font-size: 10px; font-weight: 600; background: transparent;"
-        value_style = (
-            "font-size: 12px; font-weight: 600; color: #1e293b; background: transparent;"
-        )
-
-        headers = ["Voc (V)", "Jsc (mA/cm²)", "FF (%)", "Vmpp (V)", "Eff (%)"]
-        self.quick_jv_result_labels = {}
-
-        for col, hdr in enumerate(headers):
-            lbl = QtWidgets.QLabel(hdr)
-            lbl.setStyleSheet(header_style)
-            lbl.setAlignment(QtCore.Qt.AlignCenter)
-            results_grid.addWidget(lbl, 0, col)
-
-            val = QtWidgets.QLabel("—")
-            val.setStyleSheet(value_style)
-            val.setAlignment(QtCore.Qt.AlignCenter)
-            results_grid.addWidget(val, 1, col)
-            self.quick_jv_result_labels[hdr] = val
-
-        quick_jv_layout.addWidget(results_group)
-
-        # Status label
-        self.quick_jv_status = QtWidgets.QLabel("Idle")
-        self.quick_jv_status.setStyleSheet(
-            "color: #94a3b8; font-size: 11px; background: transparent;"
-        )
-        quick_jv_layout.addWidget(self.quick_jv_status)
-
-        self.mode_stack.addWidget(quick_jv_page)  # index 1
-        self.mode_stack.setCurrentIndex(0)
-        layout.addWidget(self.mode_stack)
-
-        form.addRow(card)
-
-    def _update_vmpp_badge(self):
-        """Update the source badge chip color and text."""
-        base = (
-            "border-radius: 10px; font-size: 10px; font-weight: 600; "
-            "padding: 2px 0px;"
-        )
-        if self.has_valid_hold_voltage():
-            if self._vmpp_source == "quick_jv":
-                self.vmpp_badge.setStyleSheet(
-                    f"{base} color: #053a46; background-color: #d1e3e9;"
-                )
-                self.vmpp_badge.setText("Quick JV")
-            else:
-                self.vmpp_badge.setStyleSheet(
-                    f"{base} color: #053a46; background-color: #d1e3e9;"
-                )
-                self.vmpp_badge.setText("Manual")
-        else:
-            self.vmpp_badge.setStyleSheet(
-                f"{base} color: #64748b; background-color: #f1f5f9;"
-            )
-            self.vmpp_badge.setText("No Vmpp")
-
-    def _on_mode_button_clicked(self, _button=None):
-        """Swap between Manual (page 0) and Quick JV (page 1) panels."""
-        self.mode_stack.setCurrentIndex(
-            0 if self.manual_mode_button.isChecked() else 1
-        )
-        # Nudge the sidebar to recompute heights immediately (rather than
-        # waiting for the next window resize) so switching to the much
-        # shorter Manual page doesn't leave dead space below this card.
-        relayout = getattr(self.main_window, '_relayout_sidebar', None)
-        if callable(relayout):
-            relayout()
-
-    # -------------------------------------------------------------------
-    # Quick JV (temporary, in-memory sweep solely to locate Vmpp)
-    # -------------------------------------------------------------------
-
-    def _run_quick_jv(self):
-        """Run a fast JV sweep to auto-detect Vmpp with live plotting."""
-        if self._quick_jv_running:
-            return
-
-        # Guard against concurrent runs: Quick JV must not overlap with
-        # JV queue / SPO / Combined runs that use the same Keithley.
-        controller = self.main_window.controller
-        if getattr(controller, 'is_busy', False) or getattr(controller, 'spo_running', False):
-            QtWidgets.QMessageBox.warning(
-                self, "Instrument Busy",
-                "Another measurement is already in progress.\n\n"
-                "Please wait for it to finish or abort it before running Quick JV."
-            )
-            return
-
-        # ---- Pre-validate sweep parameters (before touching hardware) ----
-        start_v = self.quick_jv_start_input.value()
-        stop_v = self.quick_jv_stop_input.value()
-
-        if start_v <= stop_v:
-            QtWidgets.QMessageBox.warning(
-                self, "Invalid Sweep Range",
-                "Start voltage must be greater than stop voltage.\n\n"
-                "The Quick JV sweep runs from start to stop."
-            )
-            return
-
-        expected_points = int(abs(stop_v - start_v) / self.QUICK_JV_STEP) + 1
-        if expected_points > 2500:
-            QtWidgets.QMessageBox.warning(
-                self, "Sweep Too Large",
-                f"The sweep range produces {expected_points} points, which "
-                f"exceeds the instrument's 2500-point buffer.\n\n"
-                f"Reduce the voltage range or increase the step size."
-            )
-            return
-
-        # Validate device area (compute_jv_metrics raises ValueError if ≤ 0)
-        device_area = 0.089
-        try:
-            device_area = float(
-                self.main_window.params_tab.get_parameters().get(
-                    'device_area', device_area
-                )
-            )
-        except Exception:
-            pass
-        if device_area <= 0:
-            QtWidgets.QMessageBox.warning(
-                self, "Invalid Device Area",
-                "Device area must be greater than zero for JV analysis."
-            )
-            return
-
-        # ---- Enter running state ------------------------------------------
-        self._quick_jv_running = True
-        self.main_window.controller.is_busy = True
-        self._quick_jv_voltages = []
-        self._quick_jv_currents = []
-        self._quick_jv_expected_points = expected_points
-
-        # Clear previous results
-        self.quick_jv_curve.setData([], [])
-        self.quick_jv_mpp.setData([], [])
-        for lbl in self.quick_jv_result_labels.values():
-            lbl.setText("—")
-            lbl.setStyleSheet(
-                "font-size: 12px; font-weight: 600; color: #1e293b; background: transparent;"
-            )
-        self.quick_jv_progress.setValue(0)
-        self.quick_jv_progress.show()
-        self.quick_jv_status.setText("Connecting...")
-
-        # Lock controls
-        self.quick_jv_button.setEnabled(False)
-        self.quick_jv_button.setText("Running Quick JV...")
-        self.manual_mode_button.setEnabled(False)
-        self.quick_jv_mode_button.setEnabled(False)
-        self.quick_jv_start_input.setEnabled(False)
-        self.quick_jv_stop_input.setEnabled(False)
-        self.quick_jv_rate_input.setEnabled(False)
-        self.vmpp_input.setEnabled(False)
-
-        # ---- Connect hardware ---------------------------------------------
-        instrument_manager = self.main_window.instrument_manager
-        try:
-            instrument_manager.connect_keithley(simulation=False)
-            instrument_manager.connect_mux(simulation=False)
-        except Exception as e:
-            self._quick_jv_running = False
-            self.main_window.controller.is_busy = False
-            self._reset_quick_jv_controls()
-            QtWidgets.QMessageBox.critical(
-                self, "Connection Failed",
-                f"Could not connect to instruments:\n{e}\n\n"
-                "Please check that the Keithley is powered on and connected."
-            )
-            return
-        self.main_window.update_instrument_lights()
-
-        channel = self.get_selected_channel()
-
-        # In-memory only: no `results` object is attached, so JVProcedure
-        # never writes a file. This cannot interfere with the JV analysis
-        # panel or browser.
-        proc = JVProcedure(
-            instrument=instrument_manager.keithley,
-            mux=instrument_manager.mux,
-            manager=instrument_manager,
-            simulation=False,
-            active_channel=channel,
-            start_voltage=start_v,
-            stop_voltage=stop_v,
-            step_size=self.QUICK_JV_STEP,
-            sweep_rate=self.quick_jv_rate_input.value(),
-            single_sweep_mode=True,
-            sweep_direction="Forward",
-            device_area=device_area,
-            incident_power=self._get_incident_power(),
-            check_errors_between_points=False,
-        )
-
-        self._quick_jv_worker = SpoWorker(proc)
-        self._quick_jv_worker.results_ready.connect(self._on_quick_jv_point)
-        self._quick_jv_worker.progress_changed.connect(self._on_quick_jv_progress)
-        self._quick_jv_worker.status_changed.connect(self._on_quick_jv_status)
-        self._quick_jv_worker.run_finished.connect(self._on_quick_jv_finished)
-        self._quick_jv_worker.run_failed.connect(self._on_quick_jv_failed)
-        self._quick_jv_worker.finished.connect(
-            self._quick_jv_worker.deleteLater
-        )
-        self._quick_jv_worker.start()
-
-    def _get_incident_power(self) -> float:
-        """Incident power from the user's Analysis Settings (was hard-coded
-        to 100, which made the Quick JV efficiency ignore the user's value)."""
-        try:
-            analysis = self.main_window.analysis_settings_tab.get_parameters()
-            return float(analysis.get('incident_power', 100.0))
-        except Exception:
-            return 100.0
-
-    def _on_quick_jv_point(self, record: dict):
-        """Append one (V, I) data point and update the live mini-plot."""
-        voltage = record.get("Voltage (V)", 0.0)
-        current = record.get("Current (A)", 0.0)
-        self._quick_jv_voltages.append(voltage)
-        self._quick_jv_currents.append(current)
-        self.quick_jv_curve.setData(
-            self._quick_jv_voltages, self._quick_jv_currents
-        )
-        # GUI-side progress: JVProcedure emits progress only at 100,
-        # so drive the bar from points received vs expected.
-        if self._quick_jv_expected_points > 0:
-            pct = min(
-                99,
-                int(
-                    len(self._quick_jv_voltages)
-                    / self._quick_jv_expected_points
-                    * 100
-                ),
-            )
-            self.quick_jv_progress.setValue(pct)
-
-    def _on_quick_jv_progress(self, pct: float):
-        """Snap the progress bar to the reported value (forward-compat)."""
-        self.quick_jv_progress.setValue(int(pct))
-
-    def _on_quick_jv_status(self, status: str):
-        """Update the status label (forward-compat; JVProcedure rarely emits)."""
-        self.quick_jv_status.setText(status)
-
-    def _on_quick_jv_finished(self, proc):
-        """Extract metrics, populate results grid, auto-fill Vmpp."""
-        self._quick_jv_running = False
-        self.main_window.controller.is_busy = False
-        self.quick_jv_progress.setValue(100)
-        self._reset_quick_jv_controls()
-        self._disconnect_quick_jv_instruments()
-
-        try:
-            channel = self.get_selected_channel()
-            channel_results = proc.analysis_results.get(channel, {})
-            metrics = channel_results.get("Forward")
-            if not metrics:
-                self.quick_jv_status.setText("No analysis result produced.")
-                QtWidgets.QMessageBox.warning(
-                    self, "Quick JV", "No analysis result was produced."
-                )
-                return
-
-            # Populate results grid (keys stored in native units: mV, mA/cm²)
-            voc_v = metrics.get("Voc", 0.0) / 1000.0
-            jsc_ma = metrics.get("Jsc", 0.0)
-            ff_pct = metrics.get("FF", 0.0)
-            vmpp_v = metrics.get("Vmpp", 0.0) / 1000.0
-            eff_pct = metrics.get("EFF", 0.0)
-
-            self.quick_jv_result_labels["Voc (V)"].setText(f"{voc_v:.3f}")
-            self.quick_jv_result_labels["Jsc (mA/cm²)"].setText(f"{jsc_ma:.2f}")
-            self.quick_jv_result_labels["FF (%)"].setText(f"{ff_pct:.2f}")
-            self.quick_jv_result_labels["Vmpp (V)"].setText(f"{vmpp_v:.4f}")
-            self.quick_jv_result_labels["Eff (%)"].setText(f"{eff_pct:.2f}")
-
-            # Highlight the Vmpp value in green
-            self.quick_jv_result_labels["Vmpp (V)"].setStyleSheet(
-                "font-size: 12px; font-weight: 600; color: #053a46; background: transparent;"
-            )
-
-            # Place MPP marker on the plot
-            if self._quick_jv_voltages and self._quick_jv_currents:
-                # Find the measured point closest to Vmpp
-                diffs = [
-                    abs(v - vmpp_v) for v in self._quick_jv_voltages
-                ]
-                idx = diffs.index(min(diffs))
-                self.quick_jv_mpp.setData(
-                    [self._quick_jv_voltages[idx]],
-                    [self._quick_jv_currents[idx]],
-                )
-
-            # Auto-fill the Vmpp field — set source BEFORE setText so
-            # _on_vmpp_changed keeps the green "Quick JV" badge.
-            self._vmpp_source = "quick_jv"
-            self.vmpp_input.setText(f"{vmpp_v:.4f}")
-
-            self.quick_jv_status.setText(f"Vmpp found: {vmpp_v:.4f} V")
-
-        except Exception as e:
-            logger.error(f"Quick JV post-processing failed: {e}")
-            self.quick_jv_status.setText("Post-processing failed.")
-            QtWidgets.QMessageBox.warning(
-                self, "Quick JV", f"Failed to read Vmpp: {e}"
-            )
-
-    def _on_quick_jv_failed(self, message: str):
-        """Handle Quick JV worker failure."""
-        self._quick_jv_running = False
-        self.main_window.controller.is_busy = False
-        self._reset_quick_jv_controls()
-        self._disconnect_quick_jv_instruments()
-        self.quick_jv_status.setText("Failed")
-        QtWidgets.QMessageBox.warning(self, "Quick JV Failed", message)
-
-    def _reset_quick_jv_controls(self):
-        """Re-enable all Quick JV controls.
-        Guarded: if an SPO run is active, leave controls locked (SPO's
-        set_config_enabled(False) wins)."""
-        spo_running = getattr(
-            self.main_window.controller, 'spo_running', False
-        )
-        if spo_running:
-            return
-        self.quick_jv_button.setEnabled(True)
-        self.quick_jv_button.setText("Run Quick JV")
-        self.manual_mode_button.setEnabled(True)
-        self.quick_jv_mode_button.setEnabled(True)
-        self.quick_jv_start_input.setEnabled(True)
-        self.quick_jv_stop_input.setEnabled(True)
-        self.quick_jv_rate_input.setEnabled(True)
-        self.vmpp_input.setEnabled(True)
-
-    def _disconnect_quick_jv_instruments(self):
-        """Disconnect hardware after a Quick JV sweep."""
-        try:
-            self.main_window.instrument_manager.disconnect_keithley()
-            self.main_window.instrument_manager.disconnect_mux()
-        except Exception:
-            pass
-        finally:
-            self.main_window.update_instrument_lights()
-
+    # ------------------------------------------------------------------
+    # The hold-voltage card now lives in gui/widgets/vmpp_card.py
+    #
+    # 519 lines of Manual / Quick JV logic used to be duplicated here and in
+    # the MPP tab, so every fix had to be made twice and the two drifted
+    # apart anyway -- SPO never got the unit selectors, the editable device
+    # fields, the working architecture toggle or the busy-flag fix.
+    #
+    # These forwarders keep SpoParameterTab's public surface identical, so
+    # nothing that calls this tab had to change.
+    # ------------------------------------------------------------------
+
+    @property
+    def vmpp_input(self):
+        return self.vmpp_card.vmpp_input
+
+    @property
+    def manual_mode_button(self):
+        return self.vmpp_card.manual_mode_button
+
+    @property
+    def quick_jv_mode_button(self):
+        return self.vmpp_card.quick_jv_mode_button
+
+    @property
+    def quick_jv_button(self):
+        return self.vmpp_card.quick_jv_button
+
+    @property
+    def quick_jv_start_input(self):
+        return self.vmpp_card.quick_jv_start_input
+
+    @property
+    def quick_jv_stop_input(self):
+        return self.vmpp_card.quick_jv_stop_input
+
+    @property
+    def quick_jv_rate_input(self):
+        return self.vmpp_card.quick_jv_rate_input
+
+    @property
+    def _quick_jv_worker(self):
+        """jv_analyzer_window reaches for this by name during shutdown."""
+        return getattr(self.vmpp_card, "_quick_jv_worker", None)
+
+    @property
+    def _quick_jv_running(self):
+        return getattr(self.vmpp_card, "_quick_jv_running", False)
+
+    def device_settings(self) -> dict:
+        """Area, compliance and architecture for an SPO run -- the card's own
+        fields in Quick JV mode, the J-V Parameters tab in Manual."""
+        return self.vmpp_card.device_settings()
 
 class SpoWidget(QtWidgets.QWidget):
     """

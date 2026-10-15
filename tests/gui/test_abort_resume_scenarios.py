@@ -103,8 +103,11 @@ def test_resume_continues_with_the_next_queued_sweep(window):
     _worker_returned(manager)
     controller.on_abort_returned()
 
-    assert window.abort_button.text() == "Resume"
-    assert window.abort_button.isEnabled()
+    # The VISIBLE control, not `window.abort_button`: that one lives on the
+    # Advanced page and is a different widget from the combined view's.
+    _start, button = window.active_run_controls()
+    assert button.text() == "Resume"
+    assert button.isEnabled()
 
     picked = _watch_next(manager)
     controller.resume_experiment()

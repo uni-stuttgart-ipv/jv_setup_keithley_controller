@@ -13,10 +13,11 @@ def report():
     os.close(fd)
     r = SpoReport(path)
     yield r, path
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+    for leftover in (path, r.raw_path):
+        try:
+            os.remove(leftover)
+        except OSError:
+            pass
 
 
 class TestSpoReport:
@@ -25,7 +26,8 @@ class TestSpoReport:
         params = {"Hold Voltage": (0.6, "V"), "Channel": (1, "")}
         r.init(params)
         r.close()
-        with open(path) as f:
+        # The live journal, not `path`: see SpoReport.raw_path.
+        with open(r.raw_path) as f:
             content = f.read()
         assert "# Hold Voltage: 0.6 V" in content
         assert "# Channel: 1" in content
@@ -36,7 +38,7 @@ class TestSpoReport:
         r.init({"V": (0.5, "V")})
         r.write_row(0.0, 0.5, -0.01, -0.005)
         r.close()
-        with open(path) as f:
+        with open(r.raw_path) as f:
             content = f.read()
         assert "0.0,0.5,-0.01,-0.005" in content or "0.0000,0.5,-0.01,-0.005" in content
 
@@ -59,7 +61,9 @@ class TestSpoReport:
         with open(report_path) as f:
             content = f.read()
         assert "[[ EXPERIMENTAL PARAMETERS ]]" in content
-        assert "[[ SPO METRICS ]]" in content
+        # Renamed from "[[ SPO METRICS ]]" so both report types carry the
+        # same heading and can be stacked or diffed without transposing.
+        assert "[[ ANALYSIS SUMMARY ]]" in content
         assert "[[ TIME SERIES DATA ]]" in content
         assert "8.7" in content
         assert "1.2" in content

@@ -129,3 +129,17 @@ Claude outputs/
 # LiteLLM/DeepSeek model config — AI tooling, unrelated to this application
 # and read by nothing in src/. Kept locally, not shipped.
 config.yaml
+
+# SMTP credential used to commission a lab PC. The admin copies
+# smtp_local_config.example.py to smtp_local_config.py and fills in the real
+# account and password. This line is what keeps it out of the repository,
+# including out of `git add .`. The .example file stays tracked.
+tools/smtp_local_config.py
+
+# Staging folder used to move files between this machine and a Claude
+# session. Never source.
+_to_delete/
+
+# Generated demo report for exercising "Open MPP Report". Regenerate with
+# demo_data/make_dummy_mpp.py rather than committing the CSV.
+demo_data/

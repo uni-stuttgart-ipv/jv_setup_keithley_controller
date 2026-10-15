@@ -50,10 +50,24 @@ class _Config:
     STORE_ENABLED: bool = True
 
     # Seconds a file must go unmodified before it counts as finished.
-    STORE_QUIET_SECONDS: float = 15.0
+    #
+    # 0.0, because nothing depends on it any more. Every producer now writes
+    # through `store.finalize.published_file()` or an excluded in-progress
+    # name, so a file carrying its final name has already been closed by its
+    # writer — a fact, where this was a guess that cost 15 s on every report.
+    # Kept as a setting rather than deleted: it is the fallback if a future
+    # writer is ever added that does not use the helper, and raising it is the
+    # one-line way to make the sweeper cautious again. `LOG_QUIET_SECONDS` in
+    # the sweeper still governs session logs, which have no completion event.
+    STORE_QUIET_SECONDS: float = 0.0
 
     # How often the sweeper looks for finished files, in milliseconds.
-    STORE_SWEEP_INTERVAL_MS: int = 20000
+    #
+    # The QFileSystemWatcher in the sidecar is what makes publishing prompt;
+    # this timer is the safety net behind it, for events the OS coalesces or
+    # drops. It is deliberately slower than the 20 s poll it replaced, because
+    # it is no longer the thing anybody waits on.
+    STORE_SWEEP_INTERVAL_MS: int = 60000
 
 # instantiate a singleton for easy import
 CONFIG = _Config()

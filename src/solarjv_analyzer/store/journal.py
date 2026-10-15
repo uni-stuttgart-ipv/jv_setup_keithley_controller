@@ -28,6 +28,10 @@ class Journal:
     def __init__(self, path: str):
         self.path = path
         self._data = {"failures": {}, "logs": {}}
+        # Whether anything has changed since the last load/save. The journal
+        # lives in the staging root, which the sidecar's file watcher watches,
+        # so an unconditional save makes every sweep schedule the next one.
+        self._dirty = False
         self.load()
 
     # -- persistence ----------------------------------------------------
@@ -42,12 +46,15 @@ class Journal:
             pass
 
     def save(self) -> None:
+        if not self._dirty:
+            return
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as handle:
                 json.dump(self._data, handle, indent=2)
             os.replace(tmp, self.path)      # local file — replace is allowed here
+            self._dirty = False
         except OSError as exc:
             logger.debug(f"Could not write the store journal: {exc}")
 
@@ -56,10 +63,12 @@ class Journal:
         entry = self._data["failures"].setdefault(path, {"attempts": 0, "error": ""})
         entry["attempts"] += 1
         entry["error"] = message
+        self._dirty = True
         return entry["attempts"]
 
     def clear_failure(self, path: str) -> None:
-        self._data["failures"].pop(path, None)
+        if self._data["failures"].pop(path, None) is not None:
+            self._dirty = True
 
     def attempts(self, path: str) -> int:
         return self._data["failures"].get(path, {}).get("attempts", 0)
@@ -75,7 +84,9 @@ class Journal:
         return path in self._data["logs"]
 
     def mark_log_published(self, path: str, target: str) -> None:
-        self._data["logs"][path] = target
+        if self._data["logs"].get(path) != target:
+            self._data["logs"][path] = target
+            self._dirty = True
 
 
 def open_journal(staging_root: str) -> Journal:

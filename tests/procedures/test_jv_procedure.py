@@ -111,6 +111,19 @@ class TestDataColumns:
         assert "Current (A)" in JVProcedure.DATA_COLUMNS
 
     def test_analysis_labels_units_match(self):
-        """ANALYSIS_LABELS_UNITS is imported from analysis.py and has 14 entries
-        (12 core J-V metrics + shunt resistivity and sheet resistance)."""
-        assert len(JVProcedure.ANALYSIS_LABELS_UNITS) == 14
+        """ANALYSIS_LABELS_UNITS is re-exported from analysis.py.
+
+        Asserting the names rather than only the count: a bare count tells you
+        something moved but not what, and it goes stale every time a metric is
+        added — which is how it came to expect 14 after `Quadrant` was added.
+        """
+        labels = JVProcedure.ANALYSIS_LABELS_UNITS
+        names = [name for name, _unit in labels]
+
+        assert names == [
+            "EFF", "FF", "Voc", "Jsc", "Vmpp", "Jmpp", "Pmpp", "Isc",
+            "Rsh", "Rs", "Rho_shunt", "Rsq", "A", "Incd. Pwr",
+            # Reported as measured, so a miswired cell is visible on the row.
+            "Quadrant",
+        ]
+        assert all(isinstance(unit, str) for _name, unit in labels)

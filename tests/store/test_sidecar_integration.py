@@ -52,7 +52,11 @@ def store_env(tmp_path, monkeypatch):
     monkeypatch.setenv("SOLARJV_STAGING_ROOT", str(tmp_path / "staging"))
     monkeypatch.setenv("SOLARJV_STORE_ENABLED", "1")
     from solarjv_analyzer.store import identity, sweeper
-    monkeypatch.setattr(identity, "_cached", "st000000")
+    # `active_user()` reads `_app_user` — the APPLICATION login. `_cached`
+    # belongs to `windows_user()`, and patching it left active_user()
+    # raising "nobody is signed in", so every sweep below returned early
+    # and published nothing.
+    monkeypatch.setattr(identity, "_app_user", "st000000")
     monkeypatch.setattr(sweeper, "extra_target", lambda: "")
     monkeypatch.setattr(sweeper, "_logs_dir", lambda: "")
     yield tmp_path
@@ -99,6 +103,15 @@ def test_a_finished_run_reaches_the_store_and_leaves_temps_alone(
         run_dir = window.file_panel.get_parameters()["directory"]
         os.makedirs(run_dir, exist_ok=True)
 
+        # attach() kicks off a sweep of its own, on a background thread. The
+        # redirect it installed stays put after a detach, so retire the
+        # sidecar here: this test asserts what ITS OWN sweep published, and
+        # that number only means something while nothing else is sweeping.
+        # (In the real app two sweepers racing is harmless -- whichever gets
+        # there first publishes the file -- which is exactly why the
+        # assertion below, not the behaviour, is what needs the quiet.)
+        store.detach(window)
+
         # what app_controller writes during a two-channel single-file run
         temps = []
         for channel in (1, 2):
@@ -124,8 +137,13 @@ def test_a_finished_run_reaches_the_store_and_leaves_temps_alone(
 
         # The date folder comes from the run's own dd-mm-yyyy staging folder,
         # converted — not from "today" — so a run crossing midnight is intact.
+        # The mode folder is the one the window is actually staging into: "JV"
+        # for a J-V run. (It was called "Main" in older builds; paths.LEGACY_MODES
+        # maps that name forward for files already sitting on the store.)
+        mode = os.path.basename(os.path.normpath(run_dir))
+        assert mode == "JV", f"unexpected staging mode folder: {mode}"
         published = (store_env / "store" / "st000000" /
-                     time.strftime("%Y-%m-%d") / "Main" /
+                     time.strftime("%Y-%m-%d") / mode /
                      "jv_2026-09-09_15-30-00_ch1_2.csv")
         assert published.exists(), sorted(
             os.walk(str(store_env / "store")))
